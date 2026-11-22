@@ -2,6 +2,11 @@
 
 所有重要版本变更都会记录在本文件中。
 
+## [v0.8.3] - 2026-11-22
+
+### 稳定性修复
+- **Electron 退出 `write EPIPE` 崩溃修复**：为 `process.stdout`、`process.stderr` 与原生输入 Helper 的 `stdin`/`stdout`/`stderr` 流统一注册 `error` 事件防线，`sendToHelper()` 补充流可写/未销毁检查与异步错误回调，并在 `will-quit` 时先优雅 `stdin.end()` 后延时兜底结束子进程，彻底消除退出时的 `Uncaught Exception: Error: write EPIPE` 弹窗。
+
 ## [v0.8.2] - 2026-11-22
 
 ### 安全与稳定性加固

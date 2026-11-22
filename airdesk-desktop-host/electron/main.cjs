@@ -25,6 +25,14 @@ const { WebSocketServer, WebSocket } = require('ws');
 const QRCode = require('qrcode');
 const APP_VERSION = require('../package.json').version;
 
+// Prevent uncaught EPIPE if parent terminal/pipe closes before Electron exits
+if (process.stdout && typeof process.stdout.on === 'function') {
+  process.stdout.on('error', () => {});
+}
+if (process.stderr && typeof process.stderr.on === 'function') {
+  process.stderr.on('error', () => {});
+}
+
 // Force Chromium WebRTC to expose real private LAN / Hotspot IPs instead of .local mDNS
 app.commandLine.appendSwitch('disable-features', 'WebRtcHideLocalIpsWithMdns');
 // Unlock AMD MediaFoundation hardware H.264 encoder when blocklisted by Chromium
@@ -149,19 +157,38 @@ function validateInputPayload(msg) {
 }
 
 function sendToHelper(payload) {
-  if (elevatedPipeClient && elevatedPipeClient.writable) {
+  const line = JSON.stringify(payload) + '\n';
+  if (
+    elevatedPipeClient &&
+    elevatedPipeClient.writable &&
+    !elevatedPipeClient.destroyed &&
+    !elevatedPipeClient.writableEnded
+  ) {
     try {
-      elevatedPipeClient.write(JSON.stringify(payload) + '\n');
+      elevatedPipeClient.write(line, () => {});
       return;
     } catch (err) {
-      console.error('[AirDesk Elevated Pipe] Write error:', err.message);
+      if (err && err.code !== 'EPIPE') {
+        console.error('[AirDesk Elevated Pipe] Write error:', err.message);
+      }
     }
   }
-  if (!nativeHelper || nativeHelper.killed || !nativeHelper.stdin.writable) return;
+  if (
+    !nativeHelper ||
+    nativeHelper.killed ||
+    !nativeHelper.stdin ||
+    !nativeHelper.stdin.writable ||
+    nativeHelper.stdin.destroyed ||
+    nativeHelper.stdin.writableEnded
+  ) {
+    return;
+  }
   try {
-    nativeHelper.stdin.write(JSON.stringify(payload) + '\n');
+    nativeHelper.stdin.write(line, () => {});
   } catch (err) {
-    console.error('[AirDesk Helper] Write error:', err.message);
+    if (err && err.code !== 'EPIPE') {
+      console.error('[AirDesk Helper] Write error:', err.message);
+    }
   }
 }
 
@@ -325,6 +352,9 @@ function spawnNativeHelper() {
       scheduleHelperRespawn();
     }
   });
+  if (nativeHelper.stdin) nativeHelper.stdin.on('error', () => {});
+  if (nativeHelper.stdout) nativeHelper.stdout.on('error', () => {});
+  if (nativeHelper.stderr) nativeHelper.stderr.on('error', () => {});
 
   let stdoutBuffer = '';
   nativeHelper.stdout.on('data', (chunk) => {
@@ -2331,7 +2361,21 @@ app.on('will-quit', () => {
   globalShortcut.unregisterAll();
   if (powerBlockerId !== null) powerSaveBlocker.stop(powerBlockerId);
   disconnectElevatedPipe();
-  if (nativeHelper) nativeHelper.kill();
+  const helperProc = nativeHelper;
+  nativeHelper = null;
+  if (helperProc && !helperProc.killed) {
+    try {
+      if (helperProc.stdin && !helperProc.stdin.destroyed && !helperProc.stdin.writableEnded) {
+        helperProc.stdin.end();
+      }
+    } catch {}
+    const killTimer = setTimeout(() => {
+      try {
+        if (!helperProc.killed) helperProc.kill();
+      } catch {}
+    }, 120);
+    if (typeof killTimer.unref === 'function') killTimer.unref();
+  }
 });
 
 // --- High-Frequency One-Way Pointer Channel (Zero Promise Allocation Churn at 60-120Hz) ---
