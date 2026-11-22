@@ -2,6 +2,14 @@
 
 所有重要版本变更都会记录在本文件中。
 
+## [v0.8.2] - 2026-11-22
+
+### 安全与稳定性加固
+- **Windows 提权服务 Fail-Closed（P0）**：`win-elevated-service.cs` 与 Electron 连接侧在 `pipe.secret` 缺失或长度不足时一律拒绝接入；管道首行认证新增 3 秒超时断连防占坑 DoS；校验接入进程镜像路径；`SupervisorLoop` 新增限频文件日志与错误退避。
+- **Windows 输入助手性能与兼容升级（P1）**：`WH_MOUSE_LL` 回调移除同步 stdout 阻塞，改为无锁信号与独立后台线程异步派发，退出时显式卸载钩子；升级 `Per-Monitor DPI Aware v2` 与虚拟桌面 bounds 缓存；通过 `MapVirtualKey` 填充硬件扫描码并校验 `SendInput` 返回值。
+- **Android 局域网文件流控与生命周期优化（P1）**：`LanFileService` 改为 `addStream` 背压流式上传/下载，新增 `25s` 空闲超时、`LanFileCancelToken` 取消令牌与显式 `deleteSourceOnFinish` 控制；`RemoteStagePage` 后台释放硬件锁、前台切回主动探活并在超时时自动重连，视频/准星/HUD 包裹 `RepaintBoundary` 隔离重绘。
+- **中继服务端生产默认加固（P2）**：`docker-compose.yml` 默认绑定 `127.0.0.1:47820:47820`、启用 `read_only` / `cap_drop: [ALL]` / `no-new-privileges` 与日志轮转；`server.mjs` 在未配置 `RELAY_ACCESS_KEY` 启动时输出安全警告，并自动清理超 75 秒失活的僵尸 WebSocket 连接。
+
 ## [v0.8.1] - 2026-11-22
 
 ### 安全与稳定性修复

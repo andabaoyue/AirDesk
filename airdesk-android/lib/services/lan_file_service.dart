@@ -21,6 +21,26 @@ class LanRemoteFile {
       );
 }
 
+class LanFileCancelToken {
+  bool _cancelled = false;
+  void Function()? _onCancel;
+
+  bool get isCancelled => _cancelled;
+
+  void bind(void Function() onCancel) {
+    _onCancel = onCancel;
+    if (_cancelled) {
+      onCancel();
+    }
+  }
+
+  void cancel() {
+    if (_cancelled) return;
+    _cancelled = true;
+    _onCancel?.call();
+  }
+}
+
 class LanFileService {
   static void _attachAuthHeaders(HttpHeaders headers, String? token, String? pin) {
     if (token != null && token.trim().isNotEmpty) {
@@ -29,6 +49,39 @@ class LanFileService {
     if (pin != null && pin.trim().isNotEmpty) {
       headers.set('X-AirDesk-Pin', pin.trim());
     }
+  }
+
+  static Stream<List<int>> _withProgressAndIdleTimeout(
+    Stream<List<int>> source, {
+    required Duration idleTimeout,
+    required int total,
+    void Function(int bytes, int total)? onProgress,
+  }) {
+    var processed = 0;
+    var lastNotifyMs = 0;
+    return source
+        .timeout(
+          idleTimeout,
+          onTimeout: (sink) {
+            sink.addError(
+              TimeoutException('文件传输超过 ${idleTimeout.inSeconds} 秒无响应，已自动超时中止'),
+            );
+            sink.close();
+          },
+        )
+        .transform(
+          StreamTransformer<List<int>, List<int>>.fromHandlers(
+            handleData: (chunk, sink) {
+              processed += chunk.length;
+              final nowMs = DateTime.now().millisecondsSinceEpoch;
+              if (nowMs - lastNotifyMs >= 80 || (total > 0 && processed >= total)) {
+                lastNotifyMs = nowMs;
+                onProgress?.call(processed, total);
+              }
+              sink.add(chunk);
+            },
+          ),
+        );
   }
 
   static Future<({bool ok, bool authRequired, List<LanRemoteFile> files, String? error})>
@@ -87,8 +140,20 @@ class LanFileService {
     String? token,
     String? pin,
     void Function(int sent, int total)? onProgress,
+    LanFileCancelToken? cancelToken,
+    bool deleteSourceOnFinish = false,
+    Duration idleTimeout = const Duration(seconds: 25),
   }) async {
+    if (cancelToken?.isCancelled == true) {
+      return (
+        ok: false,
+        authRequired: false,
+        savedName: file.name,
+        error: '已取消传输',
+      );
+    }
     final client = HttpClient()..connectionTimeout = const Duration(seconds: 5);
+    cancelToken?.bind(() => client.close(force: true));
     try {
       final uri = Uri.parse(
         'http://$ip:$port/api/lan-files/upload?name=${Uri.encodeQueryComponent(file.name)}',
@@ -100,21 +165,17 @@ class LanFileService {
         req.contentLength = file.size;
       }
 
-      var sent = 0;
-      var lastNotifyMs = 0;
       final src = File(file.path);
-      await for (final chunk in src.openRead()) {
-        req.add(chunk);
-        sent += chunk.length;
-        final nowMs = DateTime.now().millisecondsSinceEpoch;
-        if (nowMs - lastNotifyMs >= 80 || sent >= file.size) {
-          lastNotifyMs = nowMs;
-          onProgress?.call(sent, file.size);
-        }
-      }
+      final monitoredStream = _withProgressAndIdleTimeout(
+        src.openRead(),
+        idleTimeout: idleTimeout,
+        total: file.size,
+        onProgress: onProgress,
+      );
+      await req.addStream(monitoredStream);
 
-      final res = await req.close();
-      final body = await utf8.decoder.bind(res).join();
+      final res = await req.close().timeout(idleTimeout);
+      final body = await utf8.decoder.bind(res).join().timeout(idleTimeout);
       final json = jsonDecode(body) as Map<String, dynamic>;
       if (res.statusCode == 401) {
         return (
@@ -143,14 +204,16 @@ class LanFileService {
         ok: false,
         authRequired: false,
         savedName: file.name,
-        error: e.toString(),
+        error: cancelToken?.isCancelled == true ? '已取消传输' : e.toString(),
       );
     } finally {
       client.close(force: true);
-      try {
-        final f = File(file.path);
-        if (await f.exists()) await f.delete();
-      } catch (_) {}
+      if (deleteSourceOnFinish) {
+        try {
+          final f = File(file.path);
+          if (await f.exists()) await f.delete();
+        } catch (_) {}
+      }
     }
   }
 
@@ -162,8 +225,19 @@ class LanFileService {
     String? token,
     String? pin,
     void Function(int received, int total)? onProgress,
+    LanFileCancelToken? cancelToken,
+    Duration idleTimeout = const Duration(seconds: 25),
   }) async {
+    if (cancelToken?.isCancelled == true) {
+      return (
+        ok: false,
+        authRequired: false,
+        displayPath: '',
+        error: '已取消传输',
+      );
+    }
     final client = HttpClient()..connectionTimeout = const Duration(seconds: 5);
+    cancelToken?.bind(() => client.close(force: true));
     final tempFile = File(
       '${Directory.systemTemp.path}/airdesk_lan_dl_${DateTime.now().millisecondsSinceEpoch}.part',
     );
@@ -174,7 +248,7 @@ class LanFileService {
       );
       final req = await client.getUrl(uri);
       _attachAuthHeaders(req.headers, token, pin);
-      final res = await req.close();
+      final res = await req.close().timeout(idleTimeout);
       if (res.statusCode == 401) {
         return (
           ok: false,
@@ -194,17 +268,13 @@ class LanFileService {
 
       final total = res.contentLength > 0 ? res.contentLength : 0;
       sink = tempFile.openWrite();
-      var received = 0;
-      var lastNotifyMs = 0;
-      await for (final chunk in res) {
-        sink.add(chunk);
-        received += chunk.length;
-        final nowMs = DateTime.now().millisecondsSinceEpoch;
-        if (nowMs - lastNotifyMs >= 80 || (total > 0 && received >= total)) {
-          lastNotifyMs = nowMs;
-          onProgress?.call(received, total);
-        }
-      }
+      final monitoredStream = _withProgressAndIdleTimeout(
+        res,
+        idleTimeout: idleTimeout,
+        total: total,
+        onProgress: onProgress,
+      );
+      await sink.addStream(monitoredStream);
       await sink.flush();
       await sink.close();
       sink = null;
@@ -232,7 +302,7 @@ class LanFileService {
         ok: false,
         authRequired: false,
         displayPath: '',
-        error: e.toString(),
+        error: cancelToken?.isCancelled == true ? '已取消传输' : e.toString(),
       );
     } finally {
       try {

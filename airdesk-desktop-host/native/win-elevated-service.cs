@@ -74,6 +74,9 @@ namespace AirDeskElevatedService
         public const uint CREATE_NO_WINDOW = 0x08000000;
         public const uint CREATE_UNICODE_ENVIRONMENT = 0x00000400;
         public const PipeOptions PipeOptionFirstInstance = (PipeOptions)0x00080000;
+        public const uint PROCESS_QUERY_LIMITED_INFORMATION = 0x1000;
+        public const uint MAPVK_VK_TO_VSC = 0;
+        public static readonly IntPtr DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = new IntPtr(-4);
 
         [StructLayout(LayoutKind.Sequential)]
         public struct INPUT { public int type; public InputUnion u; }
@@ -235,6 +238,18 @@ namespace AirDeskElevatedService
         public static extern void SendSAS(bool asUser);
 
         [DllImport("user32.dll", SetLastError = true)]
+        public static extern bool SetProcessDpiAwarenessContext(IntPtr value);
+
+        [DllImport("user32.dll")]
+        public static extern uint MapVirtualKey(uint uCode, uint uMapType);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern IntPtr OpenProcess(uint dwDesiredAccess, bool bInheritHandle, uint dwProcessId);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        public static extern bool QueryFullProcessImageNameW(IntPtr hProcess, uint dwFlags, StringBuilder lpExeName, ref uint lpdwSize);
+
+        [DllImport("user32.dll", SetLastError = true)]
         public static extern bool SystemParametersInfo(uint uiAction, uint uiParam, ref ANIMATIONINFO pvParam, uint fWinIni);
     }
 
@@ -294,8 +309,26 @@ namespace AirDeskElevatedService
             }
         }
 
+        private void LogServiceError(string msg)
+        {
+            try
+            {
+                string logPath = @"C:\ProgramData\AirDesk\service.log";
+                string dir = Path.GetDirectoryName(logPath);
+                if (!Directory.Exists(dir)) Directory.CreateDirectory(dir);
+                if (File.Exists(logPath) && new FileInfo(logPath).Length > 131072)
+                {
+                    File.WriteAllText(logPath, "", Encoding.UTF8);
+                }
+                File.AppendAllText(logPath, DateTime.UtcNow.ToString("o") + " " + msg + Environment.NewLine, Encoding.UTF8);
+            }
+            catch { }
+        }
+
         private void SupervisorLoop()
         {
+            int errorBackoffMs = 1200;
+            long lastLogTicks = 0;
             while (!_stopping)
             {
                 try
@@ -320,9 +353,19 @@ namespace AirDeskElevatedService
                         KillWorker();
                         SpawnWorkerInSession(activeSession);
                     }
+                    errorBackoffMs = 1200;
                 }
-                catch { }
-                Thread.Sleep(1200);
+                catch (Exception ex)
+                {
+                    long nowTicks = DateTime.UtcNow.Ticks;
+                    if (nowTicks - lastLogTicks > TimeSpan.FromSeconds(30).Ticks)
+                    {
+                        lastLogTicks = nowTicks;
+                        LogServiceError("SupervisorLoop error: " + ex.Message);
+                    }
+                    errorBackoffMs = Math.Min(5000, errorBackoffMs * 2);
+                }
+                Thread.Sleep(errorBackoffMs);
             }
         }
 
@@ -406,7 +449,10 @@ namespace AirDeskElevatedService
         private const string SecretFilePath = @"C:\ProgramData\AirDesk\pipe.secret";
 
         private static NativeApi.LowLevelMouseProc _mouseProc;
+        private static IntPtr _mouseHookHandle = IntPtr.Zero;
         private static long _lastPhysicalNotifyMs = 0;
+        private static int _physicalMousePending = 0;
+        private static readonly AutoResetEvent _physicalMouseSignal = new AutoResetEvent(false);
         private static readonly Dictionary<ushort, bool> _activeKeys = new Dictionary<ushort, bool>();
         private static bool _leftDown = false;
         private static bool _rightDown = false;
@@ -506,6 +552,46 @@ namespace AirDeskElevatedService
             return diff == 0;
         }
 
+        private static string GetProcessImagePath(uint pid, Process fallbackProc)
+        {
+            IntPtr hProc = NativeApi.OpenProcess(NativeApi.PROCESS_QUERY_LIMITED_INFORMATION, false, pid);
+            if (hProc != IntPtr.Zero)
+            {
+                try
+                {
+                    StringBuilder sb = new StringBuilder(1024);
+                    uint size = (uint)sb.Capacity;
+                    if (NativeApi.QueryFullProcessImageNameW(hProc, 0, sb, ref size) && size > 0)
+                    {
+                        return sb.ToString();
+                    }
+                }
+                finally
+                {
+                    NativeApi.CloseHandle(hProc);
+                }
+            }
+            try
+            {
+                return fallbackProc != null && fallbackProc.MainModule != null ? fallbackProc.MainModule.FileName : "";
+            }
+            catch
+            {
+                return "";
+            }
+        }
+
+        private static bool IsAllowedHostBinary(string exePath)
+        {
+            if (string.IsNullOrEmpty(exePath)) return false;
+            string lowerPath = exePath.ToLowerInvariant();
+            string fileName = Path.GetFileName(lowerPath);
+            if (fileName == "airdesk host.exe" || fileName == "airdesk.exe") return true;
+            if (fileName.StartsWith("airdesk") && fileName.EndsWith(".exe")) return true;
+            if (fileName == "electron.exe" && lowerPath.Contains("airdesk")) return true;
+            return false;
+        }
+
         private static bool VerifyPipeClientSession(NamedPipeServerStream pipe)
         {
             try
@@ -518,7 +604,12 @@ namespace AirDeskElevatedService
                 using (Process proc = Process.GetProcessById((int)clientPid))
                 {
                     uint activeSession = NativeApi.WTSGetActiveConsoleSessionId();
-                    return activeSession != 0xFFFFFFFF && (uint)proc.SessionId == activeSession;
+                    if (activeSession == 0xFFFFFFFF || (uint)proc.SessionId != activeSession)
+                    {
+                        return false;
+                    }
+                    string exePath = GetProcessImagePath(clientPid, proc);
+                    return IsAllowedHostBinary(exePath);
                 }
             }
             catch
@@ -529,7 +620,17 @@ namespace AirDeskElevatedService
 
         public static void Run()
         {
-            NativeApi.SetProcessDPIAware();
+            try
+            {
+                if (!NativeApi.SetProcessDpiAwarenessContext(NativeApi.DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2))
+                {
+                    NativeApi.SetProcessDPIAware();
+                }
+            }
+            catch
+            {
+                try { NativeApi.SetProcessDPIAware(); } catch { }
+            }
             StartPhysicalMouseMonitor();
 
             JavaScriptSerializer serializer = new JavaScriptSerializer { MaxJsonLength = 2000000 };
@@ -570,21 +671,32 @@ namespace AirDeskElevatedService
                         continue;
                     }
 
+                    string expectedSecret = LoadPipeSecret();
+                    if (string.IsNullOrEmpty(expectedSecret) || expectedSecret.Length < 16)
+                    {
+                        // Fail-Closed: never allow unauthenticated connections when pipe.secret is missing/empty
+                        continue;
+                    }
+
                     using (StreamReader reader = new StreamReader(server, Encoding.UTF8, false, 4096, true))
                     using (StreamWriter writer = new StreamWriter(server, new UTF8Encoding(false), 4096, true))
                     {
                         writer.AutoFlush = true;
 
-                        string expectedSecret = LoadPipeSecret();
-                        if (!string.IsNullOrEmpty(expectedSecret))
+                        string authLine = null;
+                        using (System.Threading.Timer authTimer = new System.Threading.Timer(_ =>
                         {
-                            string authLine = ReadLineBounded(reader, 2048);
-                            if (string.IsNullOrWhiteSpace(authLine)) continue;
-                            Dictionary<string, object> authObj = serializer.Deserialize<Dictionary<string, object>>(authLine);
-                            if (authObj == null || GetStr(authObj, "t") != "auth" || !FixedTimeEquals(GetStr(authObj, "secret"), expectedSecret))
-                            {
-                                continue;
-                            }
+                            try { server.Close(); } catch { }
+                        }, null, 3000, Timeout.Infinite))
+                        {
+                            authLine = ReadLineBounded(reader, 2048);
+                            authTimer.Change(Timeout.Infinite, Timeout.Infinite);
+                        }
+                        if (string.IsNullOrWhiteSpace(authLine)) continue;
+                        Dictionary<string, object> authObj = serializer.Deserialize<Dictionary<string, object>>(authLine);
+                        if (authObj == null || GetStr(authObj, "t") != "auth" || !FixedTimeEquals(GetStr(authObj, "secret"), expectedSecret))
+                        {
+                            continue;
                         }
 
                         lock (_pipeWriteLock)
@@ -709,6 +821,8 @@ namespace AirDeskElevatedService
                         int vh = Math.Max(1, NativeApi.GetSystemMetrics(NativeApi.SM_CYVIRTUALSCREEN));
                         int normX = (int)Math.Round(((px - vx) * 65535.0) / Math.Max(1, vw - 1));
                         int normY = (int)Math.Round(((py - vy) * 65535.0) / Math.Max(1, vh - 1));
+                        normX = Math.Max(0, Math.Min(65535, normX));
+                        normY = Math.Max(0, Math.Min(65535, normY));
                         SendMouse(normX, normY, NativeApi.MOUSEEVENTF_MOVE | NativeApi.MOUSEEVENTF_ABSOLUTE | NativeApi.MOUSEEVENTF_VIRTUALDESK);
                     }
                 }
@@ -801,10 +915,11 @@ namespace AirDeskElevatedService
                 if (!isInjected)
                 {
                     long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-                    if (now - _lastPhysicalNotifyMs > 600)
+                    long prev = Interlocked.Read(ref _lastPhysicalNotifyMs);
+                    if (now - prev > 600 && Interlocked.CompareExchange(ref _lastPhysicalNotifyMs, now, prev) == prev)
                     {
-                        _lastPhysicalNotifyMs = now;
-                        EmitPipeEvent("{\"event\":\"physical_mouse_override\"}");
+                        Interlocked.Exchange(ref _physicalMousePending, 1);
+                        _physicalMouseSignal.Set();
                     }
                 }
             }
@@ -813,12 +928,28 @@ namespace AirDeskElevatedService
 
         private static void StartPhysicalMouseMonitor()
         {
+            Thread notifyThread = new Thread(() =>
+            {
+                while (true)
+                {
+                    _physicalMouseSignal.WaitOne(500);
+                    if (Interlocked.Exchange(ref _physicalMousePending, 0) == 1)
+                    {
+                        EmitPipeEvent("{\"event\":\"physical_mouse_override\"}");
+                    }
+                }
+            });
+            notifyThread.IsBackground = true;
+            notifyThread.Start();
+
             Thread hookThread = new Thread(() =>
             {
                 _mouseProc = HookCallback;
-                NativeApi.SetWindowsHookEx(NativeApi.WH_MOUSE_LL, _mouseProc, IntPtr.Zero, 0);
+                _mouseHookHandle = NativeApi.SetWindowsHookEx(NativeApi.WH_MOUSE_LL, _mouseProc, IntPtr.Zero, 0);
                 NativeApi.MSG msg;
                 while (NativeApi.GetMessage(out msg, IntPtr.Zero, 0, 0)) { }
+                IntPtr h = Interlocked.Exchange(ref _mouseHookHandle, IntPtr.Zero);
+                if (h != IntPtr.Zero) NativeApi.UnhookWindowsHookEx(h);
             });
             hookThread.IsBackground = true;
             hookThread.Start();
@@ -839,11 +970,12 @@ namespace AirDeskElevatedService
         private static void SendVirtualKey(ushort vk, bool isExtended, bool keyUp)
         {
             uint flags = (isExtended ? NativeApi.KEYEVENTF_EXTENDEDKEY : 0u) | (keyUp ? NativeApi.KEYEVENTF_KEYUP : 0u);
+            ushort scan = (ushort)(NativeApi.MapVirtualKey(vk, NativeApi.MAPVK_VK_TO_VSC) & 0xFF);
             NativeApi.INPUT[] inputs = new NativeApi.INPUT[1];
             inputs[0].type = NativeApi.INPUT_KEYBOARD;
             inputs[0].u.ki = new NativeApi.KEYBDINPUT
             {
-                wVk = vk, wScan = 0, dwFlags = flags,
+                wVk = vk, wScan = scan, dwFlags = flags,
                 time = 0, dwExtraInfo = NativeApi.AIRDESK_MAGIC
             };
             NativeApi.SendInput(1, inputs, Marshal.SizeOf(typeof(NativeApi.INPUT)));

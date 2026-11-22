@@ -235,11 +235,15 @@ export function createRelayServer(options = {}) {
     const maskedIp = rawIp.replace(/^::ffff:/, '');
 
     ws.isAlive = true;
+    ws.lastActivityAt = Date.now();
     ws.on('pong', () => {
       ws.isAlive = true;
+      ws.lastActivityAt = Date.now();
     });
 
     ws.on('message', (raw) => {
+      ws.isAlive = true;
+      ws.lastActivityAt = Date.now();
       let msg;
       try {
         msg = JSON.parse(raw.toString('utf8'));
@@ -528,8 +532,9 @@ export function createRelayServer(options = {}) {
   });
 
   const pingInterval = setInterval(() => {
+    const now = Date.now();
     for (const client of wss.clients) {
-      if (client.isAlive === false) {
+      if (client.isAlive === false || now - (client.lastActivityAt || 0) > 75000) {
         try {
           client.terminate();
         } catch {}
@@ -564,5 +569,10 @@ if (isMain) {
   const relay = createRelayServer();
   relay.server.listen(port, host, () => {
     console.log(`[airdesk-relay-server] listening on http://${host}:${port} (ws path: /ws/signaling)`);
+    if (!String(process.env.RELAY_ACCESS_KEY || '').trim()) {
+      console.warn(
+        '[SECURITY WARNING] RELAY_ACCESS_KEY is empty! Any host on the network can create rooms and query /api/ice without authentication. Set RELAY_ACCESS_KEY before exposing to public networks.'
+      );
+    }
   });
 }

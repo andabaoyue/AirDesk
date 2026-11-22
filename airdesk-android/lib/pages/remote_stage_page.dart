@@ -147,7 +147,9 @@ class _RemoteStagePageState extends State<RemoteStagePage> with WidgetsBindingOb
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    if (state == AppLifecycleState.inactive || state == AppLifecycleState.paused) {
+    if (state == AppLifecycleState.inactive ||
+        state == AppLifecycleState.paused ||
+        state == AppLifecycleState.hidden) {
       _longPressTimer?.cancel();
       if (_lockedMods.isNotEmpty) {
         setState(() => _lockedMods.clear());
@@ -158,12 +160,22 @@ class _RemoteStagePageState extends State<RemoteStagePage> with WidgetsBindingOb
       if (widget.session.controlEnabled) {
         widget.session.sendReliable({'t': 'k:release_all', 'reason': 'android_background'});
       }
+      if (state == AppLifecycleState.paused || state == AppLifecycleState.hidden) {
+        NativeBridge.setPointerCapture(false);
+        NativeBridge.setCaptureExternalInput(false);
+        NativeBridge.setLowLatencyLocks(false);
+      }
       return;
     }
     if (state == AppLifecycleState.resumed) {
+      NativeBridge.enterStreamFullscreen();
+      NativeBridge.setLowLatencyLocks(true);
+      NativeBridge.setCaptureExternalInput(true);
       _syncPointerCaptureWithUi();
       if (widget.session.phase == SessionPhase.disconnected) {
         unawaited(widget.session.reconnectSaved());
+      } else if (widget.session.phase == SessionPhase.connected) {
+        unawaited(widget.session.verifyAliveOnResume());
       }
       if (_autoSyncClipboard && widget.session.controlEnabled) {
         Clipboard.getData(Clipboard.kTextPlain).then((data) {
@@ -369,7 +381,7 @@ class _RemoteStagePageState extends State<RemoteStagePage> with WidgetsBindingOb
                 top: rect.top,
                 width: rect.width,
                 height: rect.height,
-                child: tex,
+                child: RepaintBoundary(child: tex),
               ),
               ValueListenableBuilder<Offset?>(
                 valueListenable: _localCursorNorm,
@@ -384,20 +396,22 @@ class _RemoteStagePageState extends State<RemoteStagePage> with WidgetsBindingOb
                     top: cy - 12,
                     width: 24,
                     height: 24,
-                    child: IgnorePointer(
-                      child: Container(
-                        decoration: BoxDecoration(
-                          shape: BoxShape.circle,
-                          border: Border.all(color: const Color(0xCC22D3EE), width: 1.6),
-                          color: const Color(0x2222D3EE),
-                        ),
-                        child: Center(
-                          child: Container(
-                            width: 4,
-                            height: 4,
-                            decoration: const BoxDecoration(
-                              shape: BoxShape.circle,
-                              color: Color(0xEE22D3EE),
+                    child: RepaintBoundary(
+                      child: IgnorePointer(
+                        child: Container(
+                          decoration: BoxDecoration(
+                            shape: BoxShape.circle,
+                            border: Border.all(color: const Color(0xCC22D3EE), width: 1.6),
+                            color: const Color(0x2222D3EE),
+                          ),
+                          child: Center(
+                            child: Container(
+                              width: 4,
+                              height: 4,
+                              decoration: const BoxDecoration(
+                                shape: BoxShape.circle,
+                                color: Color(0xEE22D3EE),
+                              ),
                             ),
                           ),
                         ),
@@ -765,15 +779,17 @@ class _RemoteStagePageState extends State<RemoteStagePage> with WidgetsBindingOb
                     ),
                   ),
 
-                // Debug telemetry HUD pill (top-left, hidden by default; isolated via ListenableBuilder)
+                // Debug telemetry HUD pill (top-left, hidden by default; isolated via ListenableBuilder + RepaintBoundary)
                 if (_showHud)
                   Positioned(
                     top: 10,
                     left: 14,
-                    child: IgnorePointer(
-                      child: ListenableBuilder(
-                        listenable: widget.session,
-                        builder: (_, _) => _buildTelemetryHud(),
+                    child: RepaintBoundary(
+                      child: IgnorePointer(
+                        child: ListenableBuilder(
+                          listenable: widget.session,
+                          builder: (_, _) => _buildTelemetryHud(),
+                        ),
                       ),
                     ),
                   ),

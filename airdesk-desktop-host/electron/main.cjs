@@ -435,14 +435,24 @@ function connectElevatedPipe(timeoutMs = 2500) {
     }, timeoutMs);
 
     client.on('connect', () => {
+      let secret = '';
       try {
         if (fs.existsSync(ELEVATED_SECRET_PATH)) {
-          const secret = fs.readFileSync(ELEVATED_SECRET_PATH, 'utf8').trim();
-          if (secret) {
-            client.write(JSON.stringify({ t: 'auth', secret }) + '\n');
-          }
+          secret = fs.readFileSync(ELEVATED_SECRET_PATH, 'utf8').trim();
         }
       } catch {}
+      if (!secret || secret.length < 16) {
+        try { client.destroy(); } catch {}
+        finish(false);
+        return;
+      }
+      try {
+        client.write(JSON.stringify({ t: 'auth', secret }) + '\n');
+      } catch {
+        try { client.destroy(); } catch {}
+        finish(false);
+        return;
+      }
       elevatedPipeClient = client;
       if (helperRespawnTimer) {
         clearTimeout(helperRespawnTimer);

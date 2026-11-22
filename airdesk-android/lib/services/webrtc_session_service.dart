@@ -100,6 +100,7 @@ class WebRtcSessionService extends ChangeNotifier {
   bool audioMuted = true;
   int? lastRttMs;
   int jbSettingMs = 0;
+  int _lastRxAliveAtMs = 0;
 
   List<RemoteDisplayInfo> displays = [];
   String activeDisplayId = '';
@@ -669,6 +670,7 @@ class WebRtcSessionService extends ChangeNotifier {
         }
       }
     } else if (t == 'pong' && d['ts'] is num) {
+      _lastRxAliveAtMs = DateTime.now().millisecondsSinceEpoch;
       final rtt = (DateTime.now().millisecondsSinceEpoch - (d['ts'] as num).toInt()).clamp(1, 9999);
       lastRttMs = rtt;
       telemetry = telemetry.copyWithRx(rttMs: rtt);
@@ -681,6 +683,7 @@ class WebRtcSessionService extends ChangeNotifier {
       activeDisplayId = (d['activeDisplayId'] ?? '').toString();
       notifyListeners();
     } else if (t == 'diag:tx') {
+      _lastRxAliveAtMs = DateTime.now().millisecondsSinceEpoch;
       telemetry = telemetry.copyWithTx(d);
       notifyListeners();
     } else if (t == 'clip:data') {
@@ -1527,6 +1530,23 @@ class WebRtcSessionService extends ChangeNotifier {
     await _cleanupRtc();
     if (!silent) {
       _setPhase(SessionPhase.idle, '已断开');
+    }
+  }
+
+  Future<void> verifyAliveOnResume() async {
+    if (_manualDisconnect || phase != SessionPhase.connected) return;
+    final dc = _reliableDc;
+    final wsOpen = _ws != null;
+    if (dc == null || dc.state != RTCDataChannelState.RTCDataChannelOpen || !wsOpen) {
+      await reconnectSaved();
+      return;
+    }
+    final probeStartedAt = DateTime.now().millisecondsSinceEpoch;
+    sendReliable({'t': 'ping', 'ts': probeStartedAt});
+    await Future<void>.delayed(const Duration(milliseconds: 2200));
+    if (_manualDisconnect || phase != SessionPhase.connected) return;
+    if (_lastRxAliveAtMs < probeStartedAt) {
+      await reconnectSaved();
     }
   }
 

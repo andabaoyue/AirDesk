@@ -39,6 +39,8 @@ namespace AirDeskWinHelper
         private const int WH_MOUSE_LL = 14;
         private const uint LLMHF_INJECTED = 0x00000001;
         private const int WM_MOUSEMOVE = 0x0200;
+        private const uint MAPVK_VK_TO_VSC = 0;
+        private static readonly IntPtr DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = new IntPtr(-4);
 
         private const uint SPI_GETANIMATION = 0x0048;
         private const uint SPI_SETANIMATION = 0x0049;
@@ -100,7 +102,16 @@ namespace AirDeskWinHelper
         static extern bool SetProcessDPIAware();
 
         [DllImport("user32.dll", SetLastError = true)]
+        static extern bool SetProcessDpiAwarenessContext(IntPtr value);
+
+        [DllImport("user32.dll")]
+        static extern uint MapVirtualKey(uint uCode, uint uMapType);
+
+        [DllImport("user32.dll", SetLastError = true)]
         static extern IntPtr SetWindowsHookEx(int idHook, LowLevelMouseProc lpfn, IntPtr hMod, uint dwThreadId);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        static extern bool UnhookWindowsHookEx(IntPtr hhk);
 
         [DllImport("user32.dll")]
         static extern IntPtr CallNextHookEx(IntPtr hhk, int nCode, IntPtr wParam, IntPtr lParam);
@@ -112,7 +123,27 @@ namespace AirDeskWinHelper
         static extern bool SystemParametersInfo(uint uiAction, uint uiParam, ref ANIMATIONINFO pvParam, uint fWinIni);
 
         private static LowLevelMouseProc _mouseProc;
+        private static IntPtr _mouseHookHandle = IntPtr.Zero;
+        private static uint _hookThreadId = 0;
         private static long _lastPhysicalNotifyMs = 0;
+        private static int _physicalMousePending = 0;
+        private static readonly AutoResetEvent _physicalMouseSignal = new AutoResetEvent(false);
+        private static volatile bool _hookStopping = false;
+        private static long _lastSendErrorLogMs = 0;
+
+        private static int _cachedVx = 0;
+        private static int _cachedVy = 0;
+        private static int _cachedVw = 1920;
+        private static int _cachedVh = 1080;
+        private static long _lastMetricsRefreshMs = 0;
+
+        [DllImport("kernel32.dll")]
+        static extern uint GetCurrentThreadId();
+
+        [DllImport("user32.dll")]
+        static extern bool PostThreadMessage(uint idThread, uint Msg, IntPtr wParam, IntPtr lParam);
+
+        private const uint WM_QUIT = 0x0012;
         private static readonly Dictionary<ushort, bool> _activeKeys = new Dictionary<ushort, bool>();
         private static bool _leftDown = false;
         private static bool _rightDown = false;
@@ -182,10 +213,11 @@ namespace AirDeskWinHelper
                 if (!isInjected)
                 {
                     long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-                    if (now - _lastPhysicalNotifyMs > 600)
+                    long prev = Interlocked.Read(ref _lastPhysicalNotifyMs);
+                    if (now - prev > 600 && Interlocked.CompareExchange(ref _lastPhysicalNotifyMs, now, prev) == prev)
                     {
-                        _lastPhysicalNotifyMs = now;
-                        Console.WriteLine("{\"event\":\"physical_mouse_override\"}");
+                        Interlocked.Exchange(ref _physicalMousePending, 1);
+                        _physicalMouseSignal.Set();
                     }
                 }
             }
@@ -194,15 +226,80 @@ namespace AirDeskWinHelper
 
         static void StartPhysicalMouseMonitor()
         {
+            _hookStopping = false;
+            Thread notifyThread = new Thread(() =>
+            {
+                while (!_hookStopping)
+                {
+                    _physicalMouseSignal.WaitOne(500);
+                    if (_hookStopping) break;
+                    if (Interlocked.Exchange(ref _physicalMousePending, 0) == 1)
+                    {
+                        try { Console.WriteLine("{\"event\":\"physical_mouse_override\"}"); } catch { }
+                    }
+                }
+            });
+            notifyThread.IsBackground = true;
+            notifyThread.Start();
+
             Thread hookThread = new Thread(() =>
             {
+                _hookThreadId = GetCurrentThreadId();
                 _mouseProc = HookCallback;
-                SetWindowsHookEx(WH_MOUSE_LL, _mouseProc, IntPtr.Zero, 0);
+                _mouseHookHandle = SetWindowsHookEx(WH_MOUSE_LL, _mouseProc, IntPtr.Zero, 0);
                 MSG msg;
                 while (GetMessage(out msg, IntPtr.Zero, 0, 0)) { }
+                IntPtr h = Interlocked.Exchange(ref _mouseHookHandle, IntPtr.Zero);
+                if (h != IntPtr.Zero) UnhookWindowsHookEx(h);
             });
             hookThread.IsBackground = true;
             hookThread.Start();
+        }
+
+        static void StopPhysicalMouseMonitor()
+        {
+            _hookStopping = true;
+            _physicalMouseSignal.Set();
+            IntPtr h = Interlocked.Exchange(ref _mouseHookHandle, IntPtr.Zero);
+            if (h != IntPtr.Zero)
+            {
+                try { UnhookWindowsHookEx(h); } catch { }
+            }
+            if (_hookThreadId != 0)
+            {
+                try { PostThreadMessage(_hookThreadId, WM_QUIT, IntPtr.Zero, IntPtr.Zero); } catch { }
+            }
+        }
+
+        static void InvokeSendInput(INPUT[] inputs)
+        {
+            if (inputs == null || inputs.Length == 0) return;
+            uint sent = SendInput((uint)inputs.Length, inputs, Marshal.SizeOf(typeof(INPUT)));
+            if (sent < inputs.Length)
+            {
+                int err = Marshal.GetLastWin32Error();
+                long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+                long prev = Interlocked.Read(ref _lastSendErrorLogMs);
+                if (now - prev >= 5000 && Interlocked.CompareExchange(ref _lastSendErrorLogMs, now, prev) == prev)
+                {
+                    try
+                    {
+                        Console.Error.WriteLine("[AirDeskWinHelper] SendInput incomplete: sent=" + sent + "/" + inputs.Length + " err=" + err);
+                    }
+                    catch { }
+                }
+            }
+        }
+
+        static void RefreshVirtualScreenBounds(bool force)
+        {
+            long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            if (!force && now - _lastMetricsRefreshMs < 2000) return;
+            _lastMetricsRefreshMs = now;
+            _cachedVx = GetSystemMetrics(SM_XVIRTUALSCREEN);
+            _cachedVy = GetSystemMetrics(SM_YVIRTUALSCREEN);
+            _cachedVw = Math.Max(1, GetSystemMetrics(SM_CXVIRTUALSCREEN));
+            _cachedVh = Math.Max(1, GetSystemMetrics(SM_CYVIRTUALSCREEN));
         }
 
         static void SendMouse(int dx, int dy, uint flags, uint mouseData = 0)
@@ -214,20 +311,21 @@ namespace AirDeskWinHelper
                 dx = dx, dy = dy, mouseData = mouseData,
                 dwFlags = flags, time = 0, dwExtraInfo = AIRDESK_MAGIC
             };
-            SendInput(1, inputs, Marshal.SizeOf(typeof(INPUT)));
+            InvokeSendInput(inputs);
         }
 
         static void SendVirtualKey(ushort vk, bool isExtended, bool keyUp)
         {
             uint flags = (isExtended ? KEYEVENTF_EXTENDEDKEY : 0u) | (keyUp ? KEYEVENTF_KEYUP : 0u);
+            ushort scan = (ushort)(MapVirtualKey(vk, MAPVK_VK_TO_VSC) & 0xFF);
             INPUT[] inputs = new INPUT[1];
             inputs[0].type = INPUT_KEYBOARD;
             inputs[0].u.ki = new KEYBDINPUT
             {
-                wVk = vk, wScan = 0, dwFlags = flags,
+                wVk = vk, wScan = scan, dwFlags = flags,
                 time = 0, dwExtraInfo = AIRDESK_MAGIC
             };
-            SendInput(1, inputs, Marshal.SizeOf(typeof(INPUT)));
+            InvokeSendInput(inputs);
         }
 
         static void SendUnicodeText(string text)
@@ -239,7 +337,7 @@ namespace AirDeskWinHelper
                 list.Add(new INPUT { type = INPUT_KEYBOARD, u = new InputUnion { ki = new KEYBDINPUT { wVk = 0, wScan = ch, dwFlags = KEYEVENTF_UNICODE, dwExtraInfo = AIRDESK_MAGIC } } });
                 list.Add(new INPUT { type = INPUT_KEYBOARD, u = new InputUnion { ki = new KEYBDINPUT { wVk = 0, wScan = ch, dwFlags = KEYEVENTF_UNICODE | KEYEVENTF_KEYUP, dwExtraInfo = AIRDESK_MAGIC } } });
             }
-            SendInput((uint)list.Count, list.ToArray(), Marshal.SizeOf(typeof(INPUT)));
+            InvokeSendInput(list.ToArray());
         }
 
         static bool TryMapCodeToVk(string code, out ushort vk, out bool isExtended)
@@ -360,7 +458,18 @@ namespace AirDeskWinHelper
         {
             Console.InputEncoding = Encoding.UTF8;
             Console.OutputEncoding = Encoding.UTF8;
-            SetProcessDPIAware();
+            try
+            {
+                if (!SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2))
+                {
+                    SetProcessDPIAware();
+                }
+            }
+            catch
+            {
+                try { SetProcessDPIAware(); } catch { }
+            }
+            RefreshVirtualScreenBounds(true);
             StartPhysicalMouseMonitor();
 
             JavaScriptSerializer serializer = new JavaScriptSerializer { MaxJsonLength = 2000000 };
@@ -389,12 +498,11 @@ namespace AirDeskWinHelper
                             double px, py;
                             if (TryGetDouble(obj, "px", out px) && TryGetDouble(obj, "py", out py))
                             {
-                                int vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
-                                int vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
-                                int vw = Math.Max(1, GetSystemMetrics(SM_CXVIRTUALSCREEN));
-                                int vh = Math.Max(1, GetSystemMetrics(SM_CYVIRTUALSCREEN));
-                                int normX = (int)Math.Round(((px - vx) * 65535.0) / Math.Max(1, vw - 1));
-                                int normY = (int)Math.Round(((py - vy) * 65535.0) / Math.Max(1, vh - 1));
+                                RefreshVirtualScreenBounds(false);
+                                int normX = (int)Math.Round(((px - _cachedVx) * 65535.0) / Math.Max(1, _cachedVw - 1));
+                                int normY = (int)Math.Round(((py - _cachedVy) * 65535.0) / Math.Max(1, _cachedVh - 1));
+                                normX = Math.Max(0, Math.Min(65535, normX));
+                                normY = Math.Max(0, Math.Min(65535, normY));
                                 SendMouse(normX, normY, MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK);
                             }
                         }
@@ -458,6 +566,7 @@ namespace AirDeskWinHelper
             }
             finally
             {
+                StopPhysicalMouseMonitor();
                 SetWindowAnimationSuppressed(false);
                 ReleaseAllKeysAndMouse();
             }

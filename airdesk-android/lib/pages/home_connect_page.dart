@@ -801,6 +801,7 @@ class _HomeConnectPageState extends State<HomeConnectPage> {
               file: picked,
               token: savedToken,
               pin: pinCtrl.text.trim(),
+              deleteSourceOnFinish: true,
               onProgress: (sent, total) {
                 if (!ctx.mounted) return;
                 setSheetState(() {
