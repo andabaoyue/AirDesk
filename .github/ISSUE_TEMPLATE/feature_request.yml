@@ -1,0 +1,30 @@
+name: 功能建议与体验优化 (Feature Request)
+description: 提出新特性想法、交互手势建议或特定场景优化需求
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        注意：AirDesk 明确**不引入虚拟显示器驱动（VDD）**，除此边界外的跨端体验、延迟优化与工程化建议均欢迎提出。
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: 你遇到了什么场景需求或痛点？
+      placeholder: "描述具体使用场景，例如：多指触控、快捷键、外接手柄等..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: 你期望的解决方案或交互方式
+      placeholder: "描述你希望如何工作..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: 额外上下文（设备型号、参考项目、截图等）

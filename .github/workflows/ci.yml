@@ -1,0 +1,61 @@
+name: AirDesk CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  relay-test:
+    name: Relay Server Smoke Tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: airdesk-relay-server
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: airdesk-relay-server/package-lock.json
+      - run: npm ci
+      - run: npm test
+
+  desktop-check:
+    name: Desktop Host Syntax & Win Helper Build
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: airdesk-desktop-host
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: airdesk-desktop-host/package-lock.json
+      - run: npm ci
+      - run: npm test
+      - run: npm run prebuild:win
+
+  android-check:
+    name: Android Analyze & Unit Tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: airdesk-android
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      - run: flutter pub get
+      - run: flutter analyze
+      - run: flutter test

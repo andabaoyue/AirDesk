@@ -1,0 +1,70 @@
+name: Bug 反馈 (Bug Report)
+description: 上报卡顿、连接失败、输入异常、画质/编解码兼容或文件传输问题
+title: "[Bug]: "
+labels: ["bug", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢提交 Bug 反馈！请在提交前先确认是否已查阅 [常见问题排查指南](https://github.com/andabaoyue/AirDesk/blob/main/docs/troubleshooting.md)。
+        **安全漏洞请勿直接公开发布细节**，请通过 GitHub Security Advisories 私密上报。
+
+  - type: checkboxes
+    id: components
+    attributes:
+      label: 出现问题的端 / 模块
+      options:
+        - label: Desktop Host（电脑被控端 · Windows / macOS）
+        - label: Android Client（手机控制端 APK）
+        - label: Embedded Web PWA（手机浏览器备用页）
+        - label: Relay Server（自建公网 WSS 中继）
+
+  - type: dropdown
+    id: network_mode
+    attributes:
+      label: 使用的连接模式
+      options:
+        - 局域网 Wi-Fi 直连
+        - 手机个人热点直连
+        - USB 数据线（RNDIS / adb reverse）
+        - Tailscale / ZeroTier 异地组网
+        - 自托管公网 WSS 中继（+ STUN/TURN）
+    validations:
+      required: true
+
+  - type: input
+    id: versions
+    attributes:
+      label: 版本号
+      description: 例如 Desktop v0.5.15 / Android v0.7.5 / Relay v1.0.0
+      placeholder: "Desktop v0.5.15 · Android v0.7.5"
+    validations:
+      required: true
+
+  - type: input
+    id: environment
+    attributes:
+      label: 操作系统、显卡与手机型号
+      description: 涉及编解码/花屏/延迟时尤为重要
+      placeholder: "例如：Windows 11 + NVIDIA/AMD/Intel 显卡；小米/Pixel Android 14"
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: 问题描述与复现步骤
+      description: 请描述做了什么操作后出现什么现象，与预期行为有何差异
+      placeholder: |
+        1. 打开桌面端并选择...
+        2. 手机端连接到...
+        3. 操作 ... 后出现 ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: telemetry
+    attributes:
+      label: 调试 HUD 遥测数据 / 日志（如有）
+      description: 手机端可在悬浮抽屉开启「调试 HUD」，粘贴 PC/手机两行编解码、缓冲(ms)、RTT 与掉帧数据，或附上脱敏后的报错日志（请勿包含个人 IP/Token）
+      render: text

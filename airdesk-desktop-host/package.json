@@ -1,0 +1,55 @@
+{
+  "name": "airdesk-desktop-host",
+  "version": "0.5.15",
+  "description": "AirDesk Unified Electron Desktop Host — Adaptive HW encode detection, LAN/Hotspot UDP discovery, Android APK & PWA dual-client support, low-latency WebRTC, bidirectional file transfer & optional SYSTEM input service.",
+  "author": "AirDesk Contributors",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/andabaoyue/AirDesk.git"
+  },
+  "homepage": "https://github.com/andabaoyue/AirDesk#readme",
+  "bugs": {
+    "url": "https://github.com/andabaoyue/AirDesk/issues"
+  },
+  "main": "electron/main.cjs",
+  "scripts": {
+    "start": "electron .",
+    "dev": "electron .",
+    "test": "node -c electron/main.cjs && node -c electron/preload.cjs && node -c renderer/host.js",
+    "prebuild:win": "C:\\Windows\\Microsoft.NET\\Framework64\\v4.0.30319\\csc.exe /nologo /optimize+ /r:System.Web.Extensions.dll /out:native\\airdesk-win-helper.exe native\\win-input-helper.cs && C:\\Windows\\Microsoft.NET\\Framework64\\v4.0.30319\\csc.exe /nologo /optimize+ /r:System.ServiceProcess.dll /r:System.Web.Extensions.dll /out:native\\airdesk-elevated-service.exe native\\win-elevated-service.cs",
+    "build:win": "electron-builder --win nsis",
+    "prebuild:mac": "swiftc -O native/mac-input-helper.swift -o native/airdesk-mac-helper",
+    "build:mac": "electron-builder --mac dmg"
+  },
+  "dependencies": {
+    "qrcode": "^1.5.4",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "electron": "^33.2.0",
+    "electron-builder": "^25.1.8"
+  },
+  "build": {
+    "appId": "dev.airdesk.host",
+    "productName": "AirDesk Host",
+    "files": [
+      "electron/**/*",
+      "native/**/*",
+      "renderer/**/*"
+    ],
+    "asarUnpack": [
+      "native/**/*"
+    ],
+    "win": {
+      "icon": "build/icon.ico",
+      "target": "nsis",
+      "requestedExecutionLevel": "asInvoker"
+    },
+    "mac": {
+      "icon": "build/icon.png",
+      "target": "dmg",
+      "category": "public.app-category.utilities"
+    }
+  }
+}

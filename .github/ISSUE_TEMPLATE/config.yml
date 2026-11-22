@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 使用问答与实测反馈讨论区 (Discussions)
+    url: https://github.com/andabaoyue/AirDesk/discussions
+    about: 交流帧率/延迟实测成绩、公网中继部署经验与使用技巧
+  - name: 安全漏洞私密报告 (Security Policy)
+    url: https://github.com/andabaoyue/AirDesk/security/policy
+    about: 如发现越权、路径穿越或输入注入安全隐患，请通过私密渠道披露

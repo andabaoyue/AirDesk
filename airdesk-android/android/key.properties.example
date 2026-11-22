@@ -1,0 +1,5 @@
+# Copy to android/key.properties for local signed release builds (never commit key.properties or *.jks)
+storeFile=../../airdesk-release.jks
+storePassword=change-me-store-password
+keyAlias=airdesk
+keyPassword=change-me-key-password

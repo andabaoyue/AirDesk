@@ -1,0 +1,42 @@
+# Local archives, probe scripts & backups (excluded before open-source push)
+archive/
+_probe/
+*.zip
+
+# Dependencies & build outputs
+node_modules/
+dist/
+/build/
+airdesk-android/build/
+airdesk-android/android/**/build/
+.dart_tool/
+.gradle/
+airdesk-desktop-host/native/*.exe
+airdesk-desktop-host/native/airdesk-mac-helper
+airdesk-android/release/
+
+# Android / signing / local env secrets
+*.apk
+*.aab
+*.jks
+*.keystore
+key.properties
+local.properties
+
+# Runtime user data, env & logs
+.env
+.env.*
+!.env.example
+trusted-tokens.json
+*.log
+*.pem
+*.p12
+.DS_Store
+Thumbs.db
+
+# IDE & temporary build files
+.vscode/
+.idea/
+*.iml
+airdesk-desktop-host/out/
+airdesk-desktop-host/build/*.tmp

@@ -1,0 +1,22 @@
+{
+  "name": "airdesk-relay-server",
+  "version": "1.0.0",
+  "description": "Standalone lightweight WebSocket signaling + STUN/TURN credential relay for AirDesk remote desktop.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/andabaoyue/AirDesk.git"
+  },
+  "type": "module",
+  "main": "server.mjs",
+  "scripts": {
+    "start": "node server.mjs",
+    "test": "node test/smoke.mjs"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

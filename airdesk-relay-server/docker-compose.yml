@@ -1,0 +1,34 @@
+services:
+  airdesk-relay:
+    build: .
+    container_name: airdesk-relay-server
+    restart: unless-stopped
+    ports:
+      - "47820:47820"
+    environment:
+      PORT: "47820"
+      # 可选：填写访问密钥后，只有知道密钥的电脑端才能创建房间（防止公开中继被陌生人占用）
+      RELAY_ACCESS_KEY: ""
+      # STUN 服务器（默认已内置 miwifi + google）
+      STUN_URLS: "stun:stun.miwifi.com:3478,stun:stun.l.google.com:19302"
+      # 如需企业/对称 NAT 穿透中继，取消注释并配置下方 coturn 或自建 TURN
+      # TURN_URLS: "turn:your-domain.com:3478?transport=udp,turn:your-domain.com:3478?transport=tcp"
+      # TURN_SECRET: "replace-with-strong-random-secret"
+      # TURN_TTL_SEC: "86400"
+
+  # 可选：同时部署 coturn 中继服务器（当手机移动网络与公司严格对称 NAT 无法 P2P 打洞时兜底）
+  # coturn:
+  #   image: coturn/coturn:latest
+  #   container_name: airdesk-coturn
+  #   restart: unless-stopped
+  #   network_mode: host
+  #   command:
+  #     - -n
+  #     - --log-file=stdout
+  #     - --listening-port=3478
+  #     - --fingerprint
+  #     - --use-auth-secret
+  #     - --static-auth-secret=replace-with-strong-random-secret
+  #     - --realm=your-domain.com
+  #     - --min-port=49152
+  #     - --max-port=65535

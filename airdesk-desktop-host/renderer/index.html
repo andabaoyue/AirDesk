@@ -1,0 +1,424 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta
+    http-equiv="Content-Security-Policy"
+    content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self' ws: wss: http: https:; img-src 'self' data:;"
+  />
+  <title>AirDesk Desktop Host v0.5.15</title>
+  <style>
+    * { box-sizing: border-box; }
+    :root {
+      --bg: #070B11;
+      --card: #101622;
+      --card-inner: #0A0F18;
+      --border: #1E293B;
+      --border-soft: #263347;
+      --text: #F1F5F9;
+      --muted: #94A3B8;
+      --blue: #2563EB;
+      --blue-soft: #60A5FA;
+      --green: #059669;
+      --green-soft: #34D399;
+      --red: #DC2626;
+      --amber: #FBBF24;
+    }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
+      padding: 16px 20px 22px;
+      font-size: 13.5px;
+    }
+    ::-webkit-scrollbar { width: 8px; height: 8px; }
+    ::-webkit-scrollbar-track { background: #070B11; }
+    ::-webkit-scrollbar-thumb { background: #1E293B; border-radius: 99px; }
+    ::-webkit-scrollbar-thumb:hover { background: #334155; }
+
+    .app { max-width: 1080px; margin: 0 auto; display: flex; flex-direction: column; gap: 12px; }
+
+    /* Top Command Bar */
+    .topbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 14px;
+      padding: 12px 16px;
+      background: rgba(16, 22, 34, 0.92);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      flex-wrap: wrap;
+    }
+    .brand { display: flex; align-items: center; gap: 11px; }
+    .brand-icon {
+      width: 36px; height: 36px; border-radius: 10px;
+      background: linear-gradient(135deg, #2563EB, #1D4ED8);
+      display: flex; align-items: center; justify-content: center;
+      font-weight: 800; font-size: 15px; color: #fff;
+      box-shadow: 0 4px 14px rgba(37, 99, 235, 0.35);
+      flex-shrink: 0;
+    }
+    .brand-title { display: flex; align-items: center; gap: 7px; font-weight: 700; font-size: 16px; }
+    .badge-ver {
+      font-size: 10.5px; font-weight: 600; padding: 2px 7px; border-radius: 6px;
+      background: #172554; color: #93C5FD; border: 1px solid #2563EB;
+    }
+    .pill {
+      display: inline-flex; align-items: center; gap: 6px;
+      font-size: 11.5px; font-weight: 600; padding: 3px 10px; border-radius: 999px;
+      background: #0F172A; color: var(--muted); border: 1px solid #334155;
+    }
+    .pill-dot { width: 7px; height: 7px; border-radius: 50%; background: #64748B; }
+    .pill.waiting { color: #93C5FD; border-color: #2563EB; background: rgba(37, 99, 235, 0.14); }
+    .pill.waiting .pill-dot { background: #60A5FA; }
+    .pill.live { color: #34D399; border-color: #059669; background: rgba(5, 150, 105, 0.14); }
+    .pill.live .pill-dot { background: #34D399; }
+    .brand-sub { font-size: 11.5px; color: var(--muted); margin-top: 2px; }
+
+    .actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+
+    button {
+      background: var(--blue); color: #fff; border: 1px solid rgba(255,255,255,0.08);
+      border-radius: 9px; padding: 8px 14px; cursor: pointer;
+      font-weight: 600; font-size: 12.5px; transition: filter 0.15s ease, opacity 0.15s ease;
+    }
+    button:hover:not(:disabled) { filter: brightness(1.1); }
+    button.secondary { background: #192232; color: #CBD5E1; border-color: #2B394F; }
+    button.danger { background: var(--red); }
+    button.emerald { background: var(--green); }
+    button.sm { padding: 5px 10px; font-size: 11.5px; border-radius: 7px; }
+    button:disabled { opacity: 0.42; cursor: not-allowed; }
+
+    input[type="text"], select {
+      background: #080C13; color: var(--text);
+      border: 1px solid #2A374C; border-radius: 9px;
+      padding: 8px 11px; font-size: 12.5px; outline: none; width: 100%;
+    }
+    input[type="text"]:focus, select:focus { border-color: var(--blue-soft); }
+
+    /* Segmented Tabs */
+    .tabs {
+      display: grid; grid-template-columns: repeat(3, 1fr); gap: 5px;
+      padding: 4px; background: #0B101A; border: 1px solid var(--border); border-radius: 12px;
+    }
+    .tab-btn {
+      background: transparent; border: 0; color: var(--muted);
+      padding: 8px 12px; border-radius: 9px; font-size: 13px; font-weight: 600;
+    }
+    .tab-btn.active { background: var(--blue); color: #fff; }
+    .tab-panel { display: none; flex-direction: column; gap: 12px; }
+    .tab-panel.active { display: flex; }
+
+    .card {
+      background: var(--card); border: 1px solid var(--border);
+      border-radius: 14px; padding: 15px 17px;
+    }
+    .card-head {
+      display: flex; align-items: center; justify-content: space-between;
+      gap: 10px; margin-bottom: 10px;
+    }
+    .card-title { font-weight: 600; font-size: 13.5px; color: #E2E8F0; }
+
+    /* Overview Hero */
+    .hero-grid { display: grid; grid-template-columns: 1fr auto; gap: 16px; align-items: stretch; }
+    .code-row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin: 4px 0 8px; }
+    .code {
+      font-family: ui-monospace, Consolas, monospace;
+      font-size: 38px; line-height: 1.05; letter-spacing: 0.2em;
+      font-weight: 700; color: var(--blue-soft);
+    }
+    .quick-toggles { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+    label.toggle-chip {
+      display: inline-flex; align-items: center; gap: 7px;
+      padding: 6px 11px; border-radius: 9px; font-size: 12.5px; color: #CBD5E1;
+      background: var(--card-inner); border: 1px solid #233044; cursor: pointer;
+    }
+    label.toggle-chip input { accent-color: var(--blue); cursor: pointer; }
+
+    #qrBox {
+      background: #fff; padding: 10px; border-radius: 12px;
+      width: 176px; height: 176px; display: flex; align-items: center; justify-content: center;
+      flex-shrink: 0; align-self: center;
+    }
+    #qrImg { width: 156px; height: 156px; display: none; }
+
+    /* Telemetry Box */
+    .mono { font-family: ui-monospace, Consolas, monospace; font-size: 12px; color: var(--muted); }
+    .stats-box {
+      margin-top: 8px; padding: 10px 12px; border-radius: 10px;
+      background: #070B11; border: 1px solid #1B2536;
+      font-family: ui-monospace, Consolas, monospace; font-size: 12px;
+      color: var(--green-soft); white-space: pre-line; line-height: 1.55; min-height: 44px;
+    }
+    .alert { color: var(--amber); margin-top: 8px; font-size: 12.5px; }
+
+    /* Settings 2-column grid */
+    .grid-2col { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+    .field { display: flex; flex-direction: column; gap: 5px; margin-bottom: 10px; }
+    .field:last-child { margin-bottom: 0; }
+    .field label { font-size: 12px; color: var(--muted); }
+    .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 8px; }
+
+    .hk-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: 8px; }
+    .hk-item {
+      background: var(--card-inner); border: 1px solid var(--border);
+      border-radius: 9px; padding: 8px 11px; display: flex; justify-content: space-between;
+      align-items: center; font-size: 12px;
+    }
+    .hk-key {
+      font-family: ui-monospace, Consolas, monospace;
+      color: var(--blue-soft); font-weight: 600;
+      background: #0F172A; padding: 2px 6px; border-radius: 5px; border: 1px solid #243247;
+    }
+
+    @media (max-width: 780px) {
+      .hero-grid, .grid-2col { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <!-- Top Command Bar -->
+    <header class="topbar">
+      <div class="brand">
+        <div class="brand-icon">AD</div>
+        <div>
+          <div class="brand-title">
+            <span>AirDesk Host</span>
+            <span class="badge-ver">v0.5.15</span>
+            <span id="livePill" class="pill"><span class="pill-dot"></span><span>未启动</span></span>
+          </div>
+          <div class="brand-sub">局域网热点 0 流量直连 · Tailscale 异地组网 · 公网 WSS 中继</div>
+        </div>
+      </div>
+      <div class="actions">
+        <button id="btnStart">启动串流与配对 (Ctrl+Alt+S)</button>
+        <button id="btnStop" class="danger" disabled>停止共享</button>
+        <button id="btnToggleCtrl" class="secondary" disabled>当前：仅观看（只读）(Ctrl+Alt+L)</button>
+      </div>
+    </header>
+
+    <!-- Incoming Connection Approval Card -->
+    <div id="approvalCard" class="card" style="display:none; border-color: #2563EB; background: #0E1729;">
+      <div class="card-head" style="margin-bottom:6px;">
+        <div class="card-title" style="color:#93C5FD;">收到设备连接请求（快捷键：Ctrl+Alt+Y 批准 / Ctrl+Alt+N 拒绝）</div>
+      </div>
+      <p id="approvalDesc" style="margin:4px 0 10px;"></p>
+      <div class="row" style="margin-top:0;">
+        <button id="btnAllowFull" class="emerald">允许观看与操控 (Ctrl+Alt+Y)</button>
+        <button id="btnAllowView" class="secondary">仅允许观看（只读）</button>
+        <button id="btnReject" class="danger">拒绝 (Ctrl+Alt+N)</button>
+      </div>
+    </div>
+
+    <!-- 3-Tab Switcher -->
+    <nav class="tabs" aria-label="功能分区">
+      <button type="button" class="tab-btn active" data-tab="overview">连接与监控</button>
+      <button type="button" class="tab-btn" data-tab="settings">画质与网络</button>
+      <button type="button" class="tab-btn" data-tab="devices">设备与快捷键</button>
+    </nav>
+
+    <!-- Tab 0: Overview (Pairing + Audio/Overlay Quick Switches + Live Telemetry) -->
+    <section id="tab-overview" class="tab-panel active">
+      <div class="card hero-grid">
+        <div>
+          <div class="card-title">当前 6 位配对码（30 分钟有效 · 已批准设备 7 天免密秒连）</div>
+          <div class="code-row">
+            <div id="pairCode" class="code">------</div>
+            <button id="btnCopyCode" type="button" class="secondary sm">复制配对码</button>
+          </div>
+          <div id="qrLinkText" class="mono" style="word-break: break-all;">启动串流后将生成直连地址与二维码</div>
+          <div id="tailscaleLinkRow" class="row" style="display:none;">
+            <span id="tailscaleLinkText" class="mono" style="color:#34D399; word-break:break-all;"></span>
+            <button id="btnCopyTailscale" type="button" class="secondary sm">复制异地地址</button>
+            <button id="btnToggleQrMode" type="button" class="secondary sm">切换异地二维码</button>
+          </div>
+          <div class="quick-toggles">
+            <label class="toggle-chip" title="Windows 上同步采集桌面音频至手机端；手机端也可在连接后远程一键开关">
+              <input id="enableAudio" type="checkbox" />
+              <span>同步电脑声音 (Windows)</span>
+            </label>
+            <label class="toggle-chip" title="开启后放行 Tailscale / ZeroTier 100.64.0.0/10 虚拟组网候选，仅拦截 Clash/Mihomo 198.18.0.0/15">
+              <input id="allowVirtualNet" type="checkbox" />
+              <span>允许 Tailscale / ZeroTier 异地组网</span>
+            </label>
+          </div>
+          <div class="row" style="margin-top: 10px;">
+            <span id="firewallBadge" class="pill"><span class="pill-dot"></span><span>防火墙检测中</span></span>
+            <button id="btnFixFirewall" type="button" class="secondary sm" style="display:none;">一键放行 47820 端口 (UAC)</button>
+            <button id="btnUsbDirect" type="button" class="secondary sm">USB 一键直连 (ADB/RNDIS)</button>
+            <button id="btnUsbTether" type="button" class="secondary sm">弹出手机 USB 共享设置</button>
+          </div>
+          <div id="usbDirectHint" class="mono" style="display:none; color:#34D399; margin-top:6px; word-break:break-all;"></div>
+        </div>
+        <div id="qrBox">
+          <img id="qrImg" alt="配对二维码" />
+          <span id="qrPlaceholder" style="color:#64748B;font-size:12px;text-align:center;">启动串流后<br/>生成扫码直连二维码</span>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-head">
+          <div class="card-title">实时串流遥测与链路状态</div>
+          <span id="status" class="mono" style="color:#CBD5E1;">未启动</span>
+        </div>
+        <div id="rtcStats" class="stats-box">等待启动串流或手机端接入后显示实时帧率、编解码耗时与网络 RTT...</div>
+        <div id="overrideNotice" class="alert" style="display: none;"></div>
+        <p id="netInfo" class="mono" style="margin: 10px 0 0; line-height: 1.55;">正在读取本机网卡、显示器与本地信令服务...</p>
+      </div>
+
+      <div class="card">
+        <div class="card-head">
+          <div class="card-title">双向文件互传（独立 file-transfer 通道 · 不阻塞键鼠）</div>
+          <div class="row" style="margin-top:0;">
+            <button id="btnSendFiles" type="button" class="secondary sm">选择文件发往手机</button>
+            <button id="btnOpenDownloads" type="button" class="secondary sm">打开接收目录</button>
+          </div>
+        </div>
+        <input id="fileSendInput" type="file" multiple style="display:none;" />
+        <div
+          id="fileDropZone"
+          style="border:1px dashed #334155; border-radius:10px; padding:12px 14px; background:#0A0F18; text-align:center; color:#94A3B8; font-size:12.5px; cursor:pointer;"
+        >
+          将文件拖入此处，或点击「选择文件发往手机」（手机发来的文件自动保存至「下载/AirDesk」）
+        </div>
+        <div id="fileTransferStatus" class="mono" style="margin-top:8px;">等待建立 WebRTC 连接后可互传文件（单文件上限 500MB）</div>
+        <div id="fileProgressWrap" style="display:none; width:100%; height:6px; border-radius:99px; background:#0F172A; overflow:hidden; margin-top:6px;">
+          <div id="fileProgressBar" style="width:0%; height:100%; background:#2563EB; transition:width 0.12s ease;"></div>
+        </div>
+        <div id="fileTransferLog" class="mono" style="margin-top:6px; color:#34D399; white-space:pre-line;"></div>
+      </div>
+    </section>
+
+    <!-- Tab 1: Video & Network Settings -->
+    <section id="tab-settings" class="tab-panel">
+      <div class="grid-2col">
+        <div class="card">
+          <div class="card-head">
+            <div class="card-title">视频采集与编码策略</div>
+          </div>
+          <div class="field">
+            <label for="displaySelect">采集显示器</label>
+            <select id="displaySelect"></select>
+          </div>
+          <div class="field">
+            <label for="resolutionSelect">采集分辨率上限</label>
+            <select id="resolutionSelect">
+              <option value="1080p" selected>1080p 清晰推荐（1920×1080）</option>
+              <option value="900p">900p 极速高清（1600×900）</option>
+              <option value="720p">720p 极速（低配/弱网）</option>
+              <option value="native">原生分辨率（2K/4K 极清）</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="framerateSelect">采集帧率上限</label>
+            <select id="framerateSelect">
+              <option value="30" selected>30 fps 稳帧（推荐）</option>
+              <option value="60">60 fps 高刷（独显/高配，核显 1080p 可能卡顿）</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="contentHintSelect">编码器策略 (contentHint)</label>
+            <select id="contentHintSelect" title="自动：优先启用显卡硬编(detail)，若检测到回退软编则自动切低延迟(motion)">
+              <option value="auto" selected>自动硬编探测（推荐）</option>
+              <option value="detail">强制锐利硬编 (detail)</option>
+              <option value="motion">强制软编低延迟 (motion)</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="codecSelect">视频编码格式偏好</label>
+            <select id="codecSelect" title="默认优先 H.264 通用硬编；支持 HEVC 硬编的独显与支持 HEVC 硬解的手机可尝试 H.265/HEVC">
+              <option value="h264" selected>H.264 低延迟通用（推荐，全设备硬解）</option>
+              <option value="hevc">H.265 / HEVC 高清低码（支持硬编硬解时优先，否则自动回退 H.264）</option>
+            </select>
+          </div>
+          <div class="quick-toggles">
+            <label class="toggle-chip" title="在移动端浏览器备用端显示虚拟键盘入口；Android 原生客户端已自带快捷键工具条">
+              <input id="enableVkb" type="checkbox" />
+              <span>启用移动端网页虚拟键盘入口</span>
+            </label>
+            <label class="toggle-chip" title="连续 12 秒无鼠标键盘操作时自动降至 8fps 省电，收到任意操控立刻 0ms 恢复满帧">
+              <input id="enableIdleFpsSaver" type="checkbox" />
+              <span>空闲 12s 自动降帧节能 (8fps)</span>
+            </label>
+            <label class="toggle-chip" title="当允许操控且数据通道就绪时，检测到电脑剪贴板文本变化自动推送至手机端">
+              <input id="enableAutoClipboard" type="checkbox" />
+              <span>剪贴板自动同步至手机</span>
+            </label>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-head">
+            <div class="card-title">信令模式与 NAT 穿透</div>
+          </div>
+          <div class="field">
+            <label for="signalingMode">信令服务模式</label>
+            <select id="signalingMode">
+              <option value="local">内置本地信令（纯局域网/手机热点免公网扫码直连）</option>
+              <option value="remote">自定义远程 WSS 信令（支持跨网 / iOS Safari HTTPS）</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="serverUrl">信令服务地址</label>
+            <input id="serverUrl" type="text" placeholder="https://你的-airdesk-信令服务地址" />
+          </div>
+          <div class="field">
+            <label for="customStunUrl">可选 STUN / TURN（逗号分隔）</label>
+            <input id="customStunUrl" type="text" placeholder="支持 turn:user:pass@ip:3478" />
+          </div>
+          <div class="field">
+            <input id="relayAccessKey" type="text" style="display: none;" placeholder="可选中继访问密钥 (RELAY_ACCESS_KEY)" />
+          </div>
+          <div class="quick-toggles">
+            <label class="toggle-chip">
+              <input id="lanNoStun" type="checkbox" checked />
+              <span>纯局域网 / 手机热点免 STUN 极速直连</span>
+            </label>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Tab 2: Trusted Devices & Hotkeys -->
+    <section id="tab-devices" class="tab-panel">
+      <div class="card">
+        <div class="card-head">
+          <div class="card-title">已信任免密设备管理（7 天有效 · 物理急停 Ctrl+Alt+Esc 自动清空）</div>
+          <div class="row" style="margin-top:0;">
+            <button id="btnRefreshTrusted" type="button" class="secondary sm">刷新</button>
+            <button id="btnRevokeAllTokens" type="button" class="danger sm">清空全部免密凭证</button>
+          </div>
+        </div>
+        <div id="trustedDevicesList" class="mono">暂无已信任设备</div>
+      </div>
+
+      <div class="card">
+        <div class="card-head">
+          <div class="card-title">全局快捷键（关闭窗口最小化到托盘后依然可用）</div>
+        </div>
+        <div id="hotkeyList" class="hk-grid"></div>
+      </div>
+
+      <div class="card">
+        <div class="card-head">
+          <div class="card-title">Windows 后台提权服务（可选 · 管理员窗口 / UAC / 锁屏输入）</div>
+          <span id="serviceStatusBadge" class="pill"><span class="pill-dot"></span><span>普通绿色模式</span></span>
+        </div>
+        <div id="serviceStatusNote" class="mono" style="line-height: 1.6;">
+          当前以零门槛绿色模式运行，普通窗口操控完全正常；仅当需要远程操作管理员终端、UAC 提权框或锁屏界面时，才需点击下方按钮注册 SYSTEM 后台服务（注意：Windows 安全桌面下 Electron desktopCapturer 仍可能因系统隔离变黑，如需远程批准 UAC 建议在系统设置中调低 UAC 桌面变暗级别）。
+        </div>
+        <div class="row" style="margin-top: 10px;">
+          <button id="btnInstallService" type="button" class="secondary sm">安装并启动后台提权服务 (UAC)</button>
+          <button id="btnUninstallService" type="button" class="danger sm" style="display:none;">卸载服务（恢复绿色模式）</button>
+          <button id="btnRefreshService" type="button" class="secondary sm">刷新状态</button>
+        </div>
+      </div>
+    </section>
+  </div>
+
+  <script src="./host.js"></script>
+</body>
+</html>
