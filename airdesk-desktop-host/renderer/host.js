@@ -124,6 +124,7 @@ let activeTargetBitrateKbps = 15000;
 let lastSyncedClipboardText = '';
 let syncingClipboardPending = false;
 let lastPliHandledAt = 0;
+let disconnectGraceTimer = null;
 
 function initialTrackContentHint() {
   const pref = (contentHintSelect && contentHintSelect.value) || 'auto';
@@ -1736,6 +1737,8 @@ function attachFileTransferChannel(dc) {
           if (dc.readyState === 'open') {
             dc.send(JSON.stringify({ t: 'file:accept', id: msg.id }));
           }
+        }).catch((err) => {
+          console.error('[AirDesk FileRecv] file:offer error:', err);
         });
       } else if (t === 'file:done') {
         incomingFileWriteChain = incomingFileWriteChain.then(async () => {
@@ -1771,6 +1774,8 @@ function attachFileTransferChannel(dc) {
               );
             }
           }
+        }).catch((err) => {
+          console.error('[AirDesk FileRecv] file:done error:', err);
         });
       } else if (t === 'file:cancel') {
         incomingFileWriteChain = incomingFileWriteChain.then(async () => {
@@ -1780,6 +1785,8 @@ function attachFileTransferChannel(dc) {
             await window.airdeskAPI.fileRecvEnd(cur.id, false);
             updateFileTransferUi('对方取消了文件传输：' + cur.name, -1);
           }
+        }).catch((err) => {
+          console.error('[AirDesk FileRecv] file:cancel error:', err);
         });
       }
       return;
@@ -1817,11 +1824,17 @@ function attachFileTransferChannel(dc) {
           cur.expectedSize > 0 ? cur.receivedBytes / cur.expectedSize : 1
         );
       }
+    }).catch((err) => {
+      console.error('[AirDesk FileRecv] chunk write error:', err);
     });
   };
 }
 
 function cleanupPeerConnection() {
+  if (disconnectGraceTimer) {
+    clearTimeout(disconnectGraceTimer);
+    disconnectGraceTimer = null;
+  }
   if (statsTimer) {
     clearInterval(statsTimer);
     statsTimer = null;
@@ -2021,6 +2034,9 @@ async function startHost() {
       hostLabel: 'AirDesk Electron Desktop',
       audioEnabled: Boolean(enableAudioCheckbox && enableAudioCheckbox.checked),
     };
+    if (signalingModeSelect.value === 'local' && localSignalingInfo && localSignalingInfo.localHostToken) {
+      createPayload.localHostToken = localSignalingInfo.localHostToken;
+    }
     const rk = relayAccessKeyInput ? relayAccessKeyInput.value.trim() : '';
     if (rk) createPayload.accessKey = rk;
     ws.send(JSON.stringify(createPayload));
@@ -2323,11 +2339,12 @@ function ensurePlayoutDelayExtInSdp(sdp, preferredId = null) {
 async function handleOffer(remoteSdp) {
   cleanupPeerConnection();
 
-  pc = new RTCPeerConnection({
+  const currentPc = new RTCPeerConnection({
     iceServers: buildIceServers(),
     bundlePolicy: 'max-bundle',
     rtcpMuxPolicy: 'require',
   });
+  pc = currentPc;
 
 
 
@@ -2345,30 +2362,50 @@ async function handleOffer(remoteSdp) {
     return false;
   };
 
-  pc.onicecandidate = (e) => {
-    if (!e.candidate || !ws || ws.readyState !== WebSocket.OPEN) return;
+  currentPc.onicecandidate = (e) => {
+    if (pc !== currentPc || !e.candidate || !ws || ws.readyState !== WebSocket.OPEN) return;
     if (isVirtualCandidate(e.candidate.candidate)) return;
     ws.send(JSON.stringify({ type: 'rtc:ice', candidate: e.candidate }));
   };
 
-  pc.onconnectionstatechange = async () => {
-    if (!pc) return;
-    if (pc.connectionState === 'connected') {
+  const resetOnConnectionLost = async (stateLabel) => {
+    if (pc !== currentPc) return;
+    hasActivePeer = false;
+    currentControlEnabled = false;
+    if (isHosting) setLivePill('waiting', '待连接');
+    updateControlButtonUi();
+    await window.airdeskAPI.setSessionActive(false);
+    statusEl.textContent = 'WebRTC 链路已断开（' + stateLabel + '），已自动切回只读并释放所有按键';
+  };
+
+  currentPc.onconnectionstatechange = async () => {
+    if (pc !== currentPc) return;
+    const state = currentPc.connectionState;
+    if (state === 'connected') {
+      if (disconnectGraceTimer) {
+        clearTimeout(disconnectGraceTimer);
+        disconnectGraceTimer = null;
+      }
       hasActivePeer = true;
       setLivePill('live', '串流中');
       await window.airdeskAPI.setSessionActive(true);
       updateControlButtonUi();
-    } else if (
-      pc.connectionState === 'disconnected' ||
-      pc.connectionState === 'failed' ||
-      pc.connectionState === 'closed'
-    ) {
-      hasActivePeer = false;
-      currentControlEnabled = false;
-      if (isHosting) setLivePill('waiting', '待连接');
-      updateControlButtonUi();
-      await window.airdeskAPI.setSessionActive(false);
-      statusEl.textContent = 'WebRTC 链路已断开（' + pc.connectionState + '），已自动切回只读并释放所有按键';
+    } else if (state === 'disconnected') {
+      if (!disconnectGraceTimer) {
+        statusEl.textContent = 'WebRTC 链路波动 (disconnected)，等待 2.5s 自动恢复...';
+        disconnectGraceTimer = setTimeout(() => {
+          disconnectGraceTimer = null;
+          if (pc === currentPc && currentPc.connectionState !== 'connected') {
+            resetOnConnectionLost(currentPc.connectionState).catch(() => {});
+          }
+        }, 2500);
+      }
+    } else if (state === 'failed' || state === 'closed') {
+      if (disconnectGraceTimer) {
+        clearTimeout(disconnectGraceTimer);
+        disconnectGraceTimer = null;
+      }
+      await resetOnConnectionLost(state);
     }
   };
 

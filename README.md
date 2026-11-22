@@ -2,7 +2,7 @@
 
 <p align="left">
   <img alt="License: MIT" src="https://img.shields.io/badge/License-MIT-blue.svg" />
-  <img alt="Version: v0.8.0-beta.1" src="https://img.shields.io/badge/Release-v0.8.0--beta.1-emerald.svg" />
+  <img alt="Version: v0.8.1" src="https://img.shields.io/badge/Release-v0.8.1-emerald.svg" />
   <img alt="Desktop: Windows / macOS" src="https://img.shields.io/badge/Host-Windows%20%7C%20macOS-0EA5E9.svg" />
   <img alt="Client: Android / Web PWA" src="https://img.shields.io/badge/Client-Android%20APK%20%7C%20Web%20PWA-34D399.svg" />
 </p>
@@ -10,7 +10,7 @@
 **AirDesk** 是一款面向个人自用与开源社区的**超低延迟跨端屏幕串流与远程桌面控制工具**，基于 WebRTC（H.264 / H.265 硬编硬解协商、零缓冲 Playout 控制）与原生 OS 输入注入构建，支持**局域网 / 手机热点 / USB 有线 0 流量直连**、**Tailscale / ZeroTier 异地组网直连**与**自托管公网 WSS + STUN/TURN 中继穿透**。
 
 > **当前版本与实测边界说明（诚实披露）**
-> - **当前公测版本**：`v0.8.0-beta.1`（Desktop Host `v0.5.15` · Android APK `v0.7.5` · Relay Server `v1.0.0`）
+> - **当前公测版本**：`v0.8.1`（Desktop Host `v0.5.15` · Android APK `v0.7.5` · Relay Server `v1.0.0`）
 > - **已真机实测**：局域网 Wi-Fi 与手机热点直连（含触控板模式、直接触控、双向文件传输、窗口切换无残影优化）均已完成真机实测。
 > - **待社区共同验证**：自托管公网中继链路（`airdesk-relay-server` + STUN/TURN）已通过协议级 6 项自动化冒烟测试，尚未经过大规模公网真实 NAT 环境长时压测；**不引入虚拟显示器驱动（VDD）**，依赖真实连接显示器（或硬件显卡欺骗器）进行屏幕采集。
 

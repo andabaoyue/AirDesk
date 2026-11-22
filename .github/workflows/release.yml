@@ -13,6 +13,7 @@ jobs:
   build-desktop:
     name: Desktop Host (${{ matrix.os }})
     strategy:
+      fail-fast: false
       matrix:
         os: [windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
@@ -33,6 +34,8 @@ jobs:
         run: npm run build:win
       - name: Build macOS DMG (runs prebuild:mac automatically)
         if: matrix.os == 'macos-latest'
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
         run: npm run build:mac
       - uses: actions/upload-artifact@v4
         with:

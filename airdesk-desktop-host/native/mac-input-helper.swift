@@ -2,6 +2,8 @@ import Foundation
 import CoreGraphics
 import ApplicationServices
 
+setbuf(stdout, nil)
+
 let AIRDESK_MAGIC: Int64 = 0x41495244
 
 // Verify macOS Accessibility permission upfront and inform Electron Host if missing

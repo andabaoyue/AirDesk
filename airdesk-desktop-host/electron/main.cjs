@@ -84,6 +84,7 @@ let localWss = null;
 let localUdpDiscoverySocket = null;
 let localSignalingPort = 47820;
 let localSignalingRunning = false;
+const LOCAL_HOST_SIGNALING_SECRET = crypto.randomBytes(24).toString('hex');
 
 // Authoritative security & anti-stuck-key state owned strictly by Main Process
 let authoritativeControlEnabled = false;
@@ -316,6 +317,14 @@ function spawnNativeHelper() {
     console.info('[AirDesk] Linux helper placeholder — integrate xdotool/uinput as needed.');
     return;
   }
+
+  nativeHelper.on('error', (err) => {
+    console.error('[AirDesk Helper] Process error:', err.message);
+    nativeHelper = null;
+    if (!isQuitting && !(elevatedPipeClient && elevatedPipeClient.writable)) {
+      scheduleHelperRespawn();
+    }
+  });
 
   let stdoutBuffer = '';
   nativeHelper.stdout.on('data', (chunk) => {
@@ -770,6 +779,7 @@ function getLocalSignalingInfo() {
   return {
     running: localSignalingRunning,
     port: localSignalingPort,
+    localHostToken: LOCAL_HOST_SIGNALING_SECRET,
     preferredHttpUrl: 'http://' + preferredIp + ':' + localSignalingPort,
     preferredWsUrl: 'ws://' + preferredIp + ':' + localSignalingPort + '/ws/signaling',
     usbIp,
@@ -1555,6 +1565,7 @@ function startLocalSignalingServer(port = 47820) {
         };
         let received = 0;
         let failed = false;
+        let drainPending = false;
 
         const cleanupTemp = () => {
           releaseUploadSlot();
@@ -1586,9 +1597,13 @@ function startLocalSignalingServer(port = 47820) {
             req.destroy();
             return;
           }
-          if (!wsOut.write(chunk)) {
+          if (!wsOut.write(chunk) && !drainPending) {
+            drainPending = true;
             req.pause();
-            wsOut.once('drain', () => req.resume());
+            wsOut.once('drain', () => {
+              drainPending = false;
+              if (!failed && !req.destroyed) req.resume();
+            });
           }
         });
         req.on('aborted', () => {
@@ -1705,6 +1720,22 @@ function startLocalSignalingServer(port = 47820) {
           return;
         }
         if (msg.type === 'host:create') {
+          const isLoopback = rawIp === '127.0.0.1' || rawIp === '::1' || rawIp === '::ffff:127.0.0.1';
+          const candToken = typeof msg.localHostToken === 'string' ? msg.localHostToken : '';
+          let hasValidSecret = false;
+          if (candToken.length === LOCAL_HOST_SIGNALING_SECRET.length) {
+            try {
+              hasValidSecret = crypto.timingSafeEqual(
+                Buffer.from(candToken, 'utf8'),
+                Buffer.from(LOCAL_HOST_SIGNALING_SECRET, 'utf8')
+              );
+            } catch {}
+          }
+          if (!isLoopback && !hasValidSecret) {
+            sendWs(ws, { type: 'error', message: 'Forbidden: host registration is restricted to local desktop host' });
+            try { ws.close(1008, 'Forbidden'); } catch {}
+            return;
+          }
           const prevMeta = socketRoom.get(ws);
           if (prevMeta && prevMeta.room) {
             roomsByCode.delete(prevMeta.room.code);

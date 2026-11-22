@@ -2,6 +2,15 @@
 
 所有重要版本变更都会记录在本文件中。
 
+## [v0.8.1] - 2026-11-22
+
+### 安全与稳定性修复
+- **内置信令房间注册防伪造**：桌面端 `/ws/signaling` 处理 `host:create` 时校验本机回环地址或主进程随机内部凭证（`localHostToken`），拦截局域网外部客户端伪造房间。
+- **局域网文件上传流背压加固**：`/api/lan-files/upload` 增加 `drainPending` 保护的 `req.pause()` / `wsOut.once('drain')` 背压流控。
+- **WebRTC 文件接收与断连状态加固**：`incomingFileWriteChain` 补齐异常 `.catch(...)` 恢复兜底；`pc.onconnectionstatechange` 增加 `currentPc` 实例比对及 `disconnected` `2.5s` 宽限自动恢复窗口。
+- **macOS 原生 Helper 与打包修复**：`mac-input-helper.swift` 启动关闭 stdout 块缓冲（`setbuf(stdout, nil)`）；Electron Helper `spawn` 绑定 `error` 监听；`package.json` 补充 macOS `extendInfo` 权限声明与 `--publish never`，`release.yml` 补充 `fail-fast: false` 与 `CSC_IDENTITY_AUTO_DISCOVERY: false`。
+- **Android 临时媒体流回收**：`webrtc_session_service.dart` 在 `onTrack` 降级创建本地 `MediaStream` 时追踪并在 `_cleanupRtc()` 中显式 `dispose()`。
+
 ## [v0.8.0-beta.1] - 2026-11-22
 
 首个面向 GitHub 开源社区的公测基线版本（桌面端 `v0.5.15` · Android 端 `v0.7.5` · 公网中继 `v1.0.0`）。

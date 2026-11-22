@@ -78,6 +78,7 @@ class WebRtcSessionService extends ChangeNotifier {
   int? _prevRxFreezes;
   DateTime _lastPliSentAt = DateTime.fromMillisecondsSinceEpoch(0);
   final List<RTCIceCandidate> _pendingRemoteIce = [];
+  MediaStream? _fallbackRemoteStream;
 
   final ValueNotifier<Offset?> remoteCursorNorm = ValueNotifier<Offset?>(null);
 
@@ -496,8 +497,20 @@ class WebRtcSessionService extends ChangeNotifier {
         remoteRenderer.srcObject = event.streams[0];
         notifyListeners();
       } else {
-        createLocalMediaStream('airdesk_remote').then((s) {
-          if (isStale()) return;
+        createLocalMediaStream('airdesk_remote').then((s) async {
+          if (isStale()) {
+            try {
+              await s.dispose();
+            } catch (_) {}
+            return;
+          }
+          final prevFallback = _fallbackRemoteStream;
+          _fallbackRemoteStream = s;
+          if (prevFallback != null && prevFallback != s) {
+            try {
+              await prevFallback.dispose();
+            } catch (_) {}
+          }
           s.addTrack(event.track);
           remoteRenderer.srcObject = s;
           notifyListeners();
@@ -1487,6 +1500,13 @@ class WebRtcSessionService extends ChangeNotifier {
     _pc = null;
     if (_rendererInitialized) {
       remoteRenderer.srcObject = null;
+    }
+    final oldFallback = _fallbackRemoteStream;
+    _fallbackRemoteStream = null;
+    if (oldFallback != null) {
+      try {
+        await oldFallback.dispose();
+      } catch (_) {}
     }
   }
 
