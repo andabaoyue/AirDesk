@@ -2,6 +2,25 @@
 
 所有重要版本变更都会记录在本文件中。
 
+## [v0.9.0] - 2026-11-24
+
+### 音频通道、虚拟声卡与 UAC 安全桌面增强
+- **Android 强制媒体音频通道 & 静音修复**：在 `MainActivity.kt` 锁定 `STREAM_MUSIC` 并新增 `ensureMediaAudioMode`（重置 `MODE_NORMAL` 与 `isSpeakerphoneOn = false`），在 `webrtc_session_service.dart` 追踪独立 `_remoteAudioTrack`，修复小米 HyperOS/MIUI 语音通话通道降质及静音按钮失效问题；SDP 注入 Opus 立体声与 `128kbps` 码率参数。
+- **Windows CoreAudio 虚拟声卡路由与 UAC 检测恢复**：新增 `win-input-helper.cs` 枚举/切换系统默认音频设备与安全桌面检测，串流桌面音频期间可选自动切换至虚拟声卡静音本机并异常退出自动兜底恢复；UAC/锁屏期间自动通知控制端显示快捷响应横幅并在退出安全桌面后自动恢复采集。
+
+### 性能、画质、显存与输入跟手度优化
+- **待机按需懒采集与显存自动释放**：启动共享仅开启信令与二维码，收到 Offer 再按单飞锁按需拉起屏幕采集；断连保留 20 秒热重连窗口，超时自动释放全部音视频轨并停用 `powerSaveBlocker`；副屏热缓存缩短至 15 秒且最多缓存 1 块。
+- **画质与编码优先级升级**：三端统一支持 H.264 Constrained High（`640c`）优先与网络场景分级码率策略，PC/Android 端同步展示实时码率（`<1000 kbps / Mbps`）、编码 Profile；Android 端视频纹理启用 `FilterQuality.medium`。
+- **8ms 指针合并与紧凑输入协议**：Android 端合并 `m:abs` / `m:rel` / `m:whl` 高频指针事件并在点击前先冲刷缓冲；Windows 输入助手与提权服务协商 `compactProto`（`R`/`A`/`W` 单行文本指令）进一步降低高频输入开销。
+- **收发双端遥测 AIMD 动态码率自愈**：结合发送端 `qualityLimitationReason`/编码耗时/RTT 与接收端掉帧/冻结/JitterBuffer，拥塞时 4 秒冷却快降至保底码率（CPU 瓶颈自动 60→30fps 降档），链路健康恢复后稳步回升，HUD 与诊断面板实时标记 `ABR`。
+
+### 架构模块化整理与自动化测试
+- **三端超长核心文件低风险拆分**：
+  - Desktop 主进程：`electron/main.cjs` 拆出 `native-helper.cjs`、`virtual-audio.cjs`、`lan-server.cjs`、`web-client-template.cjs`、`input-router.cjs`；
+  - Desktop 渲染进程：采用浏览器原生 ES Module，从 `renderer/host.js` 拆出 `sdp-codec.mjs`、`abr-controller.mjs`、`media-capture.mjs`、`file-transfer.mjs`；
+  - Android 远程舞台：`remote_stage_page.dart` 拆出 `stage_video_layer.dart`、`stage_telemetry_hud.dart`、`stage_secure_desktop_banner.dart`、`stage_overlays.dart`，保持 `RepaintBoundary` 与局部刷新隔离。
+- **打包与常驻测试体系**：`package.json` 显式纳入 `electron/modules/**/*` 与 `renderer/modules/**/*`，新增 Windows 便携版 `.zip` 打包目标；新增 `test/run-tests.mjs` 覆盖全仓 `.cjs`/`.mjs`/`host.js` 语法检查及 `sdp-codec` / `abr-controller` 单元测试。
+
 ## [v0.8.3] - 2026-11-22
 
 ### 稳定性修复
