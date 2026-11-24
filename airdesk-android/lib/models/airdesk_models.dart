@@ -159,6 +159,8 @@ class TelemetrySnapshot {
   final String codecProfile;
   final int? txKbps;
   final double? txMbps;
+  final int? targetKbps;
+  final String abrState;
   final int? txW;
   final int? txH;
   final String limitReason;
@@ -188,6 +190,8 @@ class TelemetrySnapshot {
     this.codecProfile = '',
     this.txKbps,
     this.txMbps,
+    this.targetKbps,
+    this.abrState = 'normal',
     this.txW,
     this.txH,
     this.limitReason = 'none',
@@ -217,6 +221,8 @@ class TelemetrySnapshot {
       codecProfile: (d['profile'] ?? '').toString(),
       txKbps: (d['txKbps'] as num?)?.toInt(),
       txMbps: (d['txMbps'] as num?)?.toDouble(),
+      targetKbps: (d['targetKbps'] as num?)?.toInt(),
+      abrState: (d['abrState'] ?? 'normal').toString(),
       txW: (d['w'] as num?)?.toInt(),
       txH: (d['h'] as num?)?.toInt(),
       limitReason: (d['limit'] ?? 'none').toString(),
@@ -261,6 +267,8 @@ class TelemetrySnapshot {
       codecProfile: codecProfile,
       txKbps: txKbps,
       txMbps: txMbps,
+      targetKbps: targetKbps,
+      abrState: abrState,
       txW: txW,
       txH: txH,
       limitReason: limitReason,

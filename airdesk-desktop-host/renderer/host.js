@@ -81,10 +81,18 @@ function captureMaxFps() {
   return framerateSelect && framerateSelect.value === '60' ? 60 : 30;
 }
 
+function isLanLikeConnection() {
+  const isRelay = Boolean(signalingModeSelect && signalingModeSelect.value === 'remote');
+  return Boolean(lanNoStunCheckbox && lanNoStunCheckbox.checked) && !activePeerIsOverlay && !isRelay;
+}
+
+function computeAbrFloorKbps() {
+  return isLanLikeConnection() ? 2500 : 800;
+}
+
 function computeTieredVideoBitrates() {
   const isRelay = Boolean(signalingModeSelect && signalingModeSelect.value === 'remote');
-  const isLan =
-    Boolean(lanNoStunCheckbox && lanNoStunCheckbox.checked) && !activePeerIsOverlay && !isRelay;
+  const isLan = isLanLikeConnection();
   const fps = captureMaxFps();
   const res = (resolutionSelect && resolutionSelect.value) || '1080p';
 
@@ -148,6 +156,19 @@ let noticeTimer = null;
 let statsTimer = null;
 let prevOutboundSnap = null;
 let lastClientDiag = null;
+let lastClientDiagAt = 0;
+let prevAbrClientDropped = null;
+let prevAbrClientFreezes = null;
+const adaptiveBitrate = {
+  baseMaxKbps: 15000,
+  minFloorKbps: 2500,
+  currentTargetKbps: 15000,
+  adaptiveFpsCap: null,
+  congestedStreak: 0,
+  healthyStreak: 0,
+  lastAdjustAtMs: 0,
+  state: 'normal',
+};
 let autoHintFallbackApplied = false;
 let remoteIceServers = [];
 let wsHeartbeatTimer = null;
@@ -160,6 +181,25 @@ let lastPliHandledAt = 0;
 let disconnectGraceTimer = null;
 let idleCaptureReleaseTimer = null;
 let captureInitPromise = null;
+let hostSessionGen = 0;
+
+function resetAdaptiveBitrate(baseMaxOverride = null) {
+  const baseMax = Math.max(
+    500,
+    Number(baseMaxOverride) || computeTieredVideoBitrates().maxKbps || 15000
+  );
+  const floor = Math.min(baseMax, computeAbrFloorKbps());
+  adaptiveBitrate.baseMaxKbps = baseMax;
+  adaptiveBitrate.minFloorKbps = floor;
+  adaptiveBitrate.currentTargetKbps = baseMax;
+  adaptiveBitrate.adaptiveFpsCap = null;
+  adaptiveBitrate.congestedStreak = 0;
+  adaptiveBitrate.healthyStreak = 0;
+  adaptiveBitrate.lastAdjustAtMs = 0;
+  adaptiveBitrate.state = 'normal';
+  prevAbrClientDropped = null;
+  prevAbrClientFreezes = null;
+}
 let virtualAudioInfo = null;
 let hostInSecureDesktop = false;
 let hostElevatedConnected = false;
@@ -1119,7 +1159,10 @@ async function init() {
     clearWarmDisplayTracks();
     if (localStream) {
       switchActiveDisplay(displaySelect.value, true)
-        .then(() => applyVideoParameters(defaultBitrateKbps(), captureMaxFps()))
+        .then(() => {
+          resetAdaptiveBitrate(defaultBitrateKbps());
+          return applyVideoParameters(adaptiveBitrate.currentTargetKbps, captureMaxFps());
+        })
         .catch((err) => {
           showNotice('切换分辨率失败：' + err.message);
         });
@@ -1160,7 +1203,10 @@ async function init() {
       localStorage.setItem(STORAGE_IDLE_FPS_KEY, enableIdleFpsSaverCheckbox.checked ? '1' : '0');
       if (!enableIdleFpsSaverCheckbox.checked && isIdleThrottled) {
         isIdleThrottled = false;
-        applyVideoParameters(activeTargetBitrateKbps, captureMaxFps()).catch(() => {});
+        applyVideoParameters(
+          adaptiveBitrate.currentTargetKbps,
+          adaptiveBitrate.adaptiveFpsCap || captureMaxFps()
+        ).catch(() => {});
       }
       showNotice(
         enableIdleFpsSaverCheckbox.checked
@@ -1247,7 +1293,10 @@ async function init() {
       // then re-apply the encoder cap to match.
       if (localStream) {
         switchActiveDisplay(displaySelect.value, true)
-          .then(() => applyVideoParameters(defaultBitrateKbps(), fps))
+          .then(() => {
+            resetAdaptiveBitrate(defaultBitrateKbps());
+            return applyVideoParameters(adaptiveBitrate.currentTargetKbps, fps);
+          })
           .catch((err) => showNotice('切换帧率失败：' + err.message));
       }
       showNotice('已切换采集帧率：' + fps + ' fps' + (fps === 60 ? '（核显可能掉帧）' : '（稳帧推荐）'));
@@ -1336,6 +1385,8 @@ function cancelIdleCaptureRelease() {
 }
 
 function releaseLocalCaptureMedia() {
+  hostSessionGen++;
+  captureInitPromise = null;
   cancelIdleCaptureRelease();
   clearWarmDisplayTracks();
   stopAudioCaptureOnly();
@@ -1371,6 +1422,7 @@ async function ensureLocalCaptureReady() {
   if (captureInitPromise) {
     return captureInitPromise;
   }
+  const myGen = hostSessionGen;
   const targetDisplayId = activeCaptureDisplayId || displaySelect.value;
   const run = (async () => {
     if (localStream) {
@@ -1378,10 +1430,10 @@ async function ensureLocalCaptureReady() {
       localStream = null;
     }
     const stream = await captureDisplayById(targetDisplayId);
-    if (!isHosting) {
+    if (!isHosting || myGen !== hostSessionGen) {
       stream.getTracks().forEach((t) => t.stop());
       stopAudioCaptureOnly();
-      throw new Error('共享已停止');
+      throw new Error('共享已停止或已重新启动');
     }
     localStream = stream;
     return stream;
@@ -1397,7 +1449,7 @@ async function ensureLocalCaptureReady() {
 }
 
 async function applyVideoParameters(maxBitrateKbps, maxFramerate) {
-  activeTargetBitrateKbps = Math.max(1000, Number(maxBitrateKbps) || 15000);
+  activeTargetBitrateKbps = Math.max(500, Number(maxBitrateKbps) || 15000);
   if (!videoSender) return;
   const effectiveFps = Math.min(maxFramerate, captureMaxFps());
   try {
@@ -1507,11 +1559,140 @@ async function switchActiveDisplay(displayId, forceRecapture = false) {
     }
 
     if (videoSender) {
-      await applyVideoParameters(activeTargetBitrateKbps, captureMaxFps());
+      await applyVideoParameters(
+        adaptiveBitrate.currentTargetKbps,
+        isIdleThrottled ? 8 : adaptiveBitrate.adaptiveFpsCap || captureMaxFps()
+      );
     }
   };
   switchingDisplayChain = switchingDisplayChain.then(run, run);
   return switchingDisplayChain;
+}
+
+function evaluateAdaptiveBitrate({ limitReason, encodeMs, rttMs, nowMs = Date.now() }) {
+  if (!hasActivePeer || !pc || !videoSender || isIdleThrottled || hostInSecureDesktop) {
+    return null;
+  }
+
+  const freshClient = Boolean(lastClientDiag && nowMs - lastClientDiagAt < 5000);
+  const clientJbMs =
+    freshClient && typeof lastClientDiag.jbMs === 'number' ? lastClientDiag.jbMs : null;
+
+  let deltaDropped = 0;
+  let deltaFreezes = 0;
+  if (freshClient) {
+    if (typeof lastClientDiag.dropped === 'number') {
+      if (prevAbrClientDropped !== null && lastClientDiag.dropped >= prevAbrClientDropped) {
+        deltaDropped = lastClientDiag.dropped - prevAbrClientDropped;
+      }
+      prevAbrClientDropped = lastClientDiag.dropped;
+    }
+    if (typeof lastClientDiag.freezes === 'number') {
+      if (prevAbrClientFreezes !== null && lastClientDiag.freezes >= prevAbrClientFreezes) {
+        deltaFreezes = lastClientDiag.freezes - prevAbrClientFreezes;
+      }
+      prevAbrClientFreezes = lastClientDiag.freezes;
+    }
+  }
+
+  const rttLimit = isLanLikeConnection() ? 60 : 180;
+  const rttCongested =
+    rttMs !== null &&
+    rttMs > rttLimit &&
+    ((encodeMs !== null && encodeMs > 16) || (clientJbMs !== null && clientJbMs > 25));
+  const limitCongested = limitReason === 'bandwidth' || limitReason === 'cpu';
+  const clientCongested =
+    freshClient && (deltaDropped >= 3 || deltaFreezes > 0 || (clientJbMs !== null && clientJbMs > 45));
+  const freezeDetected = freshClient && deltaFreezes > 0;
+  const isCongested = limitCongested || rttCongested || clientCongested;
+
+  if (isCongested) {
+    adaptiveBitrate.healthyStreak = 0;
+    adaptiveBitrate.congestedStreak++;
+    if (
+      (adaptiveBitrate.congestedStreak >= 2 || freezeDetected) &&
+      nowMs - adaptiveBitrate.lastAdjustAtMs >= 4000
+    ) {
+      const prevKbps = adaptiveBitrate.currentTargetKbps;
+      const prevFpsCap = adaptiveBitrate.adaptiveFpsCap;
+      adaptiveBitrate.currentTargetKbps = Math.max(
+        adaptiveBitrate.minFloorKbps,
+        Math.round(adaptiveBitrate.currentTargetKbps * 0.75)
+      );
+      if (limitReason === 'cpu' && encodeMs !== null && encodeMs > 20 && captureMaxFps() >= 60) {
+        adaptiveBitrate.adaptiveFpsCap = 30;
+      }
+      adaptiveBitrate.state =
+        adaptiveBitrate.currentTargetKbps < adaptiveBitrate.baseMaxKbps ||
+        adaptiveBitrate.adaptiveFpsCap !== null
+          ? 'throttled'
+          : 'normal';
+      adaptiveBitrate.lastAdjustAtMs = nowMs;
+      adaptiveBitrate.congestedStreak = 0;
+      if (
+        adaptiveBitrate.currentTargetKbps !== prevKbps ||
+        adaptiveBitrate.adaptiveFpsCap !== prevFpsCap
+      ) {
+        return {
+          action: 'step_down',
+          targetKbps: adaptiveBitrate.currentTargetKbps,
+          fps: adaptiveBitrate.adaptiveFpsCap || captureMaxFps(),
+        };
+      }
+    }
+    return null;
+  }
+
+  const isHealthy =
+    limitReason === 'none' &&
+    (rttMs === null || rttMs <= rttLimit) &&
+    (clientJbMs === null || clientJbMs <= 45);
+  if (!isHealthy) {
+    adaptiveBitrate.congestedStreak = 0;
+    adaptiveBitrate.healthyStreak = 0;
+    return null;
+  }
+
+  adaptiveBitrate.congestedStreak = 0;
+  adaptiveBitrate.healthyStreak++;
+
+  if (
+    (adaptiveBitrate.currentTargetKbps < adaptiveBitrate.baseMaxKbps ||
+      adaptiveBitrate.adaptiveFpsCap !== null) &&
+    adaptiveBitrate.healthyStreak >= 4 &&
+    nowMs - adaptiveBitrate.lastAdjustAtMs >= 6000
+  ) {
+    const prevKbps = adaptiveBitrate.currentTargetKbps;
+    const prevFpsCap = adaptiveBitrate.adaptiveFpsCap;
+    if (adaptiveBitrate.adaptiveFpsCap !== null) {
+      adaptiveBitrate.adaptiveFpsCap = null;
+    } else {
+      const step = Math.max(1200, Math.round(adaptiveBitrate.currentTargetKbps * 0.15));
+      adaptiveBitrate.currentTargetKbps = Math.min(
+        adaptiveBitrate.baseMaxKbps,
+        adaptiveBitrate.currentTargetKbps + step
+      );
+    }
+    if (
+      adaptiveBitrate.currentTargetKbps >= adaptiveBitrate.baseMaxKbps &&
+      adaptiveBitrate.adaptiveFpsCap === null
+    ) {
+      adaptiveBitrate.state = 'normal';
+    }
+    adaptiveBitrate.lastAdjustAtMs = nowMs;
+    adaptiveBitrate.healthyStreak = 0;
+    if (
+      adaptiveBitrate.currentTargetKbps !== prevKbps ||
+      adaptiveBitrate.adaptiveFpsCap !== prevFpsCap
+    ) {
+      return {
+        action: 'ramp_up',
+        targetKbps: adaptiveBitrate.currentTargetKbps,
+        fps: adaptiveBitrate.adaptiveFpsCap || captureMaxFps(),
+      };
+    }
+  }
+  return null;
 }
 
 function startRtcStatsMonitor() {
@@ -1595,19 +1776,22 @@ function startRtcStatsMonitor() {
         if (outboundStat.qualityLimitationReason) {
           limitReason = String(outboundStat.qualityLimitationReason);
         }
-        if (
-          prevOutboundSnap &&
-          typeof outboundStat.framesEncoded === 'number' &&
-          typeof outboundStat.totalEncodeTime === 'number'
-        ) {
-          const dF = outboundStat.framesEncoded - prevOutboundSnap.framesEncoded;
-          const dT = outboundStat.totalEncodeTime - prevOutboundSnap.totalEncodeTime;
+        if (prevOutboundSnap) {
           const dt = (outboundStat.timestamp - prevOutboundSnap.ts) / 1000;
-          if (fps === null && dt > 0 && dF >= 0) {
-            fps = Math.round(dF / dt);
-          }
-          if (dF > 0 && dT >= 0) {
-            encodeMs = +(dT / dF * 1000).toFixed(1);
+          if (
+            typeof outboundStat.framesEncoded === 'number' &&
+            typeof prevOutboundSnap.framesEncoded === 'number' &&
+            typeof outboundStat.totalEncodeTime === 'number' &&
+            typeof prevOutboundSnap.totalEncodeTime === 'number'
+          ) {
+            const dF = outboundStat.framesEncoded - prevOutboundSnap.framesEncoded;
+            const dT = outboundStat.totalEncodeTime - prevOutboundSnap.totalEncodeTime;
+            if (fps === null && dt > 0 && dF >= 0) {
+              fps = Math.round(dF / dt);
+            }
+            if (dF > 0 && dT >= 0) {
+              encodeMs = +(dT / dF * 1000).toFixed(1);
+            }
           }
           if (
             dt > 0 &&
@@ -1621,11 +1805,13 @@ function startRtcStatsMonitor() {
             }
           }
         }
-        if (typeof outboundStat.framesEncoded === 'number') {
+        if (typeof outboundStat.framesEncoded === 'number' || typeof outboundStat.bytesSent === 'number') {
           prevOutboundSnap = {
             ts: outboundStat.timestamp,
-            framesEncoded: outboundStat.framesEncoded,
-            totalEncodeTime: outboundStat.totalEncodeTime || 0,
+            framesEncoded:
+              typeof outboundStat.framesEncoded === 'number' ? outboundStat.framesEncoded : null,
+            totalEncodeTime:
+              typeof outboundStat.totalEncodeTime === 'number' ? outboundStat.totalEncodeTime : null,
             bytesSent: typeof outboundStat.bytesSent === 'number' ? outboundStat.bytesSent : null,
           };
         }
@@ -1674,7 +1860,12 @@ function startRtcStatsMonitor() {
           : codecMime
         : '--';
       const bitrateText =
-        txMbps !== null ? txMbps.toFixed(1) + 'Mbps' : txKbps !== null ? txKbps + 'kbps' : '--';
+        txKbps !== null
+          ? txKbps < 1000
+            ? txKbps + 'kbps'
+            : (txKbps / 1000).toFixed(1) + 'Mbps'
+          : '--';
+      const abrTag = adaptiveBitrate.state === 'throttled' ? ' · ABR(' + adaptiveBitrate.currentTargetKbps + 'k)' : '';
 
       const line1 =
         '发送端(电脑)：' +
@@ -1688,6 +1879,7 @@ function startRtcStatsMonitor() {
         fpsText +
         ' · 码率：' +
         bitrateText +
+        abrTag +
         ' · 限制：' +
         limitReason +
         ' · RTT：' +
@@ -1729,6 +1921,11 @@ function startRtcStatsMonitor() {
       rtcStatsEl.style.color = color;
       rtcStatsEl.textContent = line1 + '\n' + line2;
 
+      const abrAdjustment = evaluateAdaptiveBitrate({ limitReason, encodeMs, rttMs });
+      if (abrAdjustment) {
+        await applyVideoParameters(abrAdjustment.targetKbps, abrAdjustment.fps);
+      }
+
       if (reliableDc && reliableDc.readyState === 'open') {
         const activeVt = localStream && localStream.getVideoTracks()[0];
         reliableDc.send(
@@ -1744,6 +1941,8 @@ function startRtcStatsMonitor() {
             profile: codecProfile,
             txKbps,
             txMbps,
+            targetKbps: adaptiveBitrate.currentTargetKbps,
+            abrState: adaptiveBitrate.state,
             w: frameW,
             h: frameH,
             limit: limitReason,
@@ -1763,7 +1962,7 @@ function startRtcStatsMonitor() {
         Date.now() - lastRemoteInputAt > 12000
       ) {
         isIdleThrottled = true;
-        applyVideoParameters(activeTargetBitrateKbps, 8).catch(() => {});
+        applyVideoParameters(adaptiveBitrate.currentTargetKbps, 8).catch(() => {});
       }
 
       // Auto-sync desktop clipboard changes to mobile when control is enabled
@@ -2184,7 +2383,9 @@ function cleanupPeerConnection(scheduleIdleRelease = true) {
   }
   prevOutboundSnap = null;
   lastClientDiag = null;
+  lastClientDiagAt = 0;
   isIdleThrottled = false;
+  resetAdaptiveBitrate();
   lastRemoteInputAt = Date.now();
   lastSyncedClipboardText = '';
   syncingClipboardPending = false;
@@ -2232,6 +2433,8 @@ function cleanupPeerConnection(scheduleIdleRelease = true) {
 }
 
 async function stopHost(reason) {
+  hostSessionGen++;
+  captureInitPromise = null;
   isHosting = false;
   hasPendingApproval = false;
   hasActivePeer = false;
@@ -2325,6 +2528,8 @@ function buildIceServers() {
 
 async function startHost() {
   if (isHosting) return;
+  hostSessionGen++;
+  captureInitPromise = null;
   remoteIceServers = [];
   if (wsHeartbeatTimer) {
     clearInterval(wsHeartbeatTimer);
@@ -2870,7 +3075,10 @@ async function handleOffer(remoteSdp) {
         lastRemoteInputAt = Date.now();
         if (isIdleThrottled) {
           isIdleThrottled = false;
-          applyVideoParameters(activeTargetBitrateKbps, captureMaxFps()).catch(() => {});
+          applyVideoParameters(
+            adaptiveBitrate.currentTargetKbps,
+            adaptiveBitrate.adaptiveFpsCap || captureMaxFps()
+          ).catch(() => {});
         }
       }
 
@@ -2916,9 +3124,11 @@ async function handleOffer(remoteSdp) {
         const maxPolicyCap = signalingModeSelect && signalingModeSelect.value === 'remote' ? 8000 : 35000;
         const targetBitrate = Math.min(maxPolicyCap, Math.max(1000, Number(data.maxBitrateKbps) || 15000));
         const targetFps = reqFps > 0 ? reqFps : data.preset === 'office_saver' ? 20 : captureMaxFps();
-        await applyVideoParameters(targetBitrate, targetFps);
+        resetAdaptiveBitrate(targetBitrate);
+        await applyVideoParameters(adaptiveBitrate.currentTargetKbps, targetFps);
       } else if (data.t === 'diag:rx') {
         lastClientDiag = data;
+        lastClientDiagAt = Date.now();
       } else if (data.t === 'clip:push') {
         await window.airdeskAPI.writeClipboard(data.text);
       } else if (data.t === 'clip:pull') {
@@ -2941,7 +3151,10 @@ async function handleOffer(remoteSdp) {
         const nowTs = Date.now();
         if (nowTs - lastPliHandledAt >= 250) {
           lastPliHandledAt = nowTs;
-          await applyVideoParameters(activeTargetBitrateKbps, captureMaxFps());
+          await applyVideoParameters(
+            adaptiveBitrate.currentTargetKbps,
+            isIdleThrottled ? 8 : adaptiveBitrate.adaptiveFpsCap || captureMaxFps()
+          );
         }
       } else {
         await window.airdeskAPI.injectInput(data);
@@ -3038,7 +3251,8 @@ async function handleOffer(remoteSdp) {
   await window.airdeskAPI.setSessionActive(true);
   await window.airdeskAPI.setControlPermission(currentControlEnabled);
   updateControlButtonUi();
-  await applyVideoParameters(tier.maxKbps, captureMaxFps());
+  resetAdaptiveBitrate(tier.maxKbps);
+  await applyVideoParameters(adaptiveBitrate.currentTargetKbps, captureMaxFps());
   startRtcStatsMonitor();
   setLivePill('live', '串流中');
   statusEl.textContent = activePeerIsOverlay

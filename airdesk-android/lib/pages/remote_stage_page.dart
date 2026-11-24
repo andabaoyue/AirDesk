@@ -1006,12 +1006,15 @@ class _RemoteStagePageState extends State<RemoteStagePage> with WidgetsBindingOb
     final codecStr = t.codec.isEmpty
         ? '--'
         : (t.codecProfile.isEmpty ? t.codec : '${t.codec}(${t.codecProfile})');
-    final rateStr = t.txMbps != null
-        ? '${t.txMbps!.toStringAsFixed(1)}Mbps'
-        : (t.txKbps != null ? '${t.txKbps}kbps' : '--');
+    final rateStr = t.txKbps != null
+        ? (t.txKbps! < 1000
+            ? '${t.txKbps}kbps'
+            : '${(t.txKbps! / 1000).toStringAsFixed(1)}Mbps')
+        : (t.txMbps != null ? '${t.txMbps!.toStringAsFixed(1)}Mbps' : '--');
+    final abrTag = t.abrState == 'throttled' ? ' · ABR' : '';
     final line1 =
         'PC: $codecStr [${t.encoder}$txHw ${t.encodeMs ?? "--"}ms] '
-        '${t.txW ?? "--"}x${t.txH ?? "--"} @ ${t.txFps ?? "--"}fps · $rateStr · RTT:$rttStr';
+        '${t.txW ?? "--"}x${t.txH ?? "--"} @ ${t.txFps ?? "--"}fps · $rateStr$abrTag · RTT:$rttStr';
     final line2 =
         '手机: ${t.rxFps ?? "--"}fps [${t.decoder}$rxHw ${t.decodeMs ?? "--"}ms] · '
         '缓冲:${t.jbMs ?? "--"}/${t.jbTargetMs ?? "--"}ms · 掉帧:${t.dropped ?? 0}';

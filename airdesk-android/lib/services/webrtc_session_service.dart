@@ -1652,6 +1652,7 @@ class WebRtcSessionService extends ChangeNotifier {
     _remoteAudioTrack = null;
     hostInSecureDesktop = false;
     hostElevatedConnected = false;
+    telemetry = const TelemetrySnapshot();
     _pendingRemoteIce.clear();
     _abortFileTransferWaiters('WebRTC 连接已重置');
     await _closeIncomingTemp(deleteFile: true);
