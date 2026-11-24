@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -553,6 +554,56 @@ namespace AirDeskWinHelper
             return false;
         }
 
+        static bool TryParseTwoDoubles(string line, out double a, out double b)
+        {
+            a = 0;
+            b = 0;
+            int sp = line.IndexOf(' ', 2);
+            if (sp <= 2 || sp + 1 >= line.Length) return false;
+            string s1 = line.Substring(2, sp - 2);
+            string s2 = line.Substring(sp + 1);
+            return double.TryParse(s1, NumberStyles.Float, CultureInfo.InvariantCulture, out a) &&
+                   double.TryParse(s2, NumberStyles.Float, CultureInfo.InvariantCulture, out b) &&
+                   !double.IsNaN(a) && !double.IsInfinity(a) &&
+                   !double.IsNaN(b) && !double.IsInfinity(b);
+        }
+
+        static bool TryHandleCompactCommand(string line)
+        {
+            if (string.IsNullOrEmpty(line) || line.Length < 4 || line[1] != ' ') return false;
+            char cmd = line[0];
+            if (cmd == 'R')
+            {
+                double dx, dy;
+                if (!TryParseTwoDoubles(line, out dx, out dy)) return false;
+                SendMouse((int)Math.Round(dx), (int)Math.Round(dy), MOUSEEVENTF_MOVE);
+                return true;
+            }
+            if (cmd == 'A')
+            {
+                double px, py;
+                if (!TryParseTwoDoubles(line, out px, out py)) return false;
+                RefreshVirtualScreenBounds(false);
+                int normX = (int)Math.Round(((px - _cachedVx) * 65535.0) / Math.Max(1, _cachedVw - 1));
+                int normY = (int)Math.Round(((py - _cachedVy) * 65535.0) / Math.Max(1, _cachedVh - 1));
+                normX = Math.Max(0, Math.Min(65535, normX));
+                normY = Math.Max(0, Math.Min(65535, normY));
+                SendMouse(normX, normY, MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK);
+                return true;
+            }
+            if (cmd == 'W')
+            {
+                double dx, dy;
+                if (!TryParseTwoDoubles(line, out dx, out dy)) return false;
+                int wheel = (int)Math.Round(-dy * 120.0);
+                if (wheel != 0) SendMouse(0, 0, MOUSEEVENTF_WHEEL, unchecked((uint)wheel));
+                int hwheel = (int)Math.Round(dx * 120.0);
+                if (hwheel != 0) SendMouse(0, 0, MOUSEEVENTF_HWHEEL, unchecked((uint)hwheel));
+                return true;
+            }
+            return false;
+        }
+
         static string ReadLineBounded(TextReader reader, int maxChars = 32768)
         {
             StringBuilder sb = new StringBuilder(256);
@@ -614,6 +665,10 @@ namespace AirDeskWinHelper
                     if (string.IsNullOrWhiteSpace(line)) continue;
                     try
                     {
+                        if (line.Length >= 2 && line[0] != '{' && TryHandleCompactCommand(line))
+                        {
+                            continue;
+                        }
                         Dictionary<string, object> obj = serializer.Deserialize<Dictionary<string, object>>(line);
                         if (obj == null) continue;
                         string t = GetStr(obj, "t");

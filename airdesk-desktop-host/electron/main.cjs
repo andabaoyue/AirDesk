@@ -78,6 +78,7 @@ let nativeHelper = null;
 let elevatedPipeClient = null;
 let elevatedPipeConnecting = false;
 let elevatedPipeAuthenticated = false;
+let elevatedCompactProto = false;
 let lastSecureDesktopActive = false;
 let virtualAudioSavedDefaultId = null;
 let virtualAudioActiveDeviceId = null;
@@ -161,8 +162,25 @@ function validateInputPayload(msg) {
   return true;
 }
 
+function formatCompactPointerLine(payload) {
+  if (!payload || typeof payload !== 'object') return null;
+  if (payload.t === 'm:rel') {
+    const dx = Number(payload.dx) || 0;
+    const dy = Number(payload.dy) || 0;
+    return 'R ' + dx + ' ' + dy + '\n';
+  }
+  if (payload.t === 'm:abs' && Number.isFinite(payload.px) && Number.isFinite(payload.py)) {
+    return 'A ' + payload.px + ' ' + payload.py + '\n';
+  }
+  if (payload.t === 'm:whl') {
+    const dx = Number.isFinite(payload.dx) ? payload.dx : 0;
+    const dy = Number.isFinite(payload.dy) ? payload.dy : 0;
+    return 'W ' + dx + ' ' + dy + '\n';
+  }
+  return null;
+}
+
 function sendToHelper(payload) {
-  const line = JSON.stringify(payload) + '\n';
   if (
     elevatedPipeClient &&
     elevatedPipeAuthenticated &&
@@ -170,6 +188,9 @@ function sendToHelper(payload) {
     !elevatedPipeClient.destroyed &&
     !elevatedPipeClient.writableEnded
   ) {
+    const line =
+      (process.platform === 'win32' && elevatedCompactProto && formatCompactPointerLine(payload)) ||
+      JSON.stringify(payload) + '\n';
     try {
       elevatedPipeClient.write(line, () => {});
       return;
@@ -189,6 +210,9 @@ function sendToHelper(payload) {
   ) {
     return;
   }
+  const line =
+    (process.platform === 'win32' && formatCompactPointerLine(payload)) ||
+    JSON.stringify(payload) + '\n';
   try {
     nativeHelper.stdin.write(line, () => {});
   } catch (err) {
@@ -533,6 +557,7 @@ function handleHelperJsonEvent(evt) {
   if (!evt || typeof evt !== 'object') return;
   if (evt.event === 'elevated_ready') {
     elevatedPipeAuthenticated = true;
+    elevatedCompactProto = evt.compactProto === true;
     return;
   }
   if (evt.event === 'secure_desktop') {
@@ -593,6 +618,7 @@ function getElevatedServiceStatus() {
 
 function disconnectElevatedPipe() {
   elevatedPipeAuthenticated = false;
+  elevatedCompactProto = false;
   if (elevatedPipeClient) {
     try {
       elevatedPipeClient.removeAllListeners();
@@ -626,6 +652,7 @@ function connectElevatedPipe(timeoutMs = 2500) {
       if (elevatedPipeClient === client) {
         elevatedPipeClient = null;
         elevatedPipeAuthenticated = false;
+        elevatedCompactProto = false;
       }
       try { client.destroy(); } catch {}
       finish(false);
@@ -651,6 +678,7 @@ function connectElevatedPipe(timeoutMs = 2500) {
         return;
       }
       elevatedPipeAuthenticated = false;
+      elevatedCompactProto = false;
       elevatedPipeClient = client;
     });
 
@@ -682,6 +710,7 @@ function connectElevatedPipe(timeoutMs = 2500) {
       if (elevatedPipeClient === client) {
         elevatedPipeClient = null;
         elevatedPipeAuthenticated = false;
+        elevatedCompactProto = false;
       }
       finish(false);
     });
@@ -691,6 +720,7 @@ function connectElevatedPipe(timeoutMs = 2500) {
       if (wasActive) {
         elevatedPipeClient = null;
         elevatedPipeAuthenticated = false;
+        elevatedCompactProto = false;
       }
       finish(false);
       if (wasActive && !isQuitting && (!nativeHelper || nativeHelper.killed)) {
@@ -1319,7 +1349,7 @@ function buildEmbeddedMobileClientHtml() {
     'function connectWith(payload){manualDisconnect=false;cleanupRtc();closeSocketSilently();const proto=location.protocol==="https:"?"wss:":"ws:";const sock=new WebSocket(proto+"//"+location.host+"/ws/signaling");ws=sock;sock.onopen=()=>sock.send(JSON.stringify(Object.assign({type:"client:join",deviceLabel:"手机直连端",platformHint:"LAN Mobile"},payload)));sock.onmessage=async e=>{if(ws!==sock)return;let m;try{m=JSON.parse(e.data);}catch{return;}if(m.type==="client:waiting_approval")msg.textContent="等待电脑审批（可在电脑按 Ctrl+Alt+Y 批准）...";else if(m.type==="client:rejected"||m.type==="error"){if(payload.sessionToken){delTok();stageView.style.display="none";joinView.style.display="flex";const fallbackCode=pinEl.value.replace(/\\D/g,"");if(fallbackCode.length===6){msg.textContent="自动重连凭证失效，正在使用配对码连接...";connect();return;}}msg.textContent=m.reason||m.message||"连接被拒绝";}else if(m.type==="client:approved"){if(m.sessionToken)setTok(m.sessionToken);ctrl=m.mode==="full_control";hostAudioEnabled=Boolean(m.audioEnabled);await startRtc();}else if(m.type==="rtc:answer"&&pc){await pc.setRemoteDescription({type:"answer",sdp:m.sdp});for(const cand of pendingIce){await pc.addIceCandidate(cand).catch(()=>{});}pendingIce=[];}else if(m.type==="rtc:ice"){if(pc&&pc.remoteDescription){pc.addIceCandidate(m.candidate).catch(()=>{});}else{pendingIce.push(m.candidate);}}else if(m.type==="session:permission_updated"){ctrl=Boolean(m.controlEnabled);updateStatusLabel();toast(ctrl?"已开启操控":"已切换为只读");}else if(m.type==="session:closed"){cleanupRtc();stageView.style.display="none";joinView.style.display="flex";msg.textContent=m.reason||"电脑端已关闭共享";}};sock.onclose=()=>{if(ws!==sock)return;cleanupRtc();updateStatusLabel();updateIceOverlay();};sock.onerror=()=>{if(ws!==sock)return;msg.textContent="无法连接本地信令，请确认同热点/Wi-Fi 且防火墙已放行 47820 端口";};}',
     'function connect(){const code=pinEl.value.replace(/\\D/g,"");if(code.length===6){connectWith({code});return;}const tok=getTok();if(tok){connectWith({sessionToken:tok});return;}msg.textContent="请输入 6 位配对码";}',
     'const CLASH_RE=/^198\\.1[89]\\./;const TS_RE=/^100\\.(6[4-9]|[7-9]\\d|1[01]\\d|12[0-7])\\./;const ALLOW_OVERLAY=TS_RE.test(location.hostname||"");const isVirtual=cs=>{const a=String(cs||"").split(" ")[4]||"";if(CLASH_RE.test(a))return true;if(!ALLOW_OVERLAY&&TS_RE.test(a))return true;return false;};',
-    'function pickLowLatencyH264(codecs){var h264=(codecs||[]).filter(function(c){return c.mimeType&&c.mimeType.toLowerCase()==="video/h264";});var score=function(c){var f=String(c.sdpFmtpLine||"").toLowerCase();if(f.indexOf("42e01f")>=0)return 0;if(f.indexOf("42001f")>=0)return 1;if(f.indexOf("42e0")>=0||f.indexOf("4200")>=0)return 2;return 3;};h264.sort(function(a,b){return score(a)-score(b);});return h264;}',
+    'function pickLowLatencyH264(codecs){var h264=(codecs||[]).filter(function(c){return c.mimeType&&c.mimeType.toLowerCase()==="video/h264";});var score=function(c){var f=String(c.sdpFmtpLine||"").toLowerCase();if(f.indexOf("640c")>=0)return 0;if(f.indexOf("42e01f")>=0)return 1;if(f.indexOf("42e0")>=0)return 2;if(f.indexOf("42001f")>=0)return 3;if(f.indexOf("4200")>=0)return 4;if(f.indexOf("6400")>=0)return 5;return 6;};h264.sort(function(a,b){return score(a)-score(b);});return h264;}',
     'function applyReceiverJitterToOne(r,ms){if(!r)return;var sec=ms/1000;try{if("jitterBufferTarget" in r)r.jitterBufferTarget=ms;}catch(e){}try{if("playoutDelayHint" in r)r.playoutDelayHint=sec;}catch(e){}try{if("jitterBufferDelayHint" in r)r.jitterBufferDelayHint=sec;}catch(e){}}',
     'function applyReceiverJitterTarget(ms){if(!pc)return;pc.getReceivers().forEach(function(r){if(r&&r.track&&r.track.kind==="video")applyReceiverJitterToOne(r,ms);});}',
     'async function collectAndSendRxDiag(){if(!pc||!rdc||rdc.readyState!=="open")return;try{const rep=await pc.getStats();let inStat=null;rep.forEach(s=>{if(s.type==="inbound-rtp"&&s.kind==="video")inStat=s;});if(!inStat)return;let rxFps=typeof inStat.framesPerSecond==="number"?+inStat.framesPerSecond.toFixed(1):null;let decodeMs=null,jbMs=null,jbTargetStatMs=null,jbMinMs=null;const framesDec=typeof inStat.framesDecoded==="number"?inStat.framesDecoded:0;const totDec=typeof inStat.totalDecodeTime==="number"?inStat.totalDecodeTime:0;const jbEmit=typeof inStat.jitterBufferEmittedCount==="number"?inStat.jitterBufferEmittedCount:0;const jbDel=typeof inStat.jitterBufferDelay==="number"?inStat.jitterBufferDelay:0;const jbTDel=typeof inStat.jitterBufferTargetDelay==="number"?inStat.jitterBufferTargetDelay:null;const jbMDel=typeof inStat.jitterBufferMinimumDelay==="number"?inStat.jitterBufferMinimumDelay:null;if(prevInSnap){const dt=(inStat.timestamp-prevInSnap.ts)/1000;const dF=framesDec-prevInSnap.framesDecoded;const dDecT=totDec-prevInSnap.totalDecodeTime;const dEmit=jbEmit-prevInSnap.jbEmit;if(dt>0&&dF>=0){rxFps=+(dF/dt).toFixed(1);if(dF>0&&dDecT>=0)decodeMs=+(dDecT/dF*1000).toFixed(2);}if(dEmit>=5){const dJb=jbDel-prevInSnap.jbDelay;if(dJb>=0)jbMs=Math.round(dJb/dEmit*1000);if(jbTDel!==null&&prevInSnap.jbTargetDelay!==null){const dT=jbTDel-prevInSnap.jbTargetDelay;if(dT>=0)jbTargetStatMs=Math.round(dT/dEmit*1000);}if(jbMDel!==null&&prevInSnap.jbMinDelay!==null){const dM=jbMDel-prevInSnap.jbMinDelay;if(dM>=0)jbMinMs=Math.round(dM/dEmit*1000);}}}prevInSnap={ts:inStat.timestamp,framesDecoded:framesDec,totalDecodeTime:totDec,jbEmit:jbEmit,jbDelay:jbDel,jbTargetDelay:jbTDel,jbMinDelay:jbMDel};sendR({t:"diag:rx",rxFps:rxFps!==null?rxFps:0,decodeMs:decodeMs,decoder:inStat.decoderImplementation||null,hw:typeof inStat.powerEfficientDecoder==="boolean"?inStat.powerEfficientDecoder:null,jbMs:jbMs,jbTargetMs:jbTargetStatMs,jbMinMs:jbMinMs,jbSettingMs:jbSettingMs,dropped:inStat.framesDropped||0,freezes:inStat.freezeCount||0,w:inStat.frameWidth||vid.videoWidth||0,h:inStat.frameHeight||vid.videoHeight||0});}catch{}}',
@@ -2465,8 +2495,24 @@ function createWindow() {
   mainWindow.loadFile(path.join(__dirname, '..', 'renderer', 'index.html'));
 }
 
+function startPowerSaveBlockerIfNeeded() {
+  if (powerBlockerId === null || !powerSaveBlocker.isStarted(powerBlockerId)) {
+    powerBlockerId = powerSaveBlocker.start('prevent-app-suspension');
+  }
+}
+
+function stopPowerSaveBlockerIfActive() {
+  if (powerBlockerId !== null) {
+    try {
+      if (powerSaveBlocker.isStarted(powerBlockerId)) {
+        powerSaveBlocker.stop(powerBlockerId);
+      }
+    } catch {}
+    powerBlockerId = null;
+  }
+}
+
 app.whenReady().then(async () => {
-  powerBlockerId = powerSaveBlocker.start('prevent-app-suspension');
   activeDisplayId = String(screen.getPrimaryDisplay().id);
   const svcStatus = getElevatedServiceStatus();
   const pipeOk = svcStatus.running ? await connectElevatedPipe(1200) : false;
@@ -2538,7 +2584,7 @@ app.on('will-quit', () => {
   releaseAllInputs('app_quit');
   stopLocalSignalingServer();
   globalShortcut.unregisterAll();
-  if (powerBlockerId !== null) powerSaveBlocker.stop(powerBlockerId);
+  stopPowerSaveBlockerIfActive();
   disconnectElevatedPipe();
   const helperProc = nativeHelper;
   nativeHelper = null;
@@ -2729,6 +2775,7 @@ ipcMain.handle('airdesk:set-session-active', (event, active) => {
   validateIpcSender(event);
   hasActiveSession = Boolean(active);
   if (!hasActiveSession) {
+    stopPowerSaveBlockerIfActive();
     if (cursorSyncTimer) {
       clearTimeout(cursorSyncTimer);
       cursorSyncTimer = null;
@@ -2739,6 +2786,7 @@ ipcMain.handle('airdesk:set-session-active', (event, active) => {
     releaseAllInputs('session_inactive');
     sendToHelper({ t: 'sys:fast_win_anim', enabled: false });
   } else {
+    startPowerSaveBlockerIfNeeded();
     sendToHelper({ t: 'sys:fast_win_anim', enabled: true });
   }
   return { hasActiveSession, controlEnabled: authoritativeControlEnabled };

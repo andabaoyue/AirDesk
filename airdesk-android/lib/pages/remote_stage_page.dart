@@ -372,7 +372,7 @@ class _RemoteStagePageState extends State<RemoteStagePage> with WidgetsBindingOb
         );
         Widget tex = Texture(
           textureId: texId,
-          filterQuality: FilterQuality.low,
+          filterQuality: FilterQuality.medium,
         );
         final quarterTurns = (value.rotation ~/ 90) % 4;
         if (quarterTurns != 0) {
@@ -1003,9 +1003,15 @@ class _RemoteStagePageState extends State<RemoteStagePage> with WidgetsBindingOb
     final txHw = t.txHw == null ? '' : (t.txHw! ? '·硬编' : '·软编');
     final rxHw = t.rxHw == null ? '' : (t.rxHw! ? '·硬解' : '·软解');
     final rttStr = t.rttMs != null ? '${t.rttMs}ms' : '--';
+    final codecStr = t.codec.isEmpty
+        ? '--'
+        : (t.codecProfile.isEmpty ? t.codec : '${t.codec}(${t.codecProfile})');
+    final rateStr = t.txMbps != null
+        ? '${t.txMbps!.toStringAsFixed(1)}Mbps'
+        : (t.txKbps != null ? '${t.txKbps}kbps' : '--');
     final line1 =
-        'PC: ${t.codec.isEmpty ? "--" : t.codec} [${t.encoder}$txHw ${t.encodeMs ?? "--"}ms] '
-        '${t.txW ?? "--"}x${t.txH ?? "--"} @ ${t.txFps ?? "--"}fps · RTT:$rttStr';
+        'PC: $codecStr [${t.encoder}$txHw ${t.encodeMs ?? "--"}ms] '
+        '${t.txW ?? "--"}x${t.txH ?? "--"} @ ${t.txFps ?? "--"}fps · $rateStr · RTT:$rttStr';
     final line2 =
         '手机: ${t.rxFps ?? "--"}fps [${t.decoder}$rxHw ${t.decodeMs ?? "--"}ms] · '
         '缓冲:${t.jbMs ?? "--"}/${t.jbTargetMs ?? "--"}ms · 掉帧:${t.dropped ?? 0}';

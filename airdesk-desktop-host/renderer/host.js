@@ -81,6 +81,35 @@ function captureMaxFps() {
   return framerateSelect && framerateSelect.value === '60' ? 60 : 30;
 }
 
+function computeTieredVideoBitrates() {
+  const isRelay = Boolean(signalingModeSelect && signalingModeSelect.value === 'remote');
+  const isLan =
+    Boolean(lanNoStunCheckbox && lanNoStunCheckbox.checked) && !activePeerIsOverlay && !isRelay;
+  const fps = captureMaxFps();
+  const res = (resolutionSelect && resolutionSelect.value) || '1080p';
+
+  if (isRelay) {
+    return { minKbps: 600, startKbps: 2500, maxKbps: fps >= 60 ? 8000 : 6000 };
+  }
+  if (activePeerIsOverlay) {
+    return { minKbps: 800, startKbps: 4000, maxKbps: fps >= 60 ? 14000 : 10000 };
+  }
+  if (isLan) {
+    let maxKbps;
+    if (res === 'native') {
+      maxKbps = fps >= 60 ? 24000 : 18000;
+    } else if (res === '1080p') {
+      maxKbps = fps >= 60 ? 22000 : 12000;
+    } else if (res === '900p') {
+      maxKbps = fps >= 60 ? 18000 : 10000;
+    } else {
+      maxKbps = fps >= 60 ? 14000 : 8000;
+    }
+    return { minKbps: 2000, startKbps: fps >= 60 ? 8000 : 6000, maxKbps };
+  }
+  return { minKbps: 1200, startKbps: 5000, maxKbps: fps >= 60 ? 16000 : 10000 };
+}
+
 let ws = null;
 let pc = null;
 let localStream = null;
@@ -129,6 +158,8 @@ let lastSyncedClipboardText = '';
 let syncingClipboardPending = false;
 let lastPliHandledAt = 0;
 let disconnectGraceTimer = null;
+let idleCaptureReleaseTimer = null;
+let captureInitPromise = null;
 let virtualAudioInfo = null;
 let hostInSecureDesktop = false;
 let hostElevatedConnected = false;
@@ -1076,7 +1107,7 @@ async function init() {
     }
   };
 
-  const defaultBitrateKbps = () => (lanNoStunCheckbox && lanNoStunCheckbox.checked ? 15000 : 12000);
+  const defaultBitrateKbps = () => computeTieredVideoBitrates().maxKbps;
   const savedRes = localStorage.getItem(STORAGE_RES_KEY);
   if (savedRes === '720p' || savedRes === '900p' || savedRes === '1080p' || savedRes === 'native') {
     resolutionSelect.value = savedRes;
@@ -1297,6 +1328,74 @@ async function captureDisplayById(displayId) {
   return stream;
 }
 
+function cancelIdleCaptureRelease() {
+  if (idleCaptureReleaseTimer) {
+    clearTimeout(idleCaptureReleaseTimer);
+    idleCaptureReleaseTimer = null;
+  }
+}
+
+function releaseLocalCaptureMedia() {
+  cancelIdleCaptureRelease();
+  clearWarmDisplayTracks();
+  stopAudioCaptureOnly();
+  activeCaptureDisplayId = '';
+  if (localStream) {
+    localStream.getTracks().forEach((t) => t.stop());
+    localStream = null;
+  }
+  if (window.airdeskAPI && window.airdeskAPI.setVirtualAudioRoute) {
+    window.airdeskAPI.setVirtualAudioRoute({ enable: false }).catch(() => {});
+  }
+}
+
+function scheduleIdleCaptureRelease(delayMs = 20000) {
+  cancelIdleCaptureRelease();
+  if (!localStream && !localAudioStream && !localAudioTrack) return;
+  idleCaptureReleaseTimer = setTimeout(() => {
+    idleCaptureReleaseTimer = null;
+    if (hasActivePeer || pc || captureInitPromise) return;
+    releaseLocalCaptureMedia();
+    if (isHosting && statusEl) {
+      statusEl.textContent = '已空闲 20 秒，自动释放桌面采集与显存（下次连接自动秒开）';
+    }
+  }, delayMs);
+}
+
+async function ensureLocalCaptureReady() {
+  cancelIdleCaptureRelease();
+  const existingTrack = localStream ? localStream.getVideoTracks()[0] : null;
+  if (existingTrack && existingTrack.readyState === 'live') {
+    return localStream;
+  }
+  if (captureInitPromise) {
+    return captureInitPromise;
+  }
+  const targetDisplayId = activeCaptureDisplayId || displaySelect.value;
+  const run = (async () => {
+    if (localStream) {
+      localStream.getTracks().forEach((t) => t.stop());
+      localStream = null;
+    }
+    const stream = await captureDisplayById(targetDisplayId);
+    if (!isHosting) {
+      stream.getTracks().forEach((t) => t.stop());
+      stopAudioCaptureOnly();
+      throw new Error('共享已停止');
+    }
+    localStream = stream;
+    return stream;
+  })();
+  captureInitPromise = run;
+  try {
+    return await run;
+  } finally {
+    if (captureInitPromise === run) {
+      captureInitPromise = null;
+    }
+  }
+}
+
 async function applyVideoParameters(maxBitrateKbps, maxFramerate) {
   activeTargetBitrateKbps = Math.max(1000, Number(maxBitrateKbps) || 15000);
   if (!videoSender) return;
@@ -1382,8 +1481,16 @@ async function switchActiveDisplay(displayId, forceRecapture = false) {
       if (!forceRecapture && prevId && prevId !== resolvedId && prevTrack && prevTrack.readyState === 'live') {
         const old = warmDisplayTracks.get(prevId);
         if (old) {
+          warmDisplayTracks.delete(prevId);
           if (old.timer) clearTimeout(old.timer);
           if (old.stream) old.stream.getTracks().forEach((t) => t.stop());
+        }
+        while (warmDisplayTracks.size >= 1) {
+          const oldestKey = warmDisplayTracks.keys().next().value;
+          const oldest = warmDisplayTracks.get(oldestKey);
+          warmDisplayTracks.delete(oldestKey);
+          if (oldest && oldest.timer) clearTimeout(oldest.timer);
+          if (oldest && oldest.stream) oldest.stream.getTracks().forEach((t) => t.stop());
         }
         prevTrack.enabled = false;
         const timer = setTimeout(() => {
@@ -1392,7 +1499,7 @@ async function switchActiveDisplay(displayId, forceRecapture = false) {
             warmDisplayTracks.delete(prevId);
             prevStream.getTracks().forEach((t) => t.stop());
           }
-        }, 45000);
+        }, 15000);
         warmDisplayTracks.set(prevId, { stream: prevStream, track: prevTrack, timer });
       } else {
         prevStream.getTracks().forEach((t) => t.stop());
@@ -1418,6 +1525,9 @@ function startRtcStatsMonitor() {
       let rttMs = null;
       let activePair = null;
       let codecMime = null;
+      let codecProfile = '';
+      let txKbps = null;
+      let txMbps = null;
       let frameW = null;
       let frameH = null;
       let encodeMs = null;
@@ -1451,6 +1561,10 @@ function startRtcStatsMonitor() {
         const codec = codecById.get(outboundStat.codecId);
         if (codec && codec.mimeType) {
           codecMime = String(codec.mimeType).replace(/^video\//i, '').toUpperCase();
+        }
+        if (codec && codec.sdpFmtpLine) {
+          const pm = String(codec.sdpFmtpLine).match(/profile-level-id=([0-9a-f]{6})/i);
+          if (pm) codecProfile = pm[1].toLowerCase();
         }
         if (typeof outboundStat.frameWidth === 'number') frameW = outboundStat.frameWidth;
         if (typeof outboundStat.frameHeight === 'number') frameH = outboundStat.frameHeight;
@@ -1495,12 +1609,24 @@ function startRtcStatsMonitor() {
           if (dF > 0 && dT >= 0) {
             encodeMs = +(dT / dF * 1000).toFixed(1);
           }
+          if (
+            dt > 0 &&
+            typeof outboundStat.bytesSent === 'number' &&
+            typeof prevOutboundSnap.bytesSent === 'number'
+          ) {
+            const dBytes = outboundStat.bytesSent - prevOutboundSnap.bytesSent;
+            if (dBytes >= 0) {
+              txKbps = Math.round((dBytes * 8) / dt / 1000);
+              txMbps = +(txKbps / 1000).toFixed(1);
+            }
+          }
         }
         if (typeof outboundStat.framesEncoded === 'number') {
           prevOutboundSnap = {
             ts: outboundStat.timestamp,
             framesEncoded: outboundStat.framesEncoded,
             totalEncodeTime: outboundStat.totalEncodeTime || 0,
+            bytesSent: typeof outboundStat.bytesSent === 'number' ? outboundStat.bytesSent : null,
           };
         }
       }
@@ -1542,16 +1668,26 @@ function startRtcStatsMonitor() {
       const fpsText = fps !== null ? fps + 'fps' : '--';
       const rttText = rttMs !== null ? rttMs + 'ms' : '--';
 
+      const codecLabel = codecMime
+        ? codecProfile
+          ? codecMime + '(' + codecProfile + ')'
+          : codecMime
+        : '--';
+      const bitrateText =
+        txMbps !== null ? txMbps.toFixed(1) + 'Mbps' : txKbps !== null ? txKbps + 'kbps' : '--';
+
       const line1 =
         '发送端(电脑)：' +
         iceLabel +
         ' · 编码：' +
-        (codecMime || '--') +
+        codecLabel +
         encDetail +
         ' · ' +
         resText +
         ' @ ' +
         fpsText +
+        ' · 码率：' +
+        bitrateText +
         ' · 限制：' +
         limitReason +
         ' · RTT：' +
@@ -1605,6 +1741,9 @@ function startRtcStatsMonitor() {
               ? outboundStat.powerEfficientEncoder
               : null,
             codec: codecMime,
+            profile: codecProfile,
+            txKbps,
+            txMbps,
             w: frameW,
             h: frameH,
             limit: limitReason,
@@ -2033,11 +2172,12 @@ function attachFileTransferChannel(dc) {
   };
 }
 
-function cleanupPeerConnection() {
+function cleanupPeerConnection(scheduleIdleRelease = true) {
   if (disconnectGraceTimer) {
     clearTimeout(disconnectGraceTimer);
     disconnectGraceTimer = null;
   }
+  clearWarmDisplayTracks();
   if (statsTimer) {
     clearInterval(statsTimer);
     statsTimer = null;
@@ -2084,6 +2224,11 @@ function cleanupPeerConnection() {
   videoSender = null;
   audioSender = null;
   updateControlButtonUi();
+  if (scheduleIdleRelease) {
+    scheduleIdleCaptureRelease(20000);
+  } else {
+    cancelIdleCaptureRelease();
+  }
 }
 
 async function stopHost(reason) {
@@ -2093,6 +2238,7 @@ async function stopHost(reason) {
   activePeerIsOverlay = false;
   currentControlEnabled = false;
   remoteIceServers = [];
+  cancelIdleCaptureRelease();
   if (secureDesktopRecoverTimer) {
     clearTimeout(secureDesktopRecoverTimer);
     secureDesktopRecoverTimer = null;
@@ -2101,15 +2247,12 @@ async function stopHost(reason) {
     clearTimeout(videoTrackRecoverTimer);
     videoTrackRecoverTimer = null;
   }
-  if (window.airdeskAPI.setVirtualAudioRoute) {
-    window.airdeskAPI.setVirtualAudioRoute({ enable: false }).catch(() => {});
-  }
   if (wsHeartbeatTimer) {
     clearInterval(wsHeartbeatTimer);
     wsHeartbeatTimer = null;
   }
   await window.airdeskAPI.setSessionActive(false);
-  cleanupPeerConnection();
+  cleanupPeerConnection(false);
   if (ws) {
     if (ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({ type: 'session:close', reason: reason || '电脑端已停止共享' }));
@@ -2119,13 +2262,7 @@ async function stopHost(reason) {
     ws.close();
     ws = null;
   }
-  clearWarmDisplayTracks();
-  stopAudioCaptureOnly();
-  activeCaptureDisplayId = '';
-  if (localStream) {
-    localStream.getTracks().forEach((t) => t.stop());
-    localStream = null;
-  }
+  releaseLocalCaptureMedia();
   approvalCard.style.display = 'none';
   pairCodeEl.textContent = '------';
   await renderPairQr('');
@@ -2212,21 +2349,11 @@ async function startHost() {
     localStorage.setItem(STORAGE_RELAY_KEY, relayAccessKeyInput.value.trim());
   }
 
-  try {
-    localStream = await captureDisplayById(displaySelect.value);
-  } catch (err) {
-    showNotice('启动屏幕采集失败：' + err.message);
-    return;
-  }
-
   const wsUrl = rawServer.replace(/^http/i, 'ws').replace(/\/$/, '') + '/ws/signaling';
   try {
     ws = new WebSocket(wsUrl);
   } catch (err) {
-    if (localStream) {
-      localStream.getTracks().forEach((t) => t.stop());
-      localStream = null;
-    }
+    releaseLocalCaptureMedia();
     isHosting = false;
     btnStart.disabled = false;
     btnStop.disabled = true;
@@ -2614,7 +2741,8 @@ function ensurePlayoutDelayExtInSdp(sdp, preferredId = null) {
 }
 
 async function handleOffer(remoteSdp) {
-  cleanupPeerConnection();
+  cancelIdleCaptureRelease();
+  cleanupPeerConnection(false);
 
   const currentPc = new RTCPeerConnection({
     iceServers: buildIceServers(),
@@ -2622,6 +2750,19 @@ async function handleOffer(remoteSdp) {
     rtcpMuxPolicy: 'require',
   });
   pc = currentPc;
+
+  try {
+    await ensureLocalCaptureReady();
+  } catch (err) {
+    if (pc === currentPc) {
+      cleanupPeerConnection(false);
+    }
+    showNotice('启动屏幕采集失败：' + (err && err.message ? err.message : err));
+    return;
+  }
+  if (pc !== currentPc || !isHosting || !localStream) {
+    return;
+  }
 
 
 
@@ -2651,6 +2792,7 @@ async function handleOffer(remoteSdp) {
     currentControlEnabled = false;
     if (isHosting) setLivePill('waiting', '待连接');
     updateControlButtonUi();
+    cleanupPeerConnection(true);
     await window.airdeskAPI.setSessionActive(false);
     statusEl.textContent = 'WebRTC 链路已断开（' + stateLabel + '），已自动切回只读并释放所有按键';
   };
@@ -2771,7 +2913,8 @@ async function handleOffer(remoteSdp) {
           clearWarmDisplayTracks();
           await switchActiveDisplay(displaySelect.value, true);
         }
-        const targetBitrate = Math.min(35000, Math.max(1000, Number(data.maxBitrateKbps) || 15000));
+        const maxPolicyCap = signalingModeSelect && signalingModeSelect.value === 'remote' ? 8000 : 35000;
+        const targetBitrate = Math.min(maxPolicyCap, Math.max(1000, Number(data.maxBitrateKbps) || 15000));
         const targetFps = reqFps > 0 ? reqFps : data.preset === 'office_saver' ? 20 : captureMaxFps();
         await applyVideoParameters(targetBitrate, targetFps);
       } else if (data.t === 'diag:rx') {
@@ -2806,12 +2949,8 @@ async function handleOffer(remoteSdp) {
     };
   };
 
-  const isLanMode = Boolean(lanNoStunCheckbox && lanNoStunCheckbox.checked) && !activePeerIsOverlay;
-  const boostedOfferSdp = isLanMode
-    ? boostVideoSdpBitrate(remoteSdp, 4000, 10000, 16000)
-    : activePeerIsOverlay
-      ? boostVideoSdpBitrate(remoteSdp, 800, 4000, 12000)
-      : boostVideoSdpBitrate(remoteSdp, 1500, 6000, 15000);
+  const tier = computeTieredVideoBitrates();
+  const boostedOfferSdp = boostVideoSdpBitrate(remoteSdp, tier.minKbps, tier.startKbps, tier.maxKbps);
   const offerExt = ensurePlayoutDelayExtInSdp(boostedOfferSdp);
   const tunedOfferSdp = enhanceAudioOpusSdp(offerExt.sdp);
   try {
@@ -2848,10 +2987,13 @@ async function handleOffer(remoteSdp) {
         .sort((a, b) => {
           const score = (c) => {
             const f = String(c.sdpFmtpLine || '').toLowerCase();
-            if (f.includes('42e01f')) return 0;
-            if (f.includes('42001f')) return 1;
-            if (f.includes('42e0') || f.includes('4200')) return 2;
-            return 3;
+            if (f.includes('640c')) return 0;
+            if (f.includes('42e01f')) return 1;
+            if (f.includes('42e0')) return 2;
+            if (f.includes('42001f')) return 3;
+            if (f.includes('4200')) return 4;
+            if (f.includes('6400')) return 5;
+            return 6;
           };
           return score(a) - score(b);
         });
@@ -2896,7 +3038,7 @@ async function handleOffer(remoteSdp) {
   await window.airdeskAPI.setSessionActive(true);
   await window.airdeskAPI.setControlPermission(currentControlEnabled);
   updateControlButtonUi();
-  await applyVideoParameters(isLanMode ? 15000 : (activePeerIsOverlay ? 8000 : 12000), captureMaxFps());
+  await applyVideoParameters(tier.maxKbps, captureMaxFps());
   startRtcStatsMonitor();
   setLivePill('live', '串流中');
   statusEl.textContent = activePeerIsOverlay

@@ -73,6 +73,16 @@ class WebRtcSessionService extends ChangeNotifier {
   Timer? _pingTimer;
   Timer? _diagTimer;
   Timer? _wsHeartbeatTimer;
+  static const int _pointerCoalesceMs = 8;
+  Timer? _pointerFlushTimer;
+  int _lastPointerSentAtMs = 0;
+  String? _pendingPointerType;
+  double _pendingRelDx = 0;
+  double _pendingRelDy = 0;
+  double? _pendingAbsX;
+  double? _pendingAbsY;
+  double _pendingWhlDx = 0;
+  double _pendingWhlDy = 0;
   _PrevInSnap? _prevInSnap;
   int? _prevRxDropped;
   int? _prevRxFreezes;
@@ -800,10 +810,13 @@ class WebRtcSessionService extends ChangeNotifier {
 
     int scorePt(String pt) {
       final f = fmtp[pt] ?? '';
-      if (f.contains('42e01f')) return 0;
-      if (f.contains('42001f')) return 1;
-      if (f.contains('42e0') || f.contains('4200')) return 2;
-      return 3;
+      if (f.contains('640c')) return 0;
+      if (f.contains('42e01f')) return 1;
+      if (f.contains('42e0')) return 2;
+      if (f.contains('42001f')) return 3;
+      if (f.contains('4200')) return 4;
+      if (f.contains('6400')) return 5;
+      return 6;
     }
 
     h264Pts.sort((a, b) => scorePt(a).compareTo(scorePt(b)));
@@ -1021,19 +1034,138 @@ class WebRtcSessionService extends ChangeNotifier {
     } catch (_) {}
   }
 
-  void sendReliable(Map<String, dynamic> payload) {
+  static const Set<String> _orderedInputTypes = {
+    'm:btn',
+    'm:abs',
+    'm:rel',
+    'm:whl',
+    'k:down',
+    'k:up',
+    'k:release_all',
+    'text:unicode',
+    'sys:sas',
+  };
+
+  void _clearPendingPointer() {
+    _pointerFlushTimer?.cancel();
+    _pointerFlushTimer = null;
+    _pendingPointerType = null;
+    _pendingRelDx = 0;
+    _pendingRelDy = 0;
+    _pendingAbsX = null;
+    _pendingAbsY = null;
+    _pendingWhlDx = 0;
+    _pendingWhlDy = 0;
+  }
+
+  void _sendReliableRaw(Map<String, dynamic> payload) {
     final dc = _reliableDc;
     if (dc != null && dc.state == RTCDataChannelState.RTCDataChannelOpen) {
       dc.send(RTCDataChannelMessage(jsonEncode(payload)));
     }
   }
 
-  void sendPointerFast(Map<String, dynamic> payload) {
+  void _sendFastImmediate(Map<String, dynamic> payload, {bool viaReliable = false}) {
+    _lastPointerSentAtMs = DateTime.now().millisecondsSinceEpoch;
+    if (viaReliable) {
+      _sendReliableRaw(payload);
+      return;
+    }
     final dc = _unreliableDc;
     if (dc != null && dc.state == RTCDataChannelState.RTCDataChannelOpen) {
       dc.send(RTCDataChannelMessage(jsonEncode(payload)));
     } else {
-      sendReliable(payload);
+      _sendReliableRaw(payload);
+    }
+  }
+
+  void flushPendingPointer({bool viaReliable = false}) {
+    _pointerFlushTimer?.cancel();
+    _pointerFlushTimer = null;
+    final pType = _pendingPointerType;
+    if (pType == null) return;
+    _pendingPointerType = null;
+
+    if (pType == 'm:rel') {
+      final dx = _pendingRelDx;
+      final dy = _pendingRelDy;
+      _pendingRelDx = 0;
+      _pendingRelDy = 0;
+      if (dx != 0 || dy != 0) {
+        _sendFastImmediate({'t': 'm:rel', 'dx': dx, 'dy': dy}, viaReliable: viaReliable);
+      }
+    } else if (pType == 'm:abs') {
+      final x = _pendingAbsX;
+      final y = _pendingAbsY;
+      _pendingAbsX = null;
+      _pendingAbsY = null;
+      if (x != null && y != null) {
+        _sendFastImmediate({'t': 'm:abs', 'x': x, 'y': y}, viaReliable: viaReliable);
+      }
+    } else if (pType == 'm:whl') {
+      final dx = _pendingWhlDx;
+      final dy = _pendingWhlDy;
+      _pendingWhlDx = 0;
+      _pendingWhlDy = 0;
+      if (dx != 0 || dy != 0) {
+        _sendFastImmediate(
+          {'t': 'm:whl', if (dx != 0) 'dx': dx, if (dy != 0) 'dy': dy},
+          viaReliable: viaReliable,
+        );
+      }
+    }
+  }
+
+  void sendReliable(Map<String, dynamic> payload) {
+    final t = (payload['t'] ?? '').toString();
+    if (_orderedInputTypes.contains(t)) {
+      flushPendingPointer(viaReliable: true);
+    }
+    _sendReliableRaw(payload);
+  }
+
+  void sendPointerFast(Map<String, dynamic> payload) {
+    final t = (payload['t'] ?? '').toString();
+    if (t != 'm:rel' && t != 'm:abs' && t != 'm:whl') {
+      flushPendingPointer();
+      _sendFastImmediate(payload);
+      return;
+    }
+
+    if (_pendingPointerType != null && _pendingPointerType != t) {
+      flushPendingPointer();
+    }
+
+    final nowMs = DateTime.now().millisecondsSinceEpoch;
+    final elapsed = nowMs - _lastPointerSentAtMs;
+    if (_pendingPointerType == null &&
+        _pointerFlushTimer == null &&
+        elapsed >= _pointerCoalesceMs) {
+      _sendFastImmediate(payload);
+      return;
+    }
+
+    _pendingPointerType = t;
+    if (t == 'm:rel') {
+      _pendingRelDx += (payload['dx'] as num?)?.toDouble() ?? 0.0;
+      _pendingRelDy += (payload['dy'] as num?)?.toDouble() ?? 0.0;
+    } else if (t == 'm:abs') {
+      final x = (payload['x'] as num?)?.toDouble();
+      final y = (payload['y'] as num?)?.toDouble();
+      if (x != null && y != null) {
+        _pendingAbsX = x;
+        _pendingAbsY = y;
+      }
+    } else if (t == 'm:whl') {
+      _pendingWhlDx += (payload['dx'] as num?)?.toDouble() ?? 0.0;
+      _pendingWhlDy += (payload['dy'] as num?)?.toDouble() ?? 0.0;
+    }
+
+    if (_pointerFlushTimer == null) {
+      final waitMs = (_pointerCoalesceMs - elapsed).clamp(1, _pointerCoalesceMs);
+      _pointerFlushTimer = Timer(Duration(milliseconds: waitMs), () {
+        flushPendingPointer();
+      });
     }
   }
 
@@ -1506,6 +1638,8 @@ class WebRtcSessionService extends ChangeNotifier {
   }
 
   Future<void> _cleanupRtc() async {
+    _clearPendingPointer();
+    _lastPointerSentAtMs = 0;
     _pingTimer?.cancel();
     _pingTimer = null;
     _diagTimer?.cancel();
@@ -1554,6 +1688,7 @@ class WebRtcSessionService extends ChangeNotifier {
     _manualDisconnect = true;
     _wsGen++;
     _rtcGen++;
+    _clearPendingPointer();
     _wsHeartbeatTimer?.cancel();
     _wsHeartbeatTimer = null;
     sendReliable({'t': 'k:release_all', 'reason': 'android_client_disconnect'});

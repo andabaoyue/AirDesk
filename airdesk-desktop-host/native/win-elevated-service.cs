@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Globalization;
 using System.IO;
 using System.IO.Pipes;
 using System.Runtime.InteropServices;
@@ -708,7 +709,7 @@ namespace AirDeskElevatedService
                         }
 
                         EnsureCurrentInputDesktop(true);
-                        EmitPipeEvent("{\"event\":\"elevated_ready\"}");
+                        EmitPipeEvent("{\"event\":\"elevated_ready\",\"compactProto\":true}");
                         if (_reportedSecureDesktop)
                         {
                             EmitPipeEvent("{\"event\":\"secure_desktop\",\"active\":true,\"desktop\":\"" + EscapeJson(_reportedSecureDesktopName) + "\"}");
@@ -875,10 +876,67 @@ namespace AirDeskElevatedService
             monitorThread.Start();
         }
 
+        private static bool TryParseTwoDoubles(string line, out double a, out double b)
+        {
+            a = 0;
+            b = 0;
+            int sp = line.IndexOf(' ', 2);
+            if (sp <= 2 || sp + 1 >= line.Length) return false;
+            string s1 = line.Substring(2, sp - 2);
+            string s2 = line.Substring(sp + 1);
+            return double.TryParse(s1, NumberStyles.Float, CultureInfo.InvariantCulture, out a) &&
+                   double.TryParse(s2, NumberStyles.Float, CultureInfo.InvariantCulture, out b) &&
+                   !double.IsNaN(a) && !double.IsInfinity(a) &&
+                   !double.IsNaN(b) && !double.IsInfinity(b);
+        }
+
+        private static bool TryHandleCompactCommand(string line)
+        {
+            if (string.IsNullOrEmpty(line) || line.Length < 4 || line[1] != ' ') return false;
+            char cmd = line[0];
+            if (cmd == 'R')
+            {
+                double dx, dy;
+                if (!TryParseTwoDoubles(line, out dx, out dy)) return false;
+                SendMouse((int)Math.Round(dx), (int)Math.Round(dy), NativeApi.MOUSEEVENTF_MOVE);
+                return true;
+            }
+            if (cmd == 'A')
+            {
+                double px, py;
+                if (!TryParseTwoDoubles(line, out px, out py)) return false;
+                int vx = NativeApi.GetSystemMetrics(NativeApi.SM_XVIRTUALSCREEN);
+                int vy = NativeApi.GetSystemMetrics(NativeApi.SM_YVIRTUALSCREEN);
+                int vw = Math.Max(1, NativeApi.GetSystemMetrics(NativeApi.SM_CXVIRTUALSCREEN));
+                int vh = Math.Max(1, NativeApi.GetSystemMetrics(NativeApi.SM_CYVIRTUALSCREEN));
+                int normX = (int)Math.Round(((px - vx) * 65535.0) / Math.Max(1, vw - 1));
+                int normY = (int)Math.Round(((py - vy) * 65535.0) / Math.Max(1, vh - 1));
+                normX = Math.Max(0, Math.Min(65535, normX));
+                normY = Math.Max(0, Math.Min(65535, normY));
+                SendMouse(normX, normY, NativeApi.MOUSEEVENTF_MOVE | NativeApi.MOUSEEVENTF_ABSOLUTE | NativeApi.MOUSEEVENTF_VIRTUALDESK);
+                return true;
+            }
+            if (cmd == 'W')
+            {
+                double dx, dy;
+                if (!TryParseTwoDoubles(line, out dx, out dy)) return false;
+                int wheel = (int)Math.Round(-dy * 120.0);
+                if (wheel != 0) SendMouse(0, 0, NativeApi.MOUSEEVENTF_WHEEL, unchecked((uint)wheel));
+                int hwheel = (int)Math.Round(dx * 120.0);
+                if (hwheel != 0) SendMouse(0, 0, NativeApi.MOUSEEVENTF_HWHEEL, unchecked((uint)hwheel));
+                return true;
+            }
+            return false;
+        }
+
         private static void HandleCommandLine(JavaScriptSerializer serializer, string line)
         {
             try
             {
+                if (line.Length >= 2 && line[0] != '{' && TryHandleCompactCommand(line))
+                {
+                    return;
+                }
                 Dictionary<string, object> obj = serializer.Deserialize<Dictionary<string, object>>(line);
                 if (obj == null) return;
                 string t = GetStr(obj, "t");
