@@ -16,7 +16,7 @@
   "scripts": {
     "start": "electron .",
     "dev": "electron .",
-    "test": "node -c electron/main.cjs && node -c electron/preload.cjs && node -c renderer/host.js",
+    "test": "node test/run-tests.mjs",
     "prebuild:win": "C:\\Windows\\Microsoft.NET\\Framework64\\v4.0.30319\\csc.exe /nologo /optimize+ /r:System.Web.Extensions.dll /out:native\\airdesk-win-helper.exe native\\win-input-helper.cs && C:\\Windows\\Microsoft.NET\\Framework64\\v4.0.30319\\csc.exe /nologo /optimize+ /r:System.ServiceProcess.dll /r:System.Web.Extensions.dll /out:native\\airdesk-elevated-service.exe native\\win-elevated-service.cs",
     "build:win": "electron-builder --win nsis --publish never",
     "prebuild:mac": "swiftc -O native/mac-input-helper.swift -o native/airdesk-mac-helper",
@@ -35,8 +35,10 @@
     "productName": "AirDesk Host",
     "files": [
       "electron/**/*",
+      "electron/modules/**/*",
       "native/**/*",
-      "renderer/**/*"
+      "renderer/**/*",
+      "renderer/modules/**/*"
     ],
     "asarUnpack": [
       "native/**/*"
