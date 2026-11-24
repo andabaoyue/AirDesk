@@ -504,6 +504,8 @@ namespace AirDeskElevatedService
 
         private static IntPtr _currentDesktopHandle = IntPtr.Zero;
         private static string _currentDesktopName = "";
+        private static volatile bool _reportedSecureDesktop = false;
+        private static string _reportedSecureDesktopName = "Default";
 
         private static readonly object _pipeWriteLock = new object();
         private static StreamWriter _activeWriter = null;
@@ -632,6 +634,7 @@ namespace AirDeskElevatedService
                 try { NativeApi.SetProcessDPIAware(); } catch { }
             }
             StartPhysicalMouseMonitor();
+            StartSecureDesktopMonitor();
 
             JavaScriptSerializer serializer = new JavaScriptSerializer { MaxJsonLength = 2000000 };
 
@@ -706,6 +709,10 @@ namespace AirDeskElevatedService
 
                         EnsureCurrentInputDesktop(true);
                         EmitPipeEvent("{\"event\":\"elevated_ready\"}");
+                        if (_reportedSecureDesktop)
+                        {
+                            EmitPipeEvent("{\"event\":\"secure_desktop\",\"active\":true,\"desktop\":\"" + EscapeJson(_reportedSecureDesktopName) + "\"}");
+                        }
 
                         string line;
                         while ((line = ReadLineBounded(reader, 32768)) != null)
@@ -793,6 +800,79 @@ namespace AirDeskElevatedService
         {
             if (string.IsNullOrEmpty(s)) return "";
             return s.Replace("\\", "\\\\").Replace("\"", "\\\"");
+        }
+
+        private static void StartSecureDesktopMonitor()
+        {
+            Thread monitorThread = new Thread(() =>
+            {
+                bool? pendingSecure = null;
+                int pendingCount = 0;
+                while (true)
+                {
+                    Thread.Sleep(400);
+                    bool? sampleSecure = null;
+                    string sampleName = "";
+                    IntPtr hDesk = NativeApi.OpenInputDesktop(0, false, NativeApi.DESKTOP_READOBJECTS);
+                    if (hDesk == IntPtr.Zero)
+                    {
+                        if (Marshal.GetLastWin32Error() == 5)
+                        {
+                            sampleSecure = true;
+                            sampleName = "Winlogon";
+                        }
+                    }
+                    else
+                    {
+                        try
+                        {
+                            sampleName = GetDesktopName(hDesk);
+                            if (!string.IsNullOrEmpty(sampleName))
+                            {
+                                sampleSecure = !string.Equals(sampleName, "Default", StringComparison.OrdinalIgnoreCase);
+                            }
+                        }
+                        finally
+                        {
+                            NativeApi.CloseDesktop(hDesk);
+                        }
+                    }
+
+                    if (!sampleSecure.HasValue) continue;
+                    bool nowSecure = sampleSecure.Value;
+                    if (nowSecure == _reportedSecureDesktop)
+                    {
+                        pendingSecure = null;
+                        pendingCount = 0;
+                        continue;
+                    }
+                    if (pendingSecure.HasValue && pendingSecure.Value == nowSecure)
+                    {
+                        pendingCount++;
+                    }
+                    else
+                    {
+                        pendingSecure = nowSecure;
+                        pendingCount = 1;
+                    }
+                    if (pendingCount >= 2)
+                    {
+                        _reportedSecureDesktop = nowSecure;
+                        _reportedSecureDesktopName = string.IsNullOrEmpty(sampleName) ? (nowSecure ? "Winlogon" : "Default") : sampleName;
+                        pendingSecure = null;
+                        pendingCount = 0;
+                        EmitPipeEvent(
+                            "{\"event\":\"secure_desktop\",\"active\":" +
+                            (_reportedSecureDesktop ? "true" : "false") +
+                            ",\"desktop\":\"" +
+                            EscapeJson(_reportedSecureDesktopName) +
+                            "\"}"
+                        );
+                    }
+                }
+            });
+            monitorThread.IsBackground = true;
+            monitorThread.Start();
         }
 
         private static void HandleCommandLine(JavaScriptSerializer serializer, string line)

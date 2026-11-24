@@ -46,6 +46,8 @@ class _RemoteStagePageState extends State<RemoteStagePage> with WidgetsBindingOb
   bool _lastUiControlEnabled = false;
   bool _lastUiHostAudioEnabled = false;
   bool _lastUiAudioMuted = true;
+  bool _lastUiSecureDesktop = false;
+  bool _lastUiElevatedConnected = false;
   int _lastUiDisplayCount = 0;
   String _lastUiActiveDisplayId = '';
   String _lastUiStatusMsg = '';
@@ -210,6 +212,8 @@ class _RemoteStagePageState extends State<RemoteStagePage> with WidgetsBindingOb
         s.controlEnabled != _lastUiControlEnabled ||
         s.hostAudioEnabled != _lastUiHostAudioEnabled ||
         s.audioMuted != _lastUiAudioMuted ||
+        s.hostInSecureDesktop != _lastUiSecureDesktop ||
+        s.hostElevatedConnected != _lastUiElevatedConnected ||
         s.displays.length != _lastUiDisplayCount ||
         s.activeDisplayId != _lastUiActiveDisplayId ||
         (s.phase != SessionPhase.connected && s.statusMessage != _lastUiStatusMsg);
@@ -218,6 +222,8 @@ class _RemoteStagePageState extends State<RemoteStagePage> with WidgetsBindingOb
     _lastUiControlEnabled = s.controlEnabled;
     _lastUiHostAudioEnabled = s.hostAudioEnabled;
     _lastUiAudioMuted = s.audioMuted;
+    _lastUiSecureDesktop = s.hostInSecureDesktop;
+    _lastUiElevatedConnected = s.hostElevatedConnected;
     _lastUiDisplayCount = s.displays.length;
     _lastUiActiveDisplayId = s.activeDisplayId;
     _lastUiStatusMsg = s.statusMessage;
@@ -779,6 +785,19 @@ class _RemoteStagePageState extends State<RemoteStagePage> with WidgetsBindingOb
                     ),
                   ),
 
+                // Windows UAC / Secure Desktop banner
+                if (widget.session.phase == SessionPhase.connected &&
+                    widget.session.hostInSecureDesktop)
+                  Positioned(
+                    top: 12,
+                    left: 16,
+                    right: 16,
+                    child: SafeArea(
+                      bottom: false,
+                      child: Center(child: _buildSecureDesktopBanner()),
+                    ),
+                  ),
+
                 // Debug telemetry HUD pill (top-left, hidden by default; isolated via ListenableBuilder + RepaintBoundary)
                 if (_showHud)
                   Positioned(
@@ -897,6 +916,84 @@ class _RemoteStagePageState extends State<RemoteStagePage> with WidgetsBindingOb
           border: Border.all(color: const Color(0xFF334155)),
         ),
         child: Text(label, style: const TextStyle(fontSize: 12.5, fontWeight: FontWeight.w600)),
+      ),
+    );
+  }
+
+  Widget _buildSecureDesktopBanner() {
+    final elevated = widget.session.hostElevatedConnected;
+    final canCtrl = widget.session.controlEnabled;
+    return ConstrainedBox(
+      constraints: const BoxConstraints(maxWidth: 520),
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+        decoration: BoxDecoration(
+          color: const Color(0xEB0F172A),
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(color: const Color(0xCCF59E0B), width: 1.2),
+          boxShadow: const [BoxShadow(color: Colors.black54, blurRadius: 12)],
+        ),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Row(
+              children: [
+                Icon(Icons.shield_outlined, color: Color(0xFFFBBF24), size: 18),
+                SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    '电脑弹出管理员确认(UAC)或已锁屏，画面暂时冻结',
+                    style: TextStyle(
+                      color: Color(0xFFFEF3C7),
+                      fontSize: 12.5,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 6),
+            if (elevated && canCtrl)
+              Row(
+                mainAxisAlignment: MainAxisAlignment.end,
+                children: [
+                  OutlinedButton(
+                    style: OutlinedButton.styleFrom(
+                      visualDensity: VisualDensity.compact,
+                      side: const BorderSide(color: Color(0xFF64748B)),
+                      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                    ),
+                    onPressed: () {
+                      _sendKeyTap('Escape');
+                      _showToast('已发送 Esc（取消 UAC）');
+                    },
+                    child: const Text('Esc 取消', style: TextStyle(fontSize: 12, color: Colors.white)),
+                  ),
+                  const SizedBox(width: 8),
+                  FilledButton(
+                    style: FilledButton.styleFrom(
+                      backgroundColor: const Color(0xFF059669),
+                      visualDensity: VisualDensity.compact,
+                      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                    ),
+                    onPressed: () {
+                      _sendCombo(['AltLeft', 'KeyY']);
+                      _showToast('已发送 Alt+Y（允许 UAC）');
+                    },
+                    child: const Text('Alt+Y 允许', style: TextStyle(fontSize: 12)),
+                  ),
+                ],
+              )
+            else
+              Text(
+                elevated
+                    ? '当前为只读模式，请在电脑端确认或按 Ctrl+Alt+L 开启操控'
+                    : '请在电脑端确认，或安装提权服务 / 将 UAC 调至不降低桌面亮度档位',
+                style: const TextStyle(color: Color(0xFFCBD5E1), fontSize: 11.5, height: 1.35),
+              ),
+          ],
+        ),
       ),
     );
   }

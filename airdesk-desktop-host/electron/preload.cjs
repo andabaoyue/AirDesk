@@ -63,6 +63,17 @@ const airdeskAPI = Object.freeze({
   getElevatedServiceStatus: () => ipcRenderer.invoke('airdesk:get-elevated-service-status'),
   installElevatedService: () => ipcRenderer.invoke('airdesk:install-elevated-service'),
   uninstallElevatedService: () => ipcRenderer.invoke('airdesk:uninstall-elevated-service'),
+  getVirtualAudioInfo: () => ipcRenderer.invoke('airdesk:get-virtual-audio-info'),
+  setVirtualAudioRoute: (opts) =>
+    ipcRenderer.invoke(
+      'airdesk:set-virtual-audio-route',
+      opts && typeof opts === 'object'
+        ? {
+            enable: Boolean(opts.enable),
+            deviceId: typeof opts.deviceId === 'string' ? opts.deviceId : '',
+          }
+        : { enable: false, deviceId: '' }
+    ),
   startLocalSignaling: (port) => ipcRenderer.invoke('airdesk:start-local-signaling', port),
   stopLocalSignaling: () => ipcRenderer.invoke('airdesk:stop-local-signaling'),
   checkFirewall: () => ipcRenderer.invoke('airdesk:check-firewall'),
@@ -115,6 +126,11 @@ const airdeskAPI = Object.freeze({
     const listener = (_e, data) => cb(data);
     ipcRenderer.on('airdesk:cursor-pos', listener);
     return () => ipcRenderer.removeListener('airdesk:cursor-pos', listener);
+  },
+  onSecureDesktop: (cb) => {
+    const listener = (_e, data) => cb(data);
+    ipcRenderer.on('airdesk:secure-desktop', listener);
+    return () => ipcRenderer.removeListener('airdesk:secure-desktop', listener);
   },
 });
 

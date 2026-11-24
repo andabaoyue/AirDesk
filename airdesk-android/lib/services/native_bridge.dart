@@ -84,6 +84,12 @@ class NativeBridge {
     } catch (_) {}
   }
 
+  static Future<void> ensureMediaAudioMode() async {
+    try {
+      await _method.invokeMethod('ensureMediaAudioMode');
+    } catch (_) {}
+  }
+
   static Future<void> setCaptureExternalInput(bool enabled) async {
     try {
       await _method.invokeMethod('setCaptureExternalInput', {'enabled': enabled});

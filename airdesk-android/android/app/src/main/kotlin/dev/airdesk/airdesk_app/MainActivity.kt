@@ -6,9 +6,11 @@ import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ActivityInfo
+import android.media.AudioManager
 import android.net.Uri
 import android.net.wifi.WifiManager
 import android.os.Build
+import android.os.Bundle
 import android.os.Environment
 import android.os.PowerManager
 import android.provider.MediaStore
@@ -192,6 +194,11 @@ class MainActivity : FlutterActivity() {
         )
     }
 
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        volumeControlStream = AudioManager.STREAM_MUSIC
+    }
+
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         // Android's ConnectivityManager.getAllNetworks() omits SoftAP/hotspot interfaces (wlan2/ap0)
         // and VPNs interfere with NetworkMonitor binding. Enumerate real OS interfaces directly so
@@ -262,6 +269,10 @@ class MainActivity : FlutterActivity() {
                     "setLowLatencyLocks" -> {
                         val enabled = call.argument<Boolean>("enabled") ?: false
                         setLowLatencyLocks(enabled)
+                        result.success(true)
+                    }
+                    "ensureMediaAudioMode" -> {
+                        runOnUiThread { ensureMediaAudioMode() }
                         result.success(true)
                     }
                     "setCaptureExternalInput" -> {
@@ -388,6 +399,25 @@ class MainActivity : FlutterActivity() {
         window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         val controller = WindowInsetsControllerCompat(window, window.decorView)
         controller.show(WindowInsetsCompat.Type.systemBars())
+    }
+
+    private fun ensureMediaAudioMode() {
+        try {
+            val am = getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+            if (am != null) {
+                am.mode = AudioManager.MODE_NORMAL
+                @Suppress("DEPRECATION")
+                am.isSpeakerphoneOn = false
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                    try {
+                        am.clearCommunicationDevice()
+                    } catch (_: Exception) {}
+                }
+            }
+        } catch (e: Exception) {
+            Log.w("AirDeskAudio", "ensureMediaAudioMode failed: ${e.message}")
+        }
+        volumeControlStream = AudioManager.STREAM_MUSIC
     }
 
     private fun setLowLatencyLocks(enabled: Boolean) {

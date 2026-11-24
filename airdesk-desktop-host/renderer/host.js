@@ -12,6 +12,9 @@ const lanNoStunCheckbox = document.getElementById('lanNoStun');
 const allowVirtualNetCheckbox = document.getElementById('allowVirtualNet');
 const enableVkbCheckbox = document.getElementById('enableVkb');
 const enableAudioCheckbox = document.getElementById('enableAudio');
+const virtualAudioToggleWrap = document.getElementById('virtualAudioToggleWrap');
+const muteHostVirtualAudioCheckbox = document.getElementById('muteHostVirtualAudio');
+const virtualAudioToggleLabel = document.getElementById('virtualAudioToggleLabel');
 const enableIdleFpsSaverCheckbox = document.getElementById('enableIdleFpsSaver');
 const enableAutoClipboardCheckbox = document.getElementById('enableAutoClipboard');
 const customStunInput = document.getElementById('customStunUrl');
@@ -62,6 +65,7 @@ const STORAGE_SERVER_KEY = 'airdesk_host_signaling_url';
 const STORAGE_MODE_KEY = 'airdesk_host_signaling_mode';
 const STORAGE_VKB_KEY = 'airdesk_host_vkb_enabled';
 const STORAGE_AUDIO_KEY = 'airdesk_host_audio_enabled';
+const STORAGE_VIRTUAL_AUDIO_KEY = 'airdesk_host_virtual_audio_mute';
 const STORAGE_FPS_KEY = 'airdesk_host_framerate';
 const STORAGE_RES_KEY = 'airdesk_host_resolution';
 const STORAGE_HINT_KEY = 'airdesk_host_content_hint';
@@ -125,6 +129,12 @@ let lastSyncedClipboardText = '';
 let syncingClipboardPending = false;
 let lastPliHandledAt = 0;
 let disconnectGraceTimer = null;
+let virtualAudioInfo = null;
+let hostInSecureDesktop = false;
+let hostElevatedConnected = false;
+let secureDesktopRecoverTimer = null;
+let videoTrackRecoverTimer = null;
+let lastTrackRecoveryAt = 0;
 
 function initialTrackContentHint() {
   const pref = (contentHintSelect && contentHintSelect.value) || 'auto';
@@ -492,6 +502,91 @@ function stopAudioCaptureOnly() {
   localAudioTrack = null;
 }
 
+async function maybeRouteVirtualAudioForStream() {
+  if (
+    !muteHostVirtualAudioCheckbox ||
+    !muteHostVirtualAudioCheckbox.checked ||
+    !virtualAudioInfo ||
+    !virtualAudioInfo.available ||
+    !window.airdeskAPI.setVirtualAudioRoute
+  ) {
+    return;
+  }
+  try {
+    const res = await window.airdeskAPI.setVirtualAudioRoute({
+      enable: true,
+      deviceId: virtualAudioInfo.deviceId || '',
+    });
+    if (res && res.ok && res.switched) {
+      await new Promise((r) => setTimeout(r, 150));
+      stopAudioCaptureOnly();
+    }
+  } catch {}
+}
+
+function sendSecureDesktopToClient() {
+  if (!reliableDc || reliableDc.readyState !== 'open') return;
+  try {
+    reliableDc.send(
+      JSON.stringify({
+        t: 'host:secure_desktop',
+        active: hostInSecureDesktop,
+        elevatedConnected: hostElevatedConnected,
+      })
+    );
+  } catch {}
+}
+
+async function getOutboundVideoFramesCount() {
+  if (!pc) return null;
+  try {
+    const report = await pc.getStats();
+    let count = null;
+    report.forEach((stat) => {
+      if (stat.type === 'outbound-rtp' && stat.kind === 'video') {
+        if (typeof stat.framesEncoded === 'number') count = stat.framesEncoded;
+        else if (typeof stat.framesSent === 'number') count = stat.framesSent;
+      }
+    });
+    return count;
+  } catch {
+    return null;
+  }
+}
+
+async function recoverVideoCaptureIfNeeded(reason) {
+  if (!isHosting || !localStream || hostInSecureDesktop) return;
+  if (Date.now() - lastTrackRecoveryAt < 1200) return;
+
+  const vt = localStream.getVideoTracks()[0];
+  let needRecapture = !vt || vt.readyState !== 'live' || vt.muted;
+
+  if (!needRecapture && pc && hasActivePeer) {
+    const f1 = await getOutboundVideoFramesCount();
+    await new Promise((r) => setTimeout(r, 400));
+    if (!isHosting || !localStream || hostInSecureDesktop) return;
+    const curVt = localStream.getVideoTracks()[0];
+    if (!curVt || curVt.readyState !== 'live' || curVt.muted) {
+      needRecapture = true;
+    } else {
+      const f2 = await getOutboundVideoFramesCount();
+      if (f1 !== null && f2 !== null && f2 <= f1) {
+        needRecapture = true;
+      }
+    }
+  }
+
+  if (!needRecapture) return;
+  lastTrackRecoveryAt = Date.now();
+  try {
+    clearWarmDisplayTracks();
+    await switchActiveDisplay(activeCaptureDisplayId || displaySelect.value, true);
+    showNotice('已从 UAC / 安全桌面恢复桌面采集 (' + reason + ')');
+  } catch (err) {
+    console.warn('[AirDesk] Video capture recovery failed:', err && err.message ? err.message : err);
+  }
+}
+
 async function ensureDesktopAudioTrack() {
   if (localAudioTrack && localAudioTrack.readyState === 'live') {
     return localAudioTrack;
@@ -567,6 +662,9 @@ async function setDesktopAudioEnabled(enabled, fromRemote = false) {
     try {
       let actualAudio = false;
       if (next) {
+        if (hasActivePeer) {
+          await maybeRouteVirtualAudioForStream();
+        }
         const at = await ensureDesktopAudioTrack();
         actualAudio = Boolean(at);
         if (audioSender && at) {
@@ -577,8 +675,14 @@ async function setDesktopAudioEnabled(enabled, fromRemote = false) {
           await audioSender.replaceTrack(null).catch(() => {});
         }
         stopAudioCaptureOnly();
+        if (window.airdeskAPI.setVirtualAudioRoute) {
+          window.airdeskAPI.setVirtualAudioRoute({ enable: false }).catch(() => {});
+        }
       }
       if (next && !actualAudio) {
+        if (window.airdeskAPI.setVirtualAudioRoute) {
+          window.airdeskAPI.setVirtualAudioRoute({ enable: false }).catch(() => {});
+        }
         if (enableAudioCheckbox) enableAudioCheckbox.checked = false;
         localStorage.setItem(STORAGE_AUDIO_KEY, '0');
         if (ws && ws.readyState === WebSocket.OPEN) {
@@ -725,6 +829,78 @@ async function init() {
   enableAudioCheckbox.onchange = () => {
     setDesktopAudioEnabled(Boolean(enableAudioCheckbox.checked), false);
   };
+
+  virtualAudioInfo =
+    info.virtualAudio ||
+    (window.airdeskAPI.getVirtualAudioInfo ? await window.airdeskAPI.getVirtualAudioInfo() : null);
+  if (virtualAudioToggleWrap && muteHostVirtualAudioCheckbox) {
+    if (virtualAudioInfo && virtualAudioInfo.available) {
+      virtualAudioToggleWrap.style.display = 'inline-flex';
+      if (virtualAudioToggleLabel) {
+        virtualAudioToggleLabel.textContent =
+          '串流音频时切换至虚拟声卡静音本机 (' + virtualAudioInfo.deviceName + ')';
+      }
+      muteHostVirtualAudioCheckbox.checked = localStorage.getItem(STORAGE_VIRTUAL_AUDIO_KEY) === '1';
+      muteHostVirtualAudioCheckbox.onchange = async () => {
+        const checked = Boolean(muteHostVirtualAudioCheckbox.checked);
+        localStorage.setItem(STORAGE_VIRTUAL_AUDIO_KEY, checked ? '1' : '0');
+        if (hasActivePeer && enableAudioCheckbox && enableAudioCheckbox.checked && window.airdeskAPI.setVirtualAudioRoute) {
+          const res = await window.airdeskAPI.setVirtualAudioRoute({
+            enable: checked,
+            deviceId: virtualAudioInfo.deviceId || '',
+          });
+          await new Promise((r) => setTimeout(r, 150));
+          stopAudioCaptureOnly();
+          const at = await ensureDesktopAudioTrack();
+          if (audioSender && at) {
+            await audioSender.replaceTrack(at).catch(() => {});
+          }
+          if (checked) {
+            showNotice(
+              res && res.ok
+                ? '已切换本机默认输出至虚拟声卡 (' + (res.deviceName || virtualAudioInfo.deviceName) + ')，本机已静音'
+                : '切换虚拟声卡失败：' + ((res && res.reason) || '未知错误')
+            );
+          } else {
+            showNotice('已恢复原默认音频输出设备');
+          }
+        } else {
+          showNotice(
+            checked
+              ? '已启用：串流声音期间自动切至虚拟声卡静音本机'
+              : '已关闭虚拟声卡自动静音本机'
+          );
+        }
+      };
+    } else {
+      virtualAudioToggleWrap.style.display = 'none';
+      muteHostVirtualAudioCheckbox.checked = false;
+    }
+  }
+
+  hostInSecureDesktop = Boolean(info.secureDesktopActive);
+  hostElevatedConnected = Boolean(info.elevatedService && info.elevatedService.pipeConnected);
+  if (window.airdeskAPI.onSecureDesktop) {
+    window.airdeskAPI.onSecureDesktop((data) => {
+      const wasActive = hostInSecureDesktop;
+      hostInSecureDesktop = Boolean(data && data.active);
+      hostElevatedConnected = Boolean(data && data.elevatedConnected);
+      sendSecureDesktopToClient();
+      if (hostInSecureDesktop) {
+        if (secureDesktopRecoverTimer) {
+          clearTimeout(secureDesktopRecoverTimer);
+          secureDesktopRecoverTimer = null;
+        }
+        showNotice('检测到 Windows UAC / 安全桌面，已通知控制端并释放远程按键', 5000);
+      } else if (wasActive) {
+        if (secureDesktopRecoverTimer) clearTimeout(secureDesktopRecoverTimer);
+        secureDesktopRecoverTimer = setTimeout(() => {
+          secureDesktopRecoverTimer = null;
+          recoverVideoCaptureIfNeeded('secure_desktop_exit').catch(() => {});
+        }, 300);
+      }
+    });
+  }
 
   const ips = info.interfaces.map((i) => i.tag + ': ' + i.address).join('  ·  ');
   const svcConnected = Boolean(info.elevatedService && info.elevatedService.pipeConnected);
@@ -1078,6 +1254,33 @@ async function captureDisplayVideoStream(displayId) {
     // Auto mode starts with 'detail' so Windows MediaFoundation HW encoder engages;
     // startRtcStatsMonitor auto-switches to 'motion' if it detects OpenH264 software fallback.
     vt.contentHint = initialTrackContentHint();
+  }
+  if (vt) {
+    vt.onended = () => {
+      if (!isHosting || hostInSecureDesktop || !localStream || localStream.getVideoTracks()[0] !== vt) {
+        return;
+      }
+      if (videoTrackRecoverTimer) clearTimeout(videoTrackRecoverTimer);
+      videoTrackRecoverTimer = setTimeout(() => {
+        videoTrackRecoverTimer = null;
+        recoverVideoCaptureIfNeeded('track_ended').catch(() => {});
+      }, 300);
+    };
+    vt.onmute = () => {
+      if (!isHosting || hostInSecureDesktop || !localStream || localStream.getVideoTracks()[0] !== vt) {
+        return;
+      }
+      if (videoTrackRecoverTimer) clearTimeout(videoTrackRecoverTimer);
+      videoTrackRecoverTimer = setTimeout(() => {
+        videoTrackRecoverTimer = null;
+        if (!isHosting || hostInSecureDesktop || !localStream || localStream.getVideoTracks()[0] !== vt) {
+          return;
+        }
+        if (vt.muted || vt.readyState !== 'live') {
+          recoverVideoCaptureIfNeeded('track_muted').catch(() => {});
+        }
+      }, 600);
+    };
   }
   autoHintFallbackApplied = false;
   return { stream, resolvedId };
@@ -1890,6 +2093,17 @@ async function stopHost(reason) {
   activePeerIsOverlay = false;
   currentControlEnabled = false;
   remoteIceServers = [];
+  if (secureDesktopRecoverTimer) {
+    clearTimeout(secureDesktopRecoverTimer);
+    secureDesktopRecoverTimer = null;
+  }
+  if (videoTrackRecoverTimer) {
+    clearTimeout(videoTrackRecoverTimer);
+    videoTrackRecoverTimer = null;
+  }
+  if (window.airdeskAPI.setVirtualAudioRoute) {
+    window.airdeskAPI.setVirtualAudioRoute({ enable: false }).catch(() => {});
+  }
   if (wsHeartbeatTimer) {
     clearInterval(wsHeartbeatTimer);
     wsHeartbeatTimer = null;
@@ -2243,6 +2457,69 @@ function boostVideoSdpBitrate(sdp, minKbps = 1500, startKbps = 6000, maxKbps = 1
   return out.join(eol);
 }
 
+function enhanceAudioOpusSdp(sdp) {
+  if (!sdp || typeof sdp !== 'string') return sdp;
+  const eol = sdp.includes('\r\n') ? '\r\n' : '\n';
+  const lines = sdp.split(/\r?\n/);
+
+  let inAudio = false;
+  const opusPts = new Set();
+  const existingFmtpPts = new Set();
+
+  for (const line of lines) {
+    if (line.startsWith('m=')) {
+      inAudio = line.startsWith('m=audio ');
+      continue;
+    }
+    if (!inAudio) continue;
+    const rm = line.match(/^a=rtpmap:(\d+)\s+opus\//i);
+    if (rm) {
+      opusPts.add(rm[1]);
+      continue;
+    }
+    const fm = line.match(/^a=fmtp:(\d+)\s+/i);
+    if (fm) {
+      existingFmtpPts.add(fm[1]);
+    }
+  }
+
+  if (opusPts.size === 0) return sdp;
+
+  const stereoParams = 'stereo=1;sprop-stereo=1;maxaveragebitrate=128000';
+  inAudio = false;
+  const out = [];
+
+  for (const line of lines) {
+    if (line.startsWith('m=')) {
+      inAudio = line.startsWith('m=audio ');
+      out.push(line);
+      continue;
+    }
+    if (!inAudio) {
+      out.push(line);
+      continue;
+    }
+    const fm = line.match(/^a=fmtp:(\d+)\s+(.*)$/i);
+    if (fm && opusPts.has(fm[1])) {
+      const pt = fm[1];
+      const cleaned = fm[2]
+        .split(';')
+        .map((s) => s.trim())
+        .filter((s) => s && !/^(stereo|sprop-stereo|maxaveragebitrate)=/i.test(s));
+      cleaned.push(stereoParams);
+      out.push('a=fmtp:' + pt + ' ' + cleaned.join(';'));
+      continue;
+    }
+    out.push(line);
+    const rm = line.match(/^a=rtpmap:(\d+)\s+opus\//i);
+    if (rm && opusPts.has(rm[1]) && !existingFmtpPts.has(rm[1])) {
+      out.push('a=fmtp:' + rm[1] + ' ' + stereoParams);
+    }
+  }
+
+  return out.join(eol);
+}
+
 function sdpPrefersHevc(sdp) {
   if (!sdp || typeof sdp !== 'string') return false;
   const lines = sdp.split(/\r?\n/);
@@ -2422,6 +2699,9 @@ async function handleOffer(remoteSdp) {
         pushUiConfigToClient();
         if (dc.readyState === 'open') {
           dc.send(JSON.stringify({ t: 'perm', controlEnabled: currentControlEnabled }));
+          if (hostInSecureDesktop) {
+            sendSecureDesktopToClient();
+          }
         }
       };
     } else if (dc.label === 'input-unreliable') {
@@ -2533,8 +2813,9 @@ async function handleOffer(remoteSdp) {
       ? boostVideoSdpBitrate(remoteSdp, 800, 4000, 12000)
       : boostVideoSdpBitrate(remoteSdp, 1500, 6000, 15000);
   const offerExt = ensurePlayoutDelayExtInSdp(boostedOfferSdp);
+  const tunedOfferSdp = enhanceAudioOpusSdp(offerExt.sdp);
   try {
-    await pc.setRemoteDescription({ type: 'offer', sdp: offerExt.sdp });
+    await pc.setRemoteDescription({ type: 'offer', sdp: tunedOfferSdp });
   } catch (err) {
     console.warn('[AirDesk] Boosted remote SDP rejected, falling back to raw SDP:', err.message);
     await pc.setRemoteDescription({ type: 'offer', sdp: remoteSdp });
@@ -2546,6 +2827,12 @@ async function handleOffer(remoteSdp) {
     vTrack.contentHint = initialTrackContentHint();
   }
   videoSender = pc.addTrack(vTrack, localStream);
+  if (enableAudioCheckbox && enableAudioCheckbox.checked) {
+    await maybeRouteVirtualAudioForStream();
+    if (!localAudioTrack || localAudioTrack.readyState !== 'live') {
+      await ensureDesktopAudioTrack();
+    }
+  }
   const aTrack = localAudioTrack || localStream.getAudioTracks()[0];
   audioSender = aTrack ? pc.addTrack(aTrack, localStream) : null;
 
@@ -2590,9 +2877,10 @@ async function handleOffer(remoteSdp) {
 
   const answer = await pc.createAnswer();
   const ansExt = ensurePlayoutDelayExtInSdp(answer.sdp, offerExt.extId);
+  const tunedAnswerSdp = enhanceAudioOpusSdp(ansExt.sdp);
   let sentAnswer = answer;
   try {
-    const tweakedAnswer = { type: answer.type, sdp: ansExt.sdp };
+    const tweakedAnswer = { type: answer.type, sdp: tunedAnswerSdp };
     await pc.setLocalDescription(tweakedAnswer);
     sentAnswer = tweakedAnswer;
   } catch (err) {

@@ -77,6 +77,11 @@ let powerBlockerId = null;
 let nativeHelper = null;
 let elevatedPipeClient = null;
 let elevatedPipeConnecting = false;
+let elevatedPipeAuthenticated = false;
+let lastSecureDesktopActive = false;
+let virtualAudioSavedDefaultId = null;
+let virtualAudioActiveDeviceId = null;
+let virtualAudioActiveDeviceName = '';
 let helperRestartTimestamps = [];
 let helperRespawnTimer = null;
 let registeredShortcuts = [];
@@ -160,6 +165,7 @@ function sendToHelper(payload) {
   const line = JSON.stringify(payload) + '\n';
   if (
     elevatedPipeClient &&
+    elevatedPipeAuthenticated &&
     elevatedPipeClient.writable &&
     !elevatedPipeClient.destroyed &&
     !elevatedPipeClient.writableEnded
@@ -271,61 +277,204 @@ function scheduleHelperRespawn() {
   }, delayMs);
 }
 
+function resolveWinHelperExePath() {
+  if (process.platform !== 'win32') return null;
+  const prebuiltExe = resolveNativeAssetPath('airdesk-win-helper.exe');
+  if (fs.existsSync(prebuiltExe)) {
+    return prebuiltExe;
+  }
+  const csFile = resolveNativeAssetPath('win-input-helper.cs');
+  if (!fs.existsSync(csFile)) {
+    console.warn('[AirDesk] win-input-helper.cs missing at:', csFile);
+    return null;
+  }
+  // Hash-based cache guarantees code updates always trigger clean recompilation
+  const sourceHash = crypto
+    .createHash('sha256')
+    .update(fs.readFileSync(csFile))
+    .digest('hex')
+    .slice(0, 12);
+  const userDataDir = app.getPath('userData');
+  const exeName = 'airdesk-win-helper-' + sourceHash + '.exe';
+  const compiledExe = path.join(userDataDir, exeName);
+
+  if (!fs.existsSync(compiledExe)) {
+    const cscCandidates = [
+      'C:\\Windows\\Microsoft.NET\\Framework64\\v4.0.30319\\csc.exe',
+      'C:\\Windows\\Microsoft.NET\\Framework\\v4.0.30319\\csc.exe',
+    ];
+    const cscPath = cscCandidates.find((p) => fs.existsSync(p));
+    if (!cscPath) {
+      console.warn('[AirDesk] Built-in .NET csc.exe not found. Native input disabled.');
+      return null;
+    }
+    try {
+      execFileSync(
+        cscPath,
+        [
+          '/nologo',
+          '/optimize+',
+          '/r:System.Web.Extensions.dll',
+          '/out:' + compiledExe,
+          csFile,
+        ],
+        { windowsHide: true }
+      );
+      cleanupStaleWinHelpers(userDataDir, exeName);
+    } catch (err) {
+      console.error('[AirDesk] Failed to compile win-input-helper.cs:', err.message);
+      return null;
+    }
+  }
+  return compiledExe;
+}
+
+const VIRTUAL_AUDIO_PRIORITY_RE = /cable input|vb-audio|vb-cable/i;
+const VIRTUAL_AUDIO_FALLBACK_RE = /virtual audio|voicemeeter/i;
+
+function runWinHelperAudioCli(args) {
+  if (process.platform !== 'win32') {
+    return { ok: false, error: 'unsupported_platform' };
+  }
+  const exePath = resolveWinHelperExePath();
+  if (!exePath) {
+    return { ok: false, error: 'win_helper_unavailable' };
+  }
+  try {
+    const out = execFileSync(exePath, args, {
+      windowsHide: true,
+      encoding: 'utf8',
+      timeout: 4000,
+    });
+    const lines = String(out || '')
+      .split(/\r?\n/)
+      .map((l) => l.trim())
+      .filter(Boolean);
+    const lastLine = lines[lines.length - 1] || '';
+    return lastLine ? JSON.parse(lastLine) : { ok: false, error: 'empty_output' };
+  } catch (err) {
+    return { ok: false, error: err && err.message ? err.message : 'audio_cli_failed' };
+  }
+}
+
+function pickBestVirtualAudioDevice(devices) {
+  if (!Array.isArray(devices) || devices.length === 0) return null;
+  const prio = devices.find((d) => VIRTUAL_AUDIO_PRIORITY_RE.test(String(d && d.name ? d.name : '')));
+  if (prio) return prio;
+  return devices.find((d) => VIRTUAL_AUDIO_FALLBACK_RE.test(String(d && d.name ? d.name : ''))) || null;
+}
+
+function queryVirtualAudioInfo() {
+  if (process.platform !== 'win32') {
+    return { supported: false, available: false, deviceId: '', deviceName: '', active: false, devices: [] };
+  }
+  const res = runWinHelperAudioCli(['--audio-list']);
+  const devices = res && res.ok && Array.isArray(res.devices) ? res.devices : [];
+  const best = pickBestVirtualAudioDevice(devices);
+  return {
+    supported: true,
+    available: Boolean(best),
+    deviceId: best ? String(best.id || '') : '',
+    deviceName: best ? String(best.name || '') : '',
+    active: Boolean(virtualAudioActiveDeviceId),
+    devices,
+  };
+}
+
+function restoreVirtualAudioOutput() {
+  const savedId = virtualAudioSavedDefaultId;
+  virtualAudioSavedDefaultId = null;
+  virtualAudioActiveDeviceId = null;
+  virtualAudioActiveDeviceName = '';
+  if (!savedId || process.platform !== 'win32') {
+    return { ok: true, restored: false };
+  }
+  try {
+    const res = runWinHelperAudioCli(['--audio-set', savedId]);
+    return { ok: Boolean(res && res.ok), restored: Boolean(res && res.ok), error: res && res.error };
+  } catch {
+    return { ok: false, restored: false };
+  }
+}
+
+function setVirtualAudioRoute(enable, requestedDeviceId = '') {
+  if (process.platform !== 'win32') {
+    return { ok: false, active: false, switched: false, reason: '仅支持 Windows 系统' };
+  }
+  if (!enable) {
+    const res = restoreVirtualAudioOutput();
+    return { ok: Boolean(res.ok), active: false, switched: false, restored: Boolean(res.restored) };
+  }
+  if (virtualAudioActiveDeviceId) {
+    return {
+      ok: true,
+      active: true,
+      switched: false,
+      deviceId: virtualAudioActiveDeviceId,
+      deviceName: virtualAudioActiveDeviceName,
+    };
+  }
+  const listRes = runWinHelperAudioCli(['--audio-list']);
+  if (!listRes || !listRes.ok) {
+    return {
+      ok: false,
+      active: false,
+      switched: false,
+      reason: (listRes && listRes.error) || '枚举音频设备失败',
+    };
+  }
+  const devices = Array.isArray(listRes.devices) ? listRes.devices : [];
+  const target =
+    (requestedDeviceId && devices.find((d) => String(d.id) === String(requestedDeviceId))) ||
+    pickBestVirtualAudioDevice(devices);
+  if (!target || !target.id) {
+    return {
+      ok: false,
+      active: false,
+      switched: false,
+      reason: '未检测到 VB-Cable 等虚拟音频输出设备',
+    };
+  }
+  const currentDefaultId = String(listRes.defaultId || '');
+  if (currentDefaultId && currentDefaultId === String(target.id)) {
+    virtualAudioSavedDefaultId = null;
+    virtualAudioActiveDeviceId = String(target.id);
+    virtualAudioActiveDeviceName = String(target.name || '');
+    return {
+      ok: true,
+      active: true,
+      switched: false,
+      deviceId: virtualAudioActiveDeviceId,
+      deviceName: virtualAudioActiveDeviceName,
+    };
+  }
+  const setRes = runWinHelperAudioCli(['--audio-set', String(target.id)]);
+  if (!setRes || !setRes.ok) {
+    return {
+      ok: false,
+      active: false,
+      switched: false,
+      reason: (setRes && setRes.error) || '切换默认音频设备失败',
+    };
+  }
+  virtualAudioSavedDefaultId = currentDefaultId || null;
+  virtualAudioActiveDeviceId = String(target.id);
+  virtualAudioActiveDeviceName = String(target.name || '');
+  return {
+    ok: true,
+    active: true,
+    switched: true,
+    deviceId: virtualAudioActiveDeviceId,
+    deviceName: virtualAudioActiveDeviceName,
+  };
+}
+
 function spawnNativeHelper() {
   if (nativeHelper && !nativeHelper.killed) return;
 
   if (process.platform === 'win32') {
-    const prebuiltExe = resolveNativeAssetPath('airdesk-win-helper.exe');
-    let exeToRun = null;
-
-    if (fs.existsSync(prebuiltExe)) {
-      exeToRun = prebuiltExe;
-    } else {
-      const csFile = resolveNativeAssetPath('win-input-helper.cs');
-      if (!fs.existsSync(csFile)) {
-        console.warn('[AirDesk] win-input-helper.cs missing at:', csFile);
-        return;
-      }
-      // Hash-based cache guarantees code updates always trigger clean recompilation
-      const sourceHash = crypto
-        .createHash('sha256')
-        .update(fs.readFileSync(csFile))
-        .digest('hex')
-        .slice(0, 12);
-      const userDataDir = app.getPath('userData');
-      const exeName = 'airdesk-win-helper-' + sourceHash + '.exe';
-      const compiledExe = path.join(userDataDir, exeName);
-
-      if (!fs.existsSync(compiledExe)) {
-        const cscCandidates = [
-          'C:\\Windows\\Microsoft.NET\\Framework64\\v4.0.30319\\csc.exe',
-          'C:\\Windows\\Microsoft.NET\\Framework\\v4.0.30319\\csc.exe',
-        ];
-        const cscPath = cscCandidates.find((p) => fs.existsSync(p));
-        if (!cscPath) {
-          console.warn('[AirDesk] Built-in .NET csc.exe not found. Native input disabled.');
-          return;
-        }
-        try {
-          execFileSync(
-            cscPath,
-            [
-              '/nologo',
-              '/optimize+',
-              '/r:System.Web.Extensions.dll',
-              '/out:' + compiledExe,
-              csFile,
-            ],
-            { windowsHide: true }
-          );
-          cleanupStaleWinHelpers(userDataDir, exeName);
-        } catch (err) {
-          console.error('[AirDesk] Failed to compile win-input-helper.cs:', err.message);
-          return;
-        }
-      }
-      exeToRun = compiledExe;
-    }
+    const exeToRun = resolveWinHelperExePath();
+    if (!exeToRun) return;
 
     nativeHelper = spawn(exeToRun, [], {
       stdio: ['pipe', 'pipe', 'pipe'],
@@ -364,22 +513,7 @@ function spawnNativeHelper() {
     for (const line of lines) {
       if (!line.trim()) continue;
       try {
-        const evt = JSON.parse(line);
-        if (evt.event === 'physical_mouse_override') {
-          if (!hasActiveSession || !authoritativeControlEnabled) continue;
-          physicalMouseSilencedUntil = Date.now() + 3000;
-          // Immediately release any held remote mouse buttons so dragging never sticks!
-          releaseHeldMouseButtons('physical_mouse_override');
-          if (mainWindow && !mainWindow.isDestroyed()) {
-            mainWindow.webContents.send('airdesk:physical-override', {
-              silencedUntil: physicalMouseSilencedUntil,
-            });
-          }
-        } else if (evt.event === 'permission_warning' && mainWindow && !mainWindow.isDestroyed()) {
-          mainWindow.webContents.send('airdesk:inputs-released', {
-            reason: evt.message || 'missing_os_permission',
-          });
-        }
+        handleHelperJsonEvent(JSON.parse(line));
       } catch {
         // Ignore non-JSON helper stdout
       }
@@ -397,6 +531,30 @@ function spawnNativeHelper() {
 
 function handleHelperJsonEvent(evt) {
   if (!evt || typeof evt !== 'object') return;
+  if (evt.event === 'elevated_ready') {
+    elevatedPipeAuthenticated = true;
+    return;
+  }
+  if (evt.event === 'secure_desktop') {
+    const active = Boolean(evt.active);
+    lastSecureDesktopActive = active;
+    const elevatedConnected = Boolean(
+      elevatedPipeClient &&
+        elevatedPipeAuthenticated &&
+        elevatedPipeClient.writable &&
+        !elevatedPipeClient.destroyed
+    );
+    if (active) {
+      releaseAllInputs('secure_desktop_entered');
+    }
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('airdesk:secure-desktop', {
+        active,
+        elevatedConnected,
+      });
+    }
+    return;
+  }
   if (evt.event === 'physical_mouse_override') {
     if (!hasActiveSession || !authoritativeControlEnabled) return;
     physicalMouseSilencedUntil = Date.now() + 3000;
@@ -417,7 +575,9 @@ function getElevatedServiceStatus() {
   if (process.platform !== 'win32') {
     return { supported: false, installed: false, running: false, pipeConnected: false };
   }
-  const pipeConnected = Boolean(elevatedPipeClient && elevatedPipeClient.writable);
+  const pipeConnected = Boolean(
+    elevatedPipeClient && elevatedPipeAuthenticated && elevatedPipeClient.writable
+  );
   try {
     const out = execFileSync('sc.exe', ['query', ELEVATED_SERVICE_NAME], {
       windowsHide: true,
@@ -432,6 +592,7 @@ function getElevatedServiceStatus() {
 }
 
 function disconnectElevatedPipe() {
+  elevatedPipeAuthenticated = false;
   if (elevatedPipeClient) {
     try {
       elevatedPipeClient.removeAllListeners();
@@ -443,7 +604,9 @@ function disconnectElevatedPipe() {
 
 function connectElevatedPipe(timeoutMs = 2500) {
   if (process.platform !== 'win32') return Promise.resolve(false);
-  if (elevatedPipeClient && elevatedPipeClient.writable) return Promise.resolve(true);
+  if (elevatedPipeClient && elevatedPipeAuthenticated && elevatedPipeClient.writable) {
+    return Promise.resolve(true);
+  }
   if (elevatedPipeConnecting) return Promise.resolve(false);
 
   elevatedPipeConnecting = true;
@@ -460,6 +623,10 @@ function connectElevatedPipe(timeoutMs = 2500) {
     const client = net.createConnection(ELEVATED_PIPE_PATH);
     let buf = '';
     const timer = setTimeout(() => {
+      if (elevatedPipeClient === client) {
+        elevatedPipeClient = null;
+        elevatedPipeAuthenticated = false;
+      }
       try { client.destroy(); } catch {}
       finish(false);
     }, timeoutMs);
@@ -483,16 +650,8 @@ function connectElevatedPipe(timeoutMs = 2500) {
         finish(false);
         return;
       }
+      elevatedPipeAuthenticated = false;
       elevatedPipeClient = client;
-      if (helperRespawnTimer) {
-        clearTimeout(helperRespawnTimer);
-        helperRespawnTimer = null;
-      }
-      if (nativeHelper && !nativeHelper.killed) {
-        try { nativeHelper.kill(); } catch {}
-        nativeHelper = null;
-      }
-      finish(true);
     });
 
     client.on('data', (chunk) => {
@@ -502,19 +661,37 @@ function connectElevatedPipe(timeoutMs = 2500) {
       for (const line of lines) {
         if (!line.trim()) continue;
         try {
-          handleHelperJsonEvent(JSON.parse(line));
+          const evt = JSON.parse(line);
+          handleHelperJsonEvent(evt);
+          if (evt && evt.event === 'elevated_ready') {
+            if (helperRespawnTimer) {
+              clearTimeout(helperRespawnTimer);
+              helperRespawnTimer = null;
+            }
+            if (nativeHelper && !nativeHelper.killed) {
+              try { nativeHelper.kill(); } catch {}
+              nativeHelper = null;
+            }
+            finish(true);
+          }
         } catch {}
       }
     });
 
     client.on('error', () => {
-      if (elevatedPipeClient === client) elevatedPipeClient = null;
+      if (elevatedPipeClient === client) {
+        elevatedPipeClient = null;
+        elevatedPipeAuthenticated = false;
+      }
       finish(false);
     });
 
     client.on('close', () => {
       const wasActive = elevatedPipeClient === client;
-      if (wasActive) elevatedPipeClient = null;
+      if (wasActive) {
+        elevatedPipeClient = null;
+        elevatedPipeAuthenticated = false;
+      }
       finish(false);
       if (wasActive && !isQuitting && (!nativeHelper || nativeHelper.killed)) {
         spawnNativeHelper();
@@ -2117,6 +2294,7 @@ function dispatchHotkeyAction(action, extra) {
 
 function triggerEmergencyStop(reason) {
   authoritativeControlEnabled = false;
+  restoreVirtualAudioOutput();
   abortAllActiveFileReceives();
   if (revokeAllTrustedTokensCallback) {
     revokeAllTrustedTokensCallback();
@@ -2355,6 +2533,7 @@ app.on('will-quit', () => {
     cursorSyncTimer = null;
   }
   sendToHelper({ t: 'sys:fast_win_anim', enabled: false });
+  restoreVirtualAudioOutput();
   abortAllActiveFileReceives();
   releaseAllInputs('app_quit');
   stopLocalSignalingServer();
@@ -2398,8 +2577,10 @@ ipcMain.handle('airdesk:get-system-info', (event) => {
     platform: process.platform,
     interfaces: getLocalNetworkInterfaces(),
     displays: getAllDisplayDescriptors(),
-    helperReady: Boolean((elevatedPipeClient && elevatedPipeClient.writable) || (nativeHelper && !nativeHelper.killed)),
+    helperReady: Boolean((elevatedPipeClient && elevatedPipeAuthenticated && elevatedPipeClient.writable) || (nativeHelper && !nativeHelper.killed)),
     elevatedService: getElevatedServiceStatus(),
+    secureDesktopActive: lastSecureDesktopActive,
+    virtualAudio: queryVirtualAudioInfo(),
     defaultSignalingUrl: process.env.AIRDESK_SIGNALING_URL || '',
     localSignaling: getLocalSignalingInfo(),
     firewall: checkFirewallRule(localSignalingPort),
@@ -2416,6 +2597,18 @@ ipcMain.handle('airdesk:get-elevated-service-status', async (event) => {
     return getElevatedServiceStatus();
   }
   return st;
+});
+
+ipcMain.handle('airdesk:get-virtual-audio-info', (event) => {
+  validateIpcSender(event);
+  return queryVirtualAudioInfo();
+});
+
+ipcMain.handle('airdesk:set-virtual-audio-route', (event, opts) => {
+  validateIpcSender(event);
+  const enable = Boolean(opts && typeof opts === 'object' && opts.enable);
+  const deviceId = opts && typeof opts === 'object' && typeof opts.deviceId === 'string' ? opts.deviceId : '';
+  return setVirtualAudioRoute(enable, deviceId);
 });
 
 ipcMain.handle('airdesk:install-elevated-service', async (event) => {
@@ -2541,6 +2734,7 @@ ipcMain.handle('airdesk:set-session-active', (event, active) => {
       cursorSyncTimer = null;
     }
     authoritativeControlEnabled = false;
+    restoreVirtualAudioOutput();
     abortAllActiveFileReceives();
     releaseAllInputs('session_inactive');
     sendToHelper({ t: 'sys:fast_win_anim', enabled: false });

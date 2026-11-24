@@ -79,6 +79,7 @@ class WebRtcSessionService extends ChangeNotifier {
   DateTime _lastPliSentAt = DateTime.fromMillisecondsSinceEpoch(0);
   final List<RTCIceCandidate> _pendingRemoteIce = [];
   MediaStream? _fallbackRemoteStream;
+  MediaStreamTrack? _remoteAudioTrack;
 
   final ValueNotifier<Offset?> remoteCursorNorm = ValueNotifier<Offset?>(null);
 
@@ -98,6 +99,8 @@ class WebRtcSessionService extends ChangeNotifier {
   bool controlEnabled = false;
   bool hostAudioEnabled = false;
   bool audioMuted = true;
+  bool hostInSecureDesktop = false;
+  bool hostElevatedConnected = false;
   int? lastRttMs;
   int jbSettingMs = 0;
   int _lastRxAliveAtMs = 0;
@@ -439,6 +442,13 @@ class WebRtcSessionService extends ChangeNotifier {
     }
   }
 
+  Future<void> _applyAndroidMediaAudioMode() async {
+    try {
+      await Helper.setAndroidAudioConfiguration(AndroidAudioConfiguration.media);
+    } catch (_) {}
+    await NativeBridge.ensureMediaAudioMode();
+  }
+
   Future<void> _startRtc(
     List<Map<String, dynamic>> iceServers, {
     bool wantAudio = false,
@@ -447,6 +457,9 @@ class WebRtcSessionService extends ChangeNotifier {
     await _cleanupRtc();
     if (_manualDisconnect || _rtcGen != myRtcGen) return;
     _setPhase(SessionPhase.negotiatingRtc, '正在建立超低延迟 WebRTC 视频通道...');
+
+    await _applyAndroidMediaAudioMode();
+    if (_manualDisconnect || _rtcGen != myRtcGen) return;
 
     final config = <String, dynamic>{
       'iceServers': iceServers,
@@ -490,7 +503,16 @@ class WebRtcSessionService extends ChangeNotifier {
     pc.onTrack = (RTCTrackEvent event) {
       if (isStale()) return;
       if (event.track.kind == 'audio') {
+        _remoteAudioTrack = event.track;
         event.track.enabled = !audioMuted;
+        unawaited(
+          _applyAndroidMediaAudioMode().then((_) async {
+            await Future<void>.delayed(const Duration(milliseconds: 300));
+            if (!isStale()) {
+              await _applyAndroidMediaAudioMode();
+            }
+          }),
+        );
         return;
       }
       if (event.track.kind != 'video') return;
@@ -695,6 +717,14 @@ class WebRtcSessionService extends ChangeNotifier {
       remoteCursorNorm.value = Offset(x, y);
     } else if (t == 'audio:error') {
       _emitToast((d['message'] ?? '电脑端开启声音失败').toString());
+    } else if (t == 'host:secure_desktop') {
+      final nextActive = d['active'] == true;
+      final nextElevated = d['elevatedConnected'] == true;
+      if (nextActive != hostInSecureDesktop || nextElevated != hostElevatedConnected) {
+        hostInSecureDesktop = nextActive;
+        hostElevatedConnected = nextElevated;
+        notifyListeners();
+      }
     }
   }
 
@@ -1037,6 +1067,10 @@ class WebRtcSessionService extends ChangeNotifier {
 
   void toggleAudioMute() {
     audioMuted = !audioMuted;
+    final remoteTrack = _remoteAudioTrack;
+    if (remoteTrack != null) {
+      remoteTrack.enabled = !audioMuted;
+    }
     final stream = remoteRenderer.srcObject;
     if (stream != null) {
       for (final t in stream.getAudioTracks()) {
@@ -1481,6 +1515,9 @@ class WebRtcSessionService extends ChangeNotifier {
     _prevRxFreezes = null;
     _lastPliSentAt = DateTime.fromMillisecondsSinceEpoch(0);
     remoteCursorNorm.value = null;
+    _remoteAudioTrack = null;
+    hostInSecureDesktop = false;
+    hostElevatedConnected = false;
     _pendingRemoteIce.clear();
     _abortFileTransferWaiters('WebRTC 连接已重置');
     await _closeIncomingTemp(deleteFile: true);

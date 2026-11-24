@@ -240,10 +240,17 @@
               <input id="enableAudio" type="checkbox" />
               <span>同步电脑声音 (Windows)</span>
             </label>
+            <label id="virtualAudioToggleWrap" class="toggle-chip" style="display:none;" title="检测到 VB-Cable 等虚拟声卡时，串流声音期间自动将 Windows 默认输出切换至虚拟声卡以静音本机，停止声音或断开会话时自动恢复原输出设备">
+              <input id="muteHostVirtualAudio" type="checkbox" />
+              <span id="virtualAudioToggleLabel">串流音频时自动切换至虚拟声卡静音本机</span>
+            </label>
             <label class="toggle-chip" title="开启后放行 Tailscale / ZeroTier 100.64.0.0/10 虚拟组网候选，仅拦截 Clash/Mihomo 198.18.0.0/15">
               <input id="allowVirtualNet" type="checkbox" />
               <span>允许 Tailscale / ZeroTier 异地组网</span>
             </label>
+          </div>
+          <div class="mono" style="margin-top:6px; font-size:11.5px; line-height:1.5;">
+            提示：开启声音时电脑本机默认会同步出声；若需电脑静音、仅手机出声，可配合虚拟声卡（如 VB-Cable）或调低外接音箱。
           </div>
           <div class="row" style="margin-top: 10px;">
             <span id="firewallBadge" class="pill"><span class="pill-dot"></span><span>防火墙检测中</span></span>

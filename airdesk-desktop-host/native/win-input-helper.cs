@@ -44,6 +44,9 @@ namespace AirDeskWinHelper
 
         private const uint SPI_GETANIMATION = 0x0048;
         private const uint SPI_SETANIMATION = 0x0049;
+        private const uint DESKTOP_READOBJECTS = 0x0001;
+        private const int UOI_NAME = 2;
+        private const int ERROR_ACCESS_DENIED = 5;
 
         [StructLayout(LayoutKind.Sequential)]
         struct ANIMATIONINFO
@@ -122,6 +125,22 @@ namespace AirDeskWinHelper
         [DllImport("user32.dll", SetLastError = true)]
         static extern bool SystemParametersInfo(uint uiAction, uint uiParam, ref ANIMATIONINFO pvParam, uint fWinIni);
 
+        [DllImport("user32.dll", SetLastError = true)]
+        static extern IntPtr OpenInputDesktop(uint dwFlags, bool fInherit, uint dwDesiredAccess);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        static extern bool CloseDesktop(IntPtr hDesktop);
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        static extern bool GetUserObjectInformationW(
+            IntPtr hObj,
+            int nIndex,
+            byte[] pvInfo,
+            int nLength,
+            out int lpnLengthNeeded
+        );
+
+        private static readonly object _stdoutLock = new object();
         private static LowLevelMouseProc _mouseProc;
         private static IntPtr _mouseHookHandle = IntPtr.Zero;
         private static uint _hookThreadId = 0;
@@ -129,6 +148,8 @@ namespace AirDeskWinHelper
         private static int _physicalMousePending = 0;
         private static readonly AutoResetEvent _physicalMouseSignal = new AutoResetEvent(false);
         private static volatile bool _hookStopping = false;
+        private static volatile bool _secureDesktopStopping = false;
+        private static readonly AutoResetEvent _secureDesktopStopEvent = new AutoResetEvent(false);
         private static long _lastSendErrorLogMs = 0;
 
         private static int _cachedVx = 0;
@@ -224,6 +245,101 @@ namespace AirDeskWinHelper
             return CallNextHookEx(IntPtr.Zero, nCode, wParam, lParam);
         }
 
+        static void EmitJsonLine(string json)
+        {
+            lock (_stdoutLock)
+            {
+                try { Console.WriteLine(json); } catch { }
+            }
+        }
+
+        static string GetDesktopName(IntPtr hDesk)
+        {
+            if (hDesk == IntPtr.Zero) return "";
+            int needed = 0;
+            GetUserObjectInformationW(hDesk, UOI_NAME, null, 0, out needed);
+            if (needed <= 0) return "";
+            byte[] buf = new byte[needed];
+            if (!GetUserObjectInformationW(hDesk, UOI_NAME, buf, needed, out needed))
+            {
+                return "";
+            }
+            return Encoding.Unicode.GetString(buf).TrimEnd('\0');
+        }
+
+        static void StartSecureDesktopMonitor()
+        {
+            _secureDesktopStopping = false;
+            Thread monitorThread = new Thread(() =>
+            {
+                bool reportedSecure = false;
+                bool? pendingSecure = null;
+                int pendingCount = 0;
+                while (!_secureDesktopStopping)
+                {
+                    if (_secureDesktopStopEvent.WaitOne(400) || _secureDesktopStopping) break;
+                    bool? sampleSecure = null;
+                    IntPtr hDesk = OpenInputDesktop(0, false, DESKTOP_READOBJECTS);
+                    if (hDesk == IntPtr.Zero)
+                    {
+                        int err = Marshal.GetLastWin32Error();
+                        if (err == ERROR_ACCESS_DENIED)
+                        {
+                            sampleSecure = true;
+                        }
+                    }
+                    else
+                    {
+                        try
+                        {
+                            string name = GetDesktopName(hDesk);
+                            if (!string.IsNullOrEmpty(name))
+                            {
+                                sampleSecure = !string.Equals(name, "Default", StringComparison.OrdinalIgnoreCase);
+                            }
+                        }
+                        finally
+                        {
+                            CloseDesktop(hDesk);
+                        }
+                    }
+
+                    if (!sampleSecure.HasValue) continue;
+                    bool nowSecure = sampleSecure.Value;
+                    if (nowSecure == reportedSecure)
+                    {
+                        pendingSecure = null;
+                        pendingCount = 0;
+                        continue;
+                    }
+                    if (pendingSecure.HasValue && pendingSecure.Value == nowSecure)
+                    {
+                        pendingCount++;
+                    }
+                    else
+                    {
+                        pendingSecure = nowSecure;
+                        pendingCount = 1;
+                    }
+                    if (pendingCount >= 2)
+                    {
+                        reportedSecure = nowSecure;
+                        pendingSecure = null;
+                        pendingCount = 0;
+                        EmitJsonLine("{\"event\":\"secure_desktop\",\"active\":" + (reportedSecure ? "true" : "false") + "}");
+                    }
+                }
+            });
+            monitorThread.IsBackground = true;
+            monitorThread.Start();
+        }
+
+        static void StopSecureDesktopMonitor()
+        {
+            _secureDesktopStopping = true;
+            _secureDesktopStopEvent.Set();
+        }
+
         static void StartPhysicalMouseMonitor()
         {
             _hookStopping = false;
@@ -235,7 +351,7 @@ namespace AirDeskWinHelper
                     if (_hookStopping) break;
                     if (Interlocked.Exchange(ref _physicalMousePending, 0) == 1)
                     {
-                        try { Console.WriteLine("{\"event\":\"physical_mouse_override\"}"); } catch { }
+                        EmitJsonLine("{\"event\":\"physical_mouse_override\"}");
                     }
                 }
             });
@@ -454,10 +570,25 @@ namespace AirDeskWinHelper
             return sb.Length > 0 ? sb.ToString() : null;
         }
 
+        [STAThread]
         static void Main(string[] args)
         {
             Console.InputEncoding = Encoding.UTF8;
             Console.OutputEncoding = Encoding.UTF8;
+            if (args != null && args.Length > 0)
+            {
+                if (string.Equals(args[0], "--audio-list", StringComparison.OrdinalIgnoreCase))
+                {
+                    AudioRouter.PrintAudioListJson();
+                    return;
+                }
+                if (string.Equals(args[0], "--audio-set", StringComparison.OrdinalIgnoreCase))
+                {
+                    string devId = args.Length > 1 ? args[1] : "";
+                    AudioRouter.SetDefaultDeviceJson(devId);
+                    return;
+                }
+            }
             try
             {
                 if (!SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2))
@@ -471,6 +602,7 @@ namespace AirDeskWinHelper
             }
             RefreshVirtualScreenBounds(true);
             StartPhysicalMouseMonitor();
+            StartSecureDesktopMonitor();
 
             JavaScriptSerializer serializer = new JavaScriptSerializer { MaxJsonLength = 2000000 };
 
@@ -566,9 +698,255 @@ namespace AirDeskWinHelper
             }
             finally
             {
+                StopSecureDesktopMonitor();
                 StopPhysicalMouseMonitor();
                 SetWindowAnimationSuppressed(false);
                 ReleaseAllKeysAndMouse();
+            }
+        }
+    }
+
+    static class AudioRouter
+    {
+        private const int eRender = 0;
+        private const uint DEVICE_STATE_ACTIVE = 0x00000001;
+        private const int STGM_READ = 0;
+        private const ushort VT_LPWSTR = 31;
+
+        private enum ERole : uint
+        {
+            eConsole = 0,
+            eMultimedia = 1,
+            eCommunications = 2
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct PROPERTYKEY
+        {
+            public Guid fmtid;
+            public uint pid;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct PROPVARIANT
+        {
+            public ushort vt;
+            public ushort wReserved1;
+            public ushort wReserved2;
+            public ushort wReserved3;
+            public IntPtr p;
+            public IntPtr p2;
+        }
+
+        [DllImport("ole32.dll")]
+        private static extern int PropVariantClear(ref PROPVARIANT pvar);
+
+        [ComImport, Guid("BCDE0395-E52F-467C-8E3D-C4579291692E")]
+        private class MMDeviceEnumerator { }
+
+        [ComImport, Guid("A95664D2-9614-4F35-A746-DE8DB63617E6")]
+        [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+        private interface IMMDeviceEnumerator
+        {
+            [PreserveSig] int EnumAudioEndpoints(int dataFlow, uint dwStateMask, out IMMDeviceCollection ppDevices);
+            [PreserveSig] int GetDefaultAudioEndpoint(int dataFlow, int role, out IMMDevice ppEndpoint);
+            [PreserveSig] int GetDevice([MarshalAs(UnmanagedType.LPWStr)] string pwstrId, out IMMDevice ppDevice);
+            [PreserveSig] int RegisterEndpointNotificationCallback(IntPtr pClient);
+            [PreserveSig] int UnregisterEndpointNotificationCallback(IntPtr pClient);
+        }
+
+        [ComImport, Guid("0BD7A1BE-7A1A-44DB-8397-CC5392387B5E")]
+        [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+        private interface IMMDeviceCollection
+        {
+            [PreserveSig] int GetCount(out uint pcDevices);
+            [PreserveSig] int Item(uint nDevice, out IMMDevice ppDevice);
+        }
+
+        [ComImport, Guid("D666063F-1587-4E43-81F1-B948E807363F")]
+        [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+        private interface IMMDevice
+        {
+            [PreserveSig] int Activate(ref Guid iid, uint dwClsCtx, IntPtr pActivationParams, [MarshalAs(UnmanagedType.IUnknown)] out object ppInterface);
+            [PreserveSig] int OpenPropertyStore(int stgmAccess, out IPropertyStore ppProperties);
+            [PreserveSig] int GetId([MarshalAs(UnmanagedType.LPWStr)] out string ppstrId);
+            [PreserveSig] int GetState(out uint pdwState);
+        }
+
+        [ComImport, Guid("886D8EEB-8CF2-4446-8D02-CDBA1DBDCF99")]
+        [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+        private interface IPropertyStore
+        {
+            [PreserveSig] int GetCount(out uint cProps);
+            [PreserveSig] int GetAt(uint iProp, out PROPERTYKEY pkey);
+            [PreserveSig] int GetValue(ref PROPERTYKEY key, out PROPVARIANT pv);
+            [PreserveSig] int SetValue(ref PROPERTYKEY key, ref PROPVARIANT propvar);
+            [PreserveSig] int Commit();
+        }
+
+        [ComImport, Guid("870AF99C-171D-4F9E-AF0D-E63DF40C2BC9")]
+        private class CPolicyConfigClient { }
+
+        [ComImport, Guid("F8679F50-850A-41CF-9C72-430F290290C8")]
+        [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+        private interface IPolicyConfig
+        {
+            [PreserveSig] int GetMixFormat();
+            [PreserveSig] int GetDeviceFormat();
+            [PreserveSig] int ResetDeviceFormat();
+            [PreserveSig] int SetDeviceFormat();
+            [PreserveSig] int GetProcessingPeriod();
+            [PreserveSig] int SetProcessingPeriod();
+            [PreserveSig] int GetShareMode();
+            [PreserveSig] int SetShareMode();
+            [PreserveSig] int GetPropertyValue();
+            [PreserveSig] int SetPropertyValue();
+            [PreserveSig] int SetDefaultEndpoint([In, MarshalAs(UnmanagedType.LPWStr)] string wszDeviceId, [In, MarshalAs(UnmanagedType.U4)] ERole role);
+            [PreserveSig] int SetEndpointVisibility();
+        }
+
+        private static readonly PROPERTYKEY PKEY_Device_FriendlyName = new PROPERTYKEY
+        {
+            fmtid = new Guid("A45C254E-DF1C-4EFD-8020-67D146A850E0"),
+            pid = 14
+        };
+
+        private static string GetFriendlyName(IMMDevice dev)
+        {
+            if (dev == null) return "";
+            IPropertyStore store = null;
+            try
+            {
+                if (dev.OpenPropertyStore(STGM_READ, out store) != 0 || store == null) return "";
+                PROPERTYKEY key = PKEY_Device_FriendlyName;
+                PROPVARIANT pv;
+                if (store.GetValue(ref key, out pv) != 0) return "";
+                try
+                {
+                    if (pv.vt == VT_LPWSTR && pv.p != IntPtr.Zero)
+                    {
+                        return Marshal.PtrToStringUni(pv.p) ?? "";
+                    }
+                    return "";
+                }
+                finally
+                {
+                    PropVariantClear(ref pv);
+                }
+            }
+            catch
+            {
+                return "";
+            }
+            finally
+            {
+                if (store != null) Marshal.ReleaseComObject(store);
+            }
+        }
+
+        public static void PrintAudioListJson()
+        {
+            JavaScriptSerializer ser = new JavaScriptSerializer();
+            IMMDeviceEnumerator enumerator = null;
+            IMMDeviceCollection col = null;
+            IMMDevice defDev = null;
+            try
+            {
+                enumerator = (IMMDeviceEnumerator)new MMDeviceEnumerator();
+                string defaultId = "";
+                if (enumerator.GetDefaultAudioEndpoint(eRender, (int)ERole.eMultimedia, out defDev) == 0 && defDev != null)
+                {
+                    defDev.GetId(out defaultId);
+                }
+                else if (enumerator.GetDefaultAudioEndpoint(eRender, (int)ERole.eConsole, out defDev) == 0 && defDev != null)
+                {
+                    defDev.GetId(out defaultId);
+                }
+
+                List<Dictionary<string, string>> devices = new List<Dictionary<string, string>>();
+                if (enumerator.EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE, out col) == 0 && col != null)
+                {
+                    uint count = 0;
+                    col.GetCount(out count);
+                    for (uint i = 0; i < count; i++)
+                    {
+                        IMMDevice dev = null;
+                        try
+                        {
+                            if (col.Item(i, out dev) == 0 && dev != null)
+                            {
+                                string id = "";
+                                dev.GetId(out id);
+                                string name = GetFriendlyName(dev);
+                                if (!string.IsNullOrEmpty(id))
+                                {
+                                    Dictionary<string, string> item = new Dictionary<string, string>();
+                                    item["id"] = id;
+                                    item["name"] = string.IsNullOrEmpty(name) ? id : name;
+                                    devices.Add(item);
+                                }
+                            }
+                        }
+                        finally
+                        {
+                            if (dev != null) Marshal.ReleaseComObject(dev);
+                        }
+                    }
+                }
+
+                Dictionary<string, object> result = new Dictionary<string, object>();
+                result["ok"] = true;
+                result["defaultId"] = defaultId ?? "";
+                result["devices"] = devices;
+                Console.WriteLine(ser.Serialize(result));
+            }
+            catch (Exception ex)
+            {
+                Dictionary<string, object> err = new Dictionary<string, object>();
+                err["ok"] = false;
+                err["error"] = ex.Message;
+                Console.WriteLine(ser.Serialize(err));
+            }
+            finally
+            {
+                if (defDev != null) Marshal.ReleaseComObject(defDev);
+                if (col != null) Marshal.ReleaseComObject(col);
+                if (enumerator != null) Marshal.ReleaseComObject(enumerator);
+            }
+        }
+
+        public static void SetDefaultDeviceJson(string deviceId)
+        {
+            JavaScriptSerializer ser = new JavaScriptSerializer();
+            IPolicyConfig policy = null;
+            try
+            {
+                if (string.IsNullOrWhiteSpace(deviceId))
+                {
+                    throw new ArgumentException("Missing deviceId");
+                }
+                policy = (IPolicyConfig)new CPolicyConfigClient();
+                int hrConsole = policy.SetDefaultEndpoint(deviceId, ERole.eConsole);
+                int hrMedia = policy.SetDefaultEndpoint(deviceId, ERole.eMultimedia);
+                policy.SetDefaultEndpoint(deviceId, ERole.eCommunications);
+                if (hrConsole != 0 && hrMedia != 0)
+                {
+                    Marshal.ThrowExceptionForHR(hrMedia != 0 ? hrMedia : hrConsole);
+                }
+                Dictionary<string, object> ok = new Dictionary<string, object>();
+                ok["ok"] = true;
+                Console.WriteLine(ser.Serialize(ok));
+            }
+            catch (Exception ex)
+            {
+                Dictionary<string, object> err = new Dictionary<string, object>();
+                err["ok"] = false;
+                err["error"] = ex.Message;
+                Console.WriteLine(ser.Serialize(err));
+            }
+            finally
+            {
+                if (policy != null) Marshal.ReleaseComObject(policy);
             }
         }
     }
