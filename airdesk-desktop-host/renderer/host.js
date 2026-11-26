@@ -33,6 +33,9 @@ const enableIdleFpsSaverCheckbox = document.getElementById('enableIdleFpsSaver')
 const enableAutoClipboardCheckbox = document.getElementById('enableAutoClipboard');
 const customStunInput = document.getElementById('customStunUrl');
 const relayAccessKeyInput = document.getElementById('relayAccessKey');
+const enableAutoStartCheckbox = document.getElementById('enableAutoStart');
+const enableAutoHostOnStartCheckbox = document.getElementById('enableAutoHostOnStart');
+const trustTtlSelect = document.getElementById('trustTtlSelect');
 const btnStart = document.getElementById('btnStart');
 const btnStop = document.getElementById('btnStop');
 const btnToggleCtrl = document.getElementById('btnToggleCtrl');
@@ -141,6 +144,13 @@ let lastClientDiag = null;
 let lastClientDiagAt = 0;
 let remoteIceServers = [];
 let wsHeartbeatTimer = null;
+let wsReconnectTimer = null;
+let wsReconnectAttempt = 0;
+let isManualStop = false;
+const WS_RECONNECT_DELAYS_MS = [2000, 5000, 10000, 30000];
+let hostIdentity = null;
+let pendingApprovalClient = null;
+let activeRelaySessionToken = '';
 let lastRemoteInputAt = Date.now();
 let isIdleThrottled = false;
 let activeTargetBitrateKbps = 15000;
@@ -230,7 +240,7 @@ async function refreshTrustedDevicesUi() {
   try {
     const list = await window.airdeskAPI.getTrustedDevices();
     if (!Array.isArray(list) || list.length === 0) {
-      trustedDevicesListEl.textContent = '暂无已信任免密设备（首次审批通过后 7 天内免扫码直连）';
+      trustedDevicesListEl.textContent = '暂无已信任免密设备（批准连接后将按所选有效期免扫码直连）';
       return;
     }
     trustedDevicesListEl.innerHTML = '';
@@ -240,8 +250,14 @@ async function refreshTrustedDevicesUi() {
         'display:flex;justify-content:space-between;align-items:center;gap:8px;padding:6px 10px;background:#0B0F14;border:1px solid #1E293B;border-radius:8px;margin-top:6px;';
       const infoSpan = document.createElement('span');
       const modeText = dev.mode === 'full_control' ? '允许操控' : '仅观看';
+      const sourceText = dev.source === 'relay' ? '公网中继' : '局域网';
       const seenText = dev.lastSeenAt ? new Date(dev.lastSeenAt).toLocaleString() : '--';
+      const expiryText =
+        dev.expiresAt === null ? '长期有效' : new Date(dev.expiresAt).toLocaleDateString() + ' 到期';
       infoSpan.textContent =
+        '[' +
+        sourceText +
+        '] ' +
         dev.deviceLabel +
         ' (' +
         dev.platformHint +
@@ -249,6 +265,8 @@ async function refreshTrustedDevicesUi() {
         dev.ipMasked +
         ') · 权限：' +
         modeText +
+        ' · ' +
+        expiryText +
         ' · 最近活跃：' +
         seenText;
       const revokeBtn = document.createElement('button');
@@ -971,12 +989,24 @@ function cleanupPeerConnection(scheduleIdleRelease = true) {
   }
 }
 
+function clearWsReconnectTimer() {
+  if (wsReconnectTimer) {
+    clearTimeout(wsReconnectTimer);
+    wsReconnectTimer = null;
+  }
+}
+
 async function stopHost(reason) {
+  isManualStop = true;
+  clearWsReconnectTimer();
+  wsReconnectAttempt = 0;
   mediaCapture.bumpSessionGen();
   isHosting = false;
   hasPendingApproval = false;
+  pendingApprovalClient = null;
   hasActivePeer = false;
   activePeerIsOverlay = false;
+  activeRelaySessionToken = '';
   currentControlEnabled = false;
   remoteIceServers = [];
   mediaCapture.cancelIdleCaptureRelease();
@@ -1034,12 +1064,16 @@ function buildIceServers() {
 
 async function startHost() {
   if (isHosting) return;
+  isManualStop = false;
+  clearWsReconnectTimer();
+  wsReconnectAttempt = 0;
   mediaCapture.bumpSessionGen();
   remoteIceServers = [];
   if (wsHeartbeatTimer) {
     clearInterval(wsHeartbeatTimer);
     wsHeartbeatTimer = null;
   }
+  localStorage.setItem(STORAGE_MODE_KEY, signalingModeSelect.value);
   if (signalingModeSelect.value === 'local') {
     localSignalingInfo = await window.airdeskAPI.startLocalSignaling(47820);
     serverInput.value = localSignalingInfo.preferredHttpUrl;
@@ -1061,7 +1095,10 @@ async function startHost() {
 
   const wsUrl = rawServer.replace(/^http/i, 'ws').replace(/\/$/, '') + '/ws/signaling';
   try {
-    ws = new WebSocket(wsUrl);
+    const parsedWs = new URL(wsUrl);
+    if (parsedWs.protocol !== 'ws:' && parsedWs.protocol !== 'wss:') {
+      throw new Error('不支持的协议 ' + parsedWs.protocol);
+    }
   } catch (err) {
     mediaCapture.releaseLocalCaptureMedia();
     isHosting = false;
@@ -1077,44 +1114,119 @@ async function startHost() {
   btnStart.disabled = true;
   btnStop.disabled = false;
   updateControlButtonUi();
-  statusEl.textContent = '正在连接信令服务器...';
+  connectSignalingSocket(wsUrl);
+}
 
-  ws.onopen = () => {
+function connectSignalingSocket(wsUrl) {
+  if (!isHosting || isManualStop) return;
+  clearWsReconnectTimer();
+  if (wsHeartbeatTimer) {
+    clearInterval(wsHeartbeatTimer);
+    wsHeartbeatTimer = null;
+  }
+  if (ws) {
+    ws.onopen = null;
+    ws.onerror = null;
+    ws.onclose = null;
+    ws.onmessage = null;
+    try {
+      ws.close();
+    } catch {}
+    ws = null;
+  }
+
+  let sock;
+  try {
+    sock = new WebSocket(wsUrl);
+  } catch (err) {
+    if (signalingModeSelect.value === 'remote' && isHosting && !isManualStop) {
+      scheduleRelayWsReconnect(wsUrl);
+    } else {
+      stopHost('信令连接创建失败：' + err.message);
+    }
+    return;
+  }
+
+  ws = sock;
+  statusEl.textContent =
+    wsReconnectAttempt > 0
+      ? '正在尝试重新连接公网信令服务器 (第 ' + wsReconnectAttempt + ' 次)...'
+      : '正在连接信令服务器...';
+
+  sock.onopen = () => {
+    if (ws !== sock || !isHosting || isManualStop) {
+      try {
+        sock.close();
+      } catch {}
+      return;
+    }
+    wsReconnectAttempt = 0;
+    clearWsReconnectTimer();
     const createPayload = {
       type: 'host:create',
+      protoVersion: 2,
       hostLabel: 'AirDesk Electron Desktop',
       audioEnabled: Boolean(enableAudioCheckbox && enableAudioCheckbox.checked),
     };
+    if (hostIdentity && hostIdentity.hostId && hostIdentity.hostSecret) {
+      createPayload.hostId = hostIdentity.hostId;
+      createPayload.hostSecret = hostIdentity.hostSecret;
+    }
     if (signalingModeSelect.value === 'local' && localSignalingInfo && localSignalingInfo.localHostToken) {
       createPayload.localHostToken = localSignalingInfo.localHostToken;
     }
     const rk = relayAccessKeyInput ? relayAccessKeyInput.value.trim() : '';
     if (rk) createPayload.accessKey = rk;
-    ws.send(JSON.stringify(createPayload));
+    sock.send(JSON.stringify(createPayload));
     if (signalingModeSelect.value === 'remote') {
       wsHeartbeatTimer = setInterval(() => {
-        if (ws && ws.readyState === WebSocket.OPEN) {
-          ws.send(JSON.stringify({ type: 'ws:ping', ts: Date.now() }));
+        if (ws === sock && sock.readyState === WebSocket.OPEN) {
+          sock.send(JSON.stringify({ type: 'ws:ping', ts: Date.now() }));
         }
       }, 25000);
     }
   };
 
-  ws.onerror = () => {
-    showNotice('信令连接出现异常，请检查服务器地址或网络连通性');
+  sock.onerror = () => {
+    if (ws !== sock) return;
+    if (wsReconnectAttempt === 0) {
+      showNotice('信令连接出现异常，请检查服务器地址或网络连通性');
+    }
   };
 
-  ws.onclose = () => {
+  sock.onclose = (ev) => {
+    if (ws !== sock) return;
     if (wsHeartbeatTimer) {
       clearInterval(wsHeartbeatTimer);
       wsHeartbeatTimer = null;
     }
-    if (isHosting) {
-      stopHost('信令连接已断开，已自动释放采集并切回只读');
+    if (isManualStop || !isHosting) return;
+    if (ev && ev.code === 4003) {
+      stopHost('中继密钥或主机身份校验失败，已停止共享');
+      return;
     }
+    if (signalingModeSelect.value === 'remote') {
+      hasPendingApproval = false;
+      pendingApprovalClient = null;
+      approvalCard.style.display = 'none';
+      hasActivePeer = false;
+      currentControlEnabled = false;
+      activePeerIsOverlay = false;
+      activeRelaySessionToken = '';
+      cleanupPeerConnection(false);
+      mediaCapture.releaseLocalCaptureMedia();
+      window.airdeskAPI.setSessionActive(false).catch(() => {});
+      pairCodeEl.textContent = '------';
+      renderPairQr('').catch(() => {});
+      updateControlButtonUi();
+      scheduleRelayWsReconnect(wsUrl);
+      return;
+    }
+    stopHost('信令连接已断开，已自动释放采集并切回只读');
   };
 
-  ws.onmessage = async (ev) => {
+  sock.onmessage = async (ev) => {
+    if (ws !== sock) return;
     let msg;
     try {
       msg = JSON.parse(ev.data);
@@ -1132,20 +1244,48 @@ async function startHost() {
       if (Array.isArray(msg.iceServers)) {
         remoteIceServers = msg.iceServers;
       }
+      setLivePill('waiting', '待连接');
       pairCodeEl.textContent = msg.code;
       await renderPairQr(msg.code);
       const hasTurn = remoteIceServers.some((s) => {
         const u = Array.isArray(s.urls) ? s.urls.join(',') : String(s.urls || '');
         return /^turns?:/i.test(u);
       });
+      const hostIdNote =
+        signalingModeSelect.value === 'remote' && hostIdentity && hostIdentity.hostId
+          ? ' · 主机 ID: ' + hostIdentity.hostId
+          : '';
       statusEl.textContent =
         signalingModeSelect.value === 'local'
           ? '内置本地信令已就绪：手机连接同一热点/Wi-Fi 扫码即可 0 流量直连'
           : (hasTurn
-              ? '公网信令已就绪（已配 TURN 中继兜底）：等待手机输入 6 位配对码...'
-              : '公网信令已就绪（STUN P2P 穿透）：等待手机输入 6 位配对码...');
+              ? '公网信令已就绪（已配 TURN 中继兜底' + hostIdNote + '）：等待手机接入...'
+              : '公网信令已就绪（STUN P2P 穿透' + hostIdNote + '）：等待手机接入...');
+    } else if (msg.type === 'host:verify_token') {
+      const clientMeta = msg.client || {};
+      const verifyRes = await window.airdeskAPI.verifyRelayTrustedToken({
+        sessionToken: msg.sessionToken,
+        ipMasked: clientMeta.ipMasked,
+        deviceLabel: clientMeta.deviceLabel,
+        platformHint: clientMeta.platformHint,
+      });
+      if (verifyRes && verifyRes.ok) {
+        activeRelaySessionToken = msg.sessionToken;
+      }
+      if (ws === sock && sock.readyState === WebSocket.OPEN) {
+        sock.send(
+          JSON.stringify({
+            type: 'host:token_verified',
+            verifyId: msg.verifyId,
+            approved: Boolean(verifyRes && verifyRes.ok),
+            mode: (verifyRes && verifyRes.mode) || 'view_only',
+            reason: (verifyRes && verifyRes.reason) || '',
+          })
+        );
+      }
     } else if (msg.type === 'host:approval_request') {
       hasPendingApproval = true;
+      pendingApprovalClient = msg.client || null;
       activePeerIsOverlay = Boolean(msg.client && msg.client.isOverlayPeer);
       const netBadge = activePeerIsOverlay ? ' [异地组网]' : '';
       approvalDesc.textContent =
@@ -1183,17 +1323,37 @@ async function startHost() {
       );
     } else if (msg.type === 'host:pending_cancelled') {
       hasPendingApproval = false;
+      pendingApprovalClient = null;
       approvalCard.style.display = 'none';
       showNotice(msg.reason || '连接请求已取消');
     } else if (msg.type === 'host:client_disconnected') {
       statusEl.textContent = '客户端已断开：' + msg.reason;
       currentControlEnabled = false;
       activePeerIsOverlay = false;
+      activeRelaySessionToken = '';
       if (isHosting) setLivePill('waiting', '待连接');
       cleanupPeerConnection();
       await window.airdeskAPI.setSessionActive(false);
     }
   };
+}
+
+function scheduleRelayWsReconnect(wsUrl) {
+  if (!isHosting || isManualStop) return;
+  const delayMs = WS_RECONNECT_DELAYS_MS[Math.min(wsReconnectAttempt, WS_RECONNECT_DELAYS_MS.length - 1)];
+  wsReconnectAttempt += 1;
+  setLivePill('waiting', '重连中');
+  statusEl.textContent =
+    '公网信令连接断开，' +
+    Math.round(delayMs / 1000) +
+    ' 秒后自动重连 (第 ' +
+    wsReconnectAttempt +
+    ' 次)...';
+  clearWsReconnectTimer();
+  wsReconnectTimer = setTimeout(() => {
+    wsReconnectTimer = null;
+    connectSignalingSocket(wsUrl);
+  }, delayMs);
 }
 
 async function handleOffer(remoteSdp) {
@@ -1483,19 +1643,35 @@ async function handleOffer(remoteSdp) {
 
 async function approveRequest(mode) {
   hasPendingApproval = false;
+  const clientMeta = pendingApprovalClient || {};
+  pendingApprovalClient = null;
   approvalCard.style.display = 'none';
   hasActivePeer = true;
   currentControlEnabled = mode === 'full_control';
   await window.airdeskAPI.setSessionActive(true);
   await window.airdeskAPI.setControlPermission(currentControlEnabled);
   updateControlButtonUi();
+  const decisionPayload = { type: 'host:approval_decision', approved: true, mode };
+  if (signalingModeSelect.value === 'remote' && window.airdeskAPI.issueRelayTrustedToken) {
+    const issued = await window.airdeskAPI.issueRelayTrustedToken({
+      mode,
+      deviceLabel: clientMeta.deviceLabel || '远程移动设备',
+      platformHint: clientMeta.platformHint || 'Mobile',
+      ipMasked: clientMeta.ipMasked || 'WAN',
+    });
+    if (issued && issued.sessionToken) {
+      decisionPayload.sessionToken = issued.sessionToken;
+      activeRelaySessionToken = issued.sessionToken;
+    }
+  }
   if (ws && ws.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify({ type: 'host:approval_decision', approved: true, mode }));
+    ws.send(JSON.stringify(decisionPayload));
   }
 }
 
 function rejectRequest() {
   hasPendingApproval = false;
+  pendingApprovalClient = null;
   approvalCard.style.display = 'none';
   if (ws && ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify({ type: 'host:approval_decision', approved: false }));
@@ -1504,6 +1680,8 @@ function rejectRequest() {
 
 async function init() {
   const info = await window.airdeskAPI.getSystemInfo();
+  hostIdentity = info.hostIdentity || null;
+  const hostSettings = info.hostSettings || {};
   displaysMeta = info.displays || [];
   localSignalingInfo = info.localSignaling || null;
   currentControlEnabled = Boolean(info.controlEnabled);
@@ -1791,6 +1969,14 @@ async function init() {
       updateControlButtonUi();
       const label = currentControlEnabled ? '允许远程操控' : '仅观看（只读）';
       showNotice('快捷键切权 (Ctrl+Alt+L)：当前已切换为「' + label + '」');
+      if (signalingModeSelect.value === 'remote' && activeRelaySessionToken && window.airdeskAPI.updateRelayTokenMode) {
+        window.airdeskAPI
+          .updateRelayTokenMode({
+            sessionToken: activeRelaySessionToken,
+            mode: currentControlEnabled ? 'full_control' : 'view_only',
+          })
+          .catch(() => {});
+      }
       if (ws && ws.readyState === WebSocket.OPEN) {
         ws.send(
           JSON.stringify({
@@ -1964,6 +2150,73 @@ async function init() {
       refreshTrustedDevicesUi().catch(() => {});
     });
   }
+  if (window.airdeskAPI.onTrustedTokenRevoked) {
+    window.airdeskAPI.onTrustedTokenRevoked((data) => {
+      if (!activeRelaySessionToken || !data) return;
+      const matched =
+        data.all === true ||
+        (typeof data.tokenPrefix === 'string' && activeRelaySessionToken.startsWith(data.tokenPrefix));
+      if (!matched) return;
+      activeRelaySessionToken = '';
+      if (signalingModeSelect.value === 'remote' && hasActivePeer) {
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: 'session:close', reason: '电脑端已移除当前设备信任凭证' }));
+        }
+        hasActivePeer = false;
+        currentControlEnabled = false;
+        activePeerIsOverlay = false;
+        if (isHosting) setLivePill('waiting', '待连接');
+        updateControlButtonUi();
+        cleanupPeerConnection(true);
+        window.airdeskAPI.setSessionActive(false).catch(() => {});
+      }
+    });
+  }
+  if (trustTtlSelect) {
+    trustTtlSelect.value =
+      hostSettings.trustTtlOption === '30d' || hostSettings.trustTtlOption === 'never'
+        ? hostSettings.trustTtlOption
+        : '7d';
+    trustTtlSelect.onchange = async () => {
+      const res = await window.airdeskAPI.updateHostSettings({ trustTtlOption: trustTtlSelect.value });
+      if (res && res.settings) {
+        trustTtlSelect.value = res.settings.trustTtlOption;
+      }
+      const label =
+        trustTtlSelect.value === 'never'
+          ? '长期有效（直到手动撤销）'
+          : trustTtlSelect.value === '30d'
+            ? '30 天'
+            : '7 天';
+      showNotice('已将免密设备有效期设为：' + label + '（新批准或重连时生效）');
+    };
+  }
+  if (enableAutoStartCheckbox) {
+    enableAutoStartCheckbox.checked = Boolean(hostSettings.autoStartOnBoot);
+    enableAutoStartCheckbox.onchange = async () => {
+      const want = Boolean(enableAutoStartCheckbox.checked);
+      const res = await window.airdeskAPI.updateHostSettings({ autoStartOnBoot: want });
+      if (res && res.loginItemResult && res.loginItemResult.supported === false) {
+        enableAutoStartCheckbox.checked = false;
+        await window.airdeskAPI.updateHostSettings({ autoStartOnBoot: false });
+        showNotice('当前系统平台暂不支持开机自启设置');
+        return;
+      }
+      showNotice(want ? '已开启：开机自动启动 AirDesk Host' : '已关闭开机自动启动');
+    };
+  }
+  if (enableAutoHostOnStartCheckbox) {
+    enableAutoHostOnStartCheckbox.checked = Boolean(hostSettings.autoHostOnStartup);
+    enableAutoHostOnStartCheckbox.onchange = async () => {
+      const want = Boolean(enableAutoHostOnStartCheckbox.checked);
+      await window.airdeskAPI.updateHostSettings({ autoHostOnStartup: want });
+      showNotice(
+        want
+          ? '已开启：下次启动时自动恢复上次共享模式并最小化到托盘'
+          : '已关闭启动后自动开启共享'
+      );
+    };
+  }
   await refreshTrustedDevicesUi();
 
   if (window.airdeskAPI.onCursorPos) {
@@ -1997,6 +2250,12 @@ async function init() {
       showNotice('已切换采集帧率：' + fps + ' fps' + (fps === 60 ? '（核显可能掉帧）' : '（稳帧推荐）'));
     };
   }
+
+  if (hostSettings.autoHostOnStartup) {
+    setTimeout(() => {
+      startHost().catch(() => {});
+    }, 0);
+  }
 }
 
 document.getElementById('btnAllowFull').onclick = () => approveRequest('full_control');
@@ -2009,6 +2268,14 @@ btnToggleCtrl.onclick = async () => {
   const res = await window.airdeskAPI.setControlPermission(next);
   currentControlEnabled = Boolean(res.controlEnabled);
   updateControlButtonUi();
+  if (signalingModeSelect.value === 'remote' && activeRelaySessionToken && window.airdeskAPI.updateRelayTokenMode) {
+    window.airdeskAPI
+      .updateRelayTokenMode({
+        sessionToken: activeRelaySessionToken,
+        mode: currentControlEnabled ? 'full_control' : 'view_only',
+      })
+      .catch(() => {});
+  }
   if (ws && ws.readyState === WebSocket.OPEN) {
     ws.send(
       JSON.stringify({

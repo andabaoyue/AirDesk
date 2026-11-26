@@ -12,6 +12,10 @@ const TRUSTED_TOKEN_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const RATE_LIMIT_WINDOW_MS = 60 * 1000;
 const RATE_LIMIT_MAX_ATTEMPTS = 8;
 const MAX_IP_BUCKETS = 10000;
+const MAX_HOST_REGISTRY = 10000;
+const MAX_PENDING_VERIFIES_PER_ROOM = 4;
+const VERIFY_TIMEOUT_MS = 10000;
+const HOST_ID_RE = /^[a-zA-Z0-9_-]{6,32}$/;
 
 function safeEqualStrings(a, b) {
   const sa = String(a || '');
@@ -100,6 +104,7 @@ export function createRelayServer(options = {}) {
 
   const startedAt = Date.now();
   const roomsByCode = new Map();
+  const roomsByHostId = new Map();
   const socketRoom = new Map();
   const ipAttemptBuckets = new Map();
 
@@ -217,8 +222,23 @@ export function createRelayServer(options = {}) {
   const maintenanceTimer = setInterval(() => {
     const now = Date.now();
     for (const room of new Set(roomsByCode.values())) {
-      if (!room.activeClientWs && !room.pendingClientWs && now >= room.expiresAt) {
+      if (room.hostWs && room.hostWs.readyState === 1 && !room.activeClientWs && !room.pendingClientWs && now >= room.expiresAt) {
         rotateCode(room, 'ttl_expired');
+      }
+      if (room.pendingVerifies && room.pendingVerifies.size > 0) {
+        for (const [verifyId, pending] of room.pendingVerifies.entries()) {
+          if (now - pending.createdAt > VERIFY_TIMEOUT_MS) {
+            room.pendingVerifies.delete(verifyId);
+            if (pending.ws && pending.ws.readyState === 1) {
+              sendWs(pending.ws, {
+                type: 'error',
+                code: 'HOST_OFFLINE',
+                retryable: true,
+                message: '电脑端验证超时，请稍后重试',
+              });
+            }
+          }
+        }
       }
     }
     for (const [ip, bucket] of ipAttemptBuckets.entries()) {
@@ -273,6 +293,77 @@ export function createRelayServer(options = {}) {
           } catch {}
           return;
         }
+        const hostId = typeof msg.hostId === 'string' ? msg.hostId.trim() : '';
+        const hostSecret = typeof msg.hostSecret === 'string' ? msg.hostSecret.trim() : '';
+        const protoVersion = Number(msg.protoVersion) >= 2 ? 2 : 1;
+
+        if (hostId) {
+          if (!HOST_ID_RE.test(hostId) || hostSecret.length < 16) {
+            checkAndRecordIpFailure(maskedIp);
+            sendWs(ws, { type: 'error', message: '无效的 hostId 或 hostSecret 格式' });
+            try {
+              ws.close(4003, 'invalid host identity');
+            } catch {}
+            return;
+          }
+          const existing = roomsByHostId.get(hostId);
+          if (existing) {
+            if (!safeEqualStrings(existing.hostSecret, hostSecret)) {
+              checkAndRecordIpFailure(maskedIp);
+              sendWs(ws, { type: 'error', message: '主机身份密钥校验失败，拒绝认领该 hostId' });
+              try {
+                ws.close(4003, 'invalid host secret');
+              } catch {}
+              return;
+            }
+            if (existing.code) roomsByCode.delete(existing.code);
+            if (existing.hostWs && existing.hostWs !== ws) {
+              const oldHostWs = existing.hostWs;
+              existing.hostWs = null;
+              socketRoom.delete(oldHostWs);
+              try {
+                oldHostWs.close(4000, 'reclaimed');
+              } catch {}
+            }
+            if (existing.activeClientWs) {
+              const oldClient = existing.activeClientWs;
+              existing.activeClientWs = null;
+              socketRoom.delete(oldClient);
+              sendWs(oldClient, { type: 'session:closed', reason: '电脑端正在重新上线' });
+            }
+            if (existing.pendingClientWs) {
+              const oldPending = existing.pendingClientWs;
+              existing.pendingClientWs = null;
+              existing.pendingClientMeta = null;
+              socketRoom.delete(oldPending);
+              sendWs(oldPending, { type: 'session:closed', reason: '电脑端正在重新上线' });
+            }
+            if (existing.pendingVerifies) {
+              for (const pending of existing.pendingVerifies.values()) {
+                if (pending.ws && pending.ws.readyState === 1) {
+                  sendWs(pending.ws, {
+                    type: 'error',
+                    code: 'HOST_OFFLINE',
+                    retryable: true,
+                    message: '目标电脑正在重新上线，请稍后重试',
+                  });
+                }
+              }
+              existing.pendingVerifies.clear();
+            }
+          } else if (roomsByHostId.size >= MAX_HOST_REGISTRY) {
+            let evictKey = null;
+            for (const [k, r] of roomsByHostId.entries()) {
+              if (!r.hostWs) {
+                evictKey = k;
+                break;
+              }
+            }
+            if (evictKey === null) evictKey = roomsByHostId.keys().next().value;
+            if (evictKey !== undefined) roomsByHostId.delete(evictKey);
+          }
+        }
+
         const prevMeta = socketRoom.get(ws);
         if (prevMeta && prevMeta.room) {
           roomsByCode.delete(prevMeta.room.code);
@@ -283,23 +374,36 @@ export function createRelayServer(options = {}) {
           code,
           expiresAt: Date.now() + PAIR_CODE_TTL_MS,
           hostWs: ws,
+          hostId: hostId || null,
+          hostSecret: hostId ? hostSecret : null,
+          protoVersion: hostId ? Math.max(2, protoVersion) : 1,
           hostLabel: String(msg.hostLabel || 'AirDesk Desktop').slice(0, 64),
           audioEnabled: Boolean(msg.audioEnabled),
           pendingClientWs: null,
           pendingClientMeta: null,
+          pendingVerifies: new Map(),
           activeClientWs: null,
           activeSessionToken: null,
           failedAttempts: 0,
-          trustedTokens: new Map(),
+          trustedTokens: hostId ? null : new Map(),
         };
         roomsByCode.set(code, room);
+        if (hostId) {
+          roomsByHostId.delete(hostId);
+          roomsByHostId.set(hostId, room);
+        }
         socketRoom.set(ws, { room, role: 'host' });
-        sendWs(ws, {
+        const createdReply = {
           type: 'host:created',
           code,
           expiresAt: room.expiresAt,
           iceServers: getIceServers(),
-        });
+        };
+        if (hostId) {
+          createdReply.hostId = hostId;
+          createdReply.protoVersion = room.protoVersion;
+        }
+        sendWs(ws, createdReply);
         return;
       }
 
@@ -308,12 +412,62 @@ export function createRelayServer(options = {}) {
           sendWs(ws, { type: 'error', message: '尝试次数过多，请 1 分钟后再试' });
           return;
         }
+        const targetHostId = typeof msg.hostId === 'string' ? msg.hostId.trim() : '';
+        if (typeof msg.sessionToken === 'string' && msg.sessionToken.length >= 16 && targetHostId) {
+          const room = roomsByHostId.get(targetHostId);
+          if (!room || !room.hostWs || room.hostWs.readyState !== 1) {
+            sendWs(ws, {
+              type: 'error',
+              code: 'HOST_OFFLINE',
+              retryable: true,
+              message: '目标电脑暂不在线（等待恢复）',
+            });
+            return;
+          }
+          for (const [vid, pending] of room.pendingVerifies.entries()) {
+            if (!pending.ws || pending.ws.readyState !== 1) {
+              room.pendingVerifies.delete(vid);
+            }
+          }
+          if (room.pendingVerifies.size >= MAX_PENDING_VERIFIES_PER_ROOM) {
+            sendWs(ws, {
+              type: 'error',
+              retryable: true,
+              message: '电脑端正在处理过多验证请求，请稍后再试',
+            });
+            return;
+          }
+          const verifyId = crypto.randomUUID();
+          const clientMeta = {
+            deviceLabel: String(msg.deviceLabel || '远程移动设备').slice(0, 64),
+            platformHint: String(msg.platformHint || 'Mobile').slice(0, 32),
+            ipMasked: maskedIp,
+          };
+          room.pendingVerifies.set(verifyId, {
+            ws,
+            sessionToken: msg.sessionToken,
+            deviceLabel: clientMeta.deviceLabel,
+            platformHint: clientMeta.platformHint,
+            ipMasked: maskedIp,
+            createdAt: Date.now(),
+          });
+          ws.once('close', () => {
+            room.pendingVerifies.delete(verifyId);
+          });
+          sendWs(room.hostWs, {
+            type: 'host:verify_token',
+            verifyId,
+            sessionToken: msg.sessionToken,
+            client: clientMeta,
+          });
+          return;
+        }
         if (typeof msg.sessionToken === 'string' && msg.sessionToken.length >= 16) {
           let matchedRoom = null;
           let tokenRecord = null;
           const nowTs = Date.now();
           for (const candidateRoom of new Set(roomsByCode.values())) {
-            const rec = candidateRoom.trustedTokens.get(msg.sessionToken);
+            const rec = candidateRoom.trustedTokens && candidateRoom.trustedTokens.get(msg.sessionToken);
             if (rec && rec.expiresAt > nowTs) {
               matchedRoom = candidateRoom;
               tokenRecord = rec;
@@ -322,7 +476,11 @@ export function createRelayServer(options = {}) {
           }
           if (!matchedRoom || !tokenRecord) {
             checkAndRecordIpFailure(maskedIp);
-            sendWs(ws, { type: 'error', message: '自动重连凭证已过期，请重新输入 6 位配对码' });
+            sendWs(ws, {
+              type: 'error',
+              code: 'TOKEN_INVALID',
+              message: '自动重连凭证已过期，请重新输入 6 位配对码',
+            });
             return;
           }
           if (matchedRoom.activeClientWs && matchedRoom.activeClientWs !== ws) {
@@ -411,14 +569,64 @@ export function createRelayServer(options = {}) {
           room.audioEnabled = msg.audioEnabled;
         }
         if (msg.activeMode === 'full_control' || msg.activeMode === 'view_only') {
-          if (room.activeSessionToken && room.trustedTokens.has(room.activeSessionToken)) {
+          if (room.trustedTokens && room.activeSessionToken && room.trustedTokens.has(room.activeSessionToken)) {
             room.trustedTokens.get(room.activeSessionToken).mode = msg.activeMode;
           }
         }
         if (msg.revokeAllTokens === true) {
-          room.trustedTokens.clear();
+          if (room.trustedTokens) room.trustedTokens.clear();
           room.activeSessionToken = null;
         }
+        return;
+      }
+
+      if (role === 'host' && msg.type === 'host:token_verified') {
+        const verifyId = typeof msg.verifyId === 'string' ? msg.verifyId : '';
+        const pending = room.pendingVerifies && room.pendingVerifies.get(verifyId);
+        if (!pending) return;
+        room.pendingVerifies.delete(verifyId);
+        if (!pending.ws || pending.ws.readyState !== 1) return;
+
+        if (msg.approved !== true) {
+          checkAndRecordIpFailure(pending.ipMasked);
+          sendWs(pending.ws, {
+            type: 'error',
+            code: 'TOKEN_INVALID',
+            message: msg.reason || '自动重连凭证已过期或已被撤销，请重新输入 6 位配对码',
+          });
+          return;
+        }
+
+        if (room.activeClientWs && room.activeClientWs !== pending.ws) {
+          const staleWs = room.activeClientWs;
+          room.activeClientWs = null;
+          socketRoom.delete(staleWs);
+          try {
+            staleWs.close();
+          } catch {}
+        }
+        room.activeClientWs = pending.ws;
+        room.activeSessionToken = pending.sessionToken;
+        socketRoom.set(pending.ws, { room, role: 'client' });
+
+        const approvedMode = msg.mode === 'full_control' ? 'full_control' : 'view_only';
+        const approvedPayload = {
+          type: 'client:approved',
+          mode: approvedMode,
+          hostLabel: room.hostLabel,
+          audioEnabled: Boolean(room.audioEnabled),
+          sessionToken: pending.sessionToken,
+          iceServers: getIceServers(),
+          reconnected: true,
+        };
+        if (room.hostId) approvedPayload.hostId = room.hostId;
+        sendWs(pending.ws, approvedPayload);
+        sendWs(room.hostWs, {
+          type: 'host:client_reconnected',
+          mode: approvedMode,
+          deviceLabel: pending.deviceLabel,
+          ipMasked: pending.ipMasked,
+        });
         return;
       }
 
@@ -437,32 +645,39 @@ export function createRelayServer(options = {}) {
 
         room.activeClientWs = pending;
         const approvedMode = msg.mode || 'view_only';
-        const sessionToken = crypto.randomBytes(16).toString('hex');
+        const sessionToken =
+          typeof msg.sessionToken === 'string' && msg.sessionToken.length >= 16
+            ? msg.sessionToken
+            : crypto.randomBytes(16).toString('hex');
         room.activeSessionToken = sessionToken;
-        const nowTs = Date.now();
-        room.trustedTokens.set(sessionToken, {
-          mode: approvedMode,
-          deviceLabel: pendingMeta.deviceLabel || '远程移动设备',
-          platformHint: pendingMeta.platformHint || 'Mobile',
-          ipMasked: pendingMeta.ipMasked || 'WAN',
-          createdAt: nowTs,
-          lastSeenAt: nowTs,
-          expiresAt: nowTs + TRUSTED_TOKEN_TTL_MS,
-        });
+        if (room.trustedTokens) {
+          const nowTs = Date.now();
+          room.trustedTokens.set(sessionToken, {
+            mode: approvedMode,
+            deviceLabel: pendingMeta.deviceLabel || '远程移动设备',
+            platformHint: pendingMeta.platformHint || 'Mobile',
+            ipMasked: pendingMeta.ipMasked || 'WAN',
+            createdAt: nowTs,
+            lastSeenAt: nowTs,
+            expiresAt: nowTs + TRUSTED_TOKEN_TTL_MS,
+          });
+        }
 
-        sendWs(pending, {
+        const approvedPayload = {
           type: 'client:approved',
           mode: approvedMode,
           hostLabel: room.hostLabel,
           audioEnabled: Boolean(room.audioEnabled),
           sessionToken,
           iceServers: getIceServers(),
-        });
+        };
+        if (room.hostId) approvedPayload.hostId = room.hostId;
+        sendWs(pending, approvedPayload);
         return;
       }
 
       if (role === 'host' && msg.type === 'host:emergency_stop') {
-        room.trustedTokens.clear();
+        if (room.trustedTokens) room.trustedTokens.clear();
         room.activeSessionToken = null;
         if (room.activeClientWs) {
           sendWs(room.activeClientWs, {
@@ -488,7 +703,26 @@ export function createRelayServer(options = {}) {
             reason: msg.reason || '对方已断开连接',
           });
         }
-        if (role === 'client') {
+        if (role === 'host') {
+          if (room.activeClientWs) {
+            const activeWs = room.activeClientWs;
+            room.activeClientWs = null;
+            room.activeSessionToken = null;
+            socketRoom.delete(activeWs);
+            try {
+              activeWs.close();
+            } catch {}
+          }
+          if (room.pendingClientWs) {
+            const pendingWs = room.pendingClientWs;
+            room.pendingClientWs = null;
+            room.pendingClientMeta = null;
+            socketRoom.delete(pendingWs);
+            try {
+              pendingWs.close();
+            } catch {}
+          }
+        } else {
           if (room.activeClientWs === ws) {
             room.activeClientWs = null;
             room.activeSessionToken = null;
@@ -508,12 +742,35 @@ export function createRelayServer(options = {}) {
       socketRoom.delete(ws);
       const { room, role } = meta;
       if (role === 'host') {
-        roomsByCode.delete(room.code);
+        if (room.hostWs !== ws) return;
+        room.hostWs = null;
+        if (room.code) roomsByCode.delete(room.code);
         if (room.activeClientWs) {
-          sendWs(room.activeClientWs, { type: 'session:closed', reason: '电脑端已关闭共享' });
+          const activeWs = room.activeClientWs;
+          room.activeClientWs = null;
+          room.activeSessionToken = null;
+          socketRoom.delete(activeWs);
+          sendWs(activeWs, { type: 'session:closed', reason: '电脑端已关闭共享' });
         }
         if (room.pendingClientWs) {
-          sendWs(room.pendingClientWs, { type: 'session:closed', reason: '电脑端已关闭共享' });
+          const pendingWs = room.pendingClientWs;
+          room.pendingClientWs = null;
+          room.pendingClientMeta = null;
+          socketRoom.delete(pendingWs);
+          sendWs(pendingWs, { type: 'session:closed', reason: '电脑端已关闭共享' });
+        }
+        if (room.pendingVerifies && room.pendingVerifies.size > 0) {
+          for (const pending of room.pendingVerifies.values()) {
+            if (pending.ws && pending.ws.readyState === 1) {
+              sendWs(pending.ws, {
+                type: 'error',
+                code: 'HOST_OFFLINE',
+                retryable: true,
+                message: '目标电脑暂不在线（等待恢复）',
+              });
+            }
+          }
+          room.pendingVerifies.clear();
         }
       } else {
         const wasActive = room.activeClientWs === ws;
@@ -559,7 +816,7 @@ export function createRelayServer(options = {}) {
     await new Promise((resolve) => server.close(resolve));
   }
 
-  return { server, wss, roomsByCode, close, getIceServers };
+  return { server, wss, roomsByCode, roomsByHostId, close, getIceServers };
 }
 
 const isMain = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;

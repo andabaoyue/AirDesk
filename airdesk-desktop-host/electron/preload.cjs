@@ -91,6 +91,32 @@ const airdeskAPI = Object.freeze({
     ipcRenderer.on('airdesk:trusted-devices-updated', listener);
     return () => ipcRenderer.removeListener('airdesk:trusted-devices-updated', listener);
   },
+  onTrustedTokenRevoked: (cb) => {
+    const listener = (_e, data) => cb(data);
+    ipcRenderer.on('airdesk:trusted-token-revoked', listener);
+    return () => ipcRenderer.removeListener('airdesk:trusted-token-revoked', listener);
+  },
+  getHostSettings: () => ipcRenderer.invoke('airdesk:get-host-settings'),
+  updateHostSettings: (patch) =>
+    ipcRenderer.invoke(
+      'airdesk:update-host-settings',
+      patch && typeof patch === 'object' ? patch : {}
+    ),
+  issueRelayTrustedToken: (opts) =>
+    ipcRenderer.invoke(
+      'airdesk:issue-relay-trusted-token',
+      opts && typeof opts === 'object' ? opts : {}
+    ),
+  verifyRelayTrustedToken: (opts) =>
+    ipcRenderer.invoke(
+      'airdesk:verify-relay-trusted-token',
+      opts && typeof opts === 'object' ? opts : {}
+    ),
+  updateRelayTokenMode: (opts) =>
+    ipcRenderer.invoke(
+      'airdesk:update-relay-token-mode',
+      opts && typeof opts === 'object' ? opts : {}
+    ),
   generateQrDataUrl: (text) => {
     if (typeof text !== 'string' || text.length > 512) {
       return Promise.resolve({ dataUrl: '' });
