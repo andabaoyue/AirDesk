@@ -79,7 +79,7 @@ export function createAbrController() {
       ((encodeMs !== null && encodeMs > 16) || (clientJbMs !== null && clientJbMs > 25));
     const limitCongested = limitReason === 'bandwidth' || limitReason === 'cpu';
     const clientCongested =
-      freshClient && (deltaDropped >= 3 || deltaFreezes > 0 || (clientJbMs !== null && clientJbMs > 45));
+      freshClient && (deltaDropped >= 3 || deltaFreezes > 0 || (clientJbMs !== null && clientJbMs > 75));
     const freezeDetected = freshClient && deltaFreezes > 0;
     const isCongested = limitCongested || rttCongested || clientCongested;
 
@@ -96,7 +96,11 @@ export function createAbrController() {
           state.minFloorKbps,
           Math.round(state.currentTargetKbps * 0.75)
         );
-        if (limitReason === 'cpu' && encodeMs !== null && encodeMs > 20 && captureMaxFps >= 60) {
+        if (
+          captureMaxFps >= 60 &&
+          ((limitReason === 'cpu' && encodeMs !== null && encodeMs > 20) ||
+            (limitReason === 'bandwidth' && state.currentTargetKbps < 3500))
+        ) {
           state.adaptiveFpsCap = 30;
         }
         state.state =
@@ -119,7 +123,7 @@ export function createAbrController() {
     const isHealthy =
       limitReason === 'none' &&
       (rttMs === null || rttMs <= rttLimit) &&
-      (clientJbMs === null || clientJbMs <= 45);
+      (clientJbMs === null || clientJbMs <= 55);
     if (!isHealthy) {
       state.congestedStreak = 0;
       state.healthyStreak = 0;

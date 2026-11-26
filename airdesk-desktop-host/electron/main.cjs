@@ -43,8 +43,7 @@ app.commandLine.appendSwitch(
   'WebRTC-ForceSendPlayoutDelay/min_ms:0,max_ms:0/' +
     'WebRTC-VideoRateControl/pacing_factor:10.0/' +
     'WebRTC-Pacer-DrainQueue/Enabled/' +
-    'WebRTC-Pacer-KeyframeFlushing/Enabled/' +
-    'WebRTC-FrameDropper/Disabled/'
+    'WebRTC-Pacer-KeyframeFlushing/Enabled/'
 );
 
 // Crisp embedded 16x16 AirDesk icon for Windows Taskbar Tray & macOS Menu Bar

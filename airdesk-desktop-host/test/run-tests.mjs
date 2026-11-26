@@ -255,6 +255,130 @@ execFileSync(process.execPath, ['--input-type=module', '--check'], {
   abr.evaluate({ ...baseEval, nowMs: 10000 });
   const clamped = abr.evaluate({ ...baseEval, nowMs: 12000 });
   assert.equal(clamped.targetKbps, 2500);
+
+  // JitterBuffer hysteresis: >75ms triggers congestion, <=55ms allows recovery, 56..75ms holds steady
+  abr.reset({ baseMaxOverride: 12000, isLanLike: true });
+  const jbEval = { ...baseEval, limitReason: 'none', encodeMs: 8, rttMs: 15 };
+  for (let i = 0; i < 3; i++) {
+    assert.equal(
+      abr.evaluate({
+        ...jbEval,
+        lastClientDiag: { jbMs: 65, dropped: 0, freezes: 0 },
+        lastClientDiagAt: 9500 + i * 2000,
+        nowMs: 10000 + i * 2000,
+      }),
+      null
+    );
+    assert.equal(abr.state.congestedStreak, 0);
+    assert.equal(abr.state.healthyStreak, 0);
+  }
+  assert.equal(
+    abr.evaluate({
+      ...jbEval,
+      lastClientDiag: { jbMs: 80, dropped: 0, freezes: 0 },
+      lastClientDiagAt: 19500,
+      nowMs: 20000,
+    }),
+    null
+  );
+  assert.equal(abr.state.congestedStreak, 1);
+  const jbStepDown = abr.evaluate({
+    ...jbEval,
+    lastClientDiag: { jbMs: 80, dropped: 0, freezes: 0 },
+    lastClientDiagAt: 21500,
+    nowMs: 22000,
+  });
+  assert.deepEqual(jbStepDown, { action: 'step_down', targetKbps: 9000, fps: 30 });
+
+  // 60ms JB (between 55 and 75) prevents ramp-up even over >=4 cycles
+  for (let i = 0; i < 5; i++) {
+    assert.equal(
+      abr.evaluate({
+        ...jbEval,
+        lastClientDiag: { jbMs: 60, dropped: 0, freezes: 0 },
+        lastClientDiagAt: 28500 + i * 2000,
+        nowMs: 29000 + i * 2000,
+      }),
+      null
+    );
+    assert.equal(abr.state.healthyStreak, 0);
+  }
+
+  // <=55ms JB recovers after 4 healthy cycles
+  for (let i = 0; i < 3; i++) {
+    assert.equal(
+      abr.evaluate({
+        ...jbEval,
+        lastClientDiag: { jbMs: 55, dropped: 0, freezes: 0 },
+        lastClientDiagAt: 38500 + i * 2000,
+        nowMs: 39000 + i * 2000,
+      }),
+      null
+    );
+  }
+  const jbRampUp = abr.evaluate({
+    ...jbEval,
+    lastClientDiag: { jbMs: 55, dropped: 0, freezes: 0 },
+    lastClientDiagAt: 44500,
+    nowMs: 45000,
+  });
+  assert.deepEqual(jbRampUp, { action: 'ramp_up', targetKbps: 10350, fps: 30 });
+
+  // Bandwidth bottleneck below 3500 kbps caps 60fps to 30fps; recovery restores fps before bitrate
+  abr.reset({ baseMaxOverride: 4000, isLanLike: true });
+  abr.evaluate({ ...baseEval, captureMaxFps: 60, limitReason: 'bandwidth', nowMs: 10000 });
+  const bwFpsCap = abr.evaluate({
+    ...baseEval,
+    captureMaxFps: 60,
+    limitReason: 'bandwidth',
+    nowMs: 12000,
+  });
+  assert.deepEqual(bwFpsCap, { action: 'step_down', targetKbps: 3000, fps: 30 });
+  assert.equal(abr.state.adaptiveFpsCap, 30);
+
+  for (let i = 0; i < 3; i++) {
+    assert.equal(
+      abr.evaluate({
+        ...jbEval,
+        captureMaxFps: 60,
+        lastClientDiag: { jbMs: 50, dropped: 0, freezes: 0 },
+        lastClientDiagAt: 18500 + i * 2000,
+        nowMs: 19000 + i * 2000,
+      }),
+      null
+    );
+  }
+  const bwRestoreFps = abr.evaluate({
+    ...jbEval,
+    captureMaxFps: 60,
+    lastClientDiag: { jbMs: 50, dropped: 0, freezes: 0 },
+    lastClientDiagAt: 24500,
+    nowMs: 25000,
+  });
+  assert.deepEqual(bwRestoreFps, { action: 'ramp_up', targetKbps: 3000, fps: 60 });
+  assert.equal(abr.state.adaptiveFpsCap, null);
+
+  for (let i = 0; i < 3; i++) {
+    assert.equal(
+      abr.evaluate({
+        ...jbEval,
+        captureMaxFps: 60,
+        lastClientDiag: { jbMs: 50, dropped: 0, freezes: 0 },
+        lastClientDiagAt: 31500 + i * 2000,
+        nowMs: 32000 + i * 2000,
+      }),
+      null
+    );
+  }
+  const bwRestoreKbps = abr.evaluate({
+    ...jbEval,
+    captureMaxFps: 60,
+    lastClientDiag: { jbMs: 50, dropped: 0, freezes: 0 },
+    lastClientDiagAt: 37500,
+    nowMs: 38000,
+  });
+  assert.deepEqual(bwRestoreKbps, { action: 'ramp_up', targetKbps: 4000, fps: 60 });
+  assert.equal(abr.state.state, 'normal');
 }
 
 console.log(

@@ -12,6 +12,8 @@ import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.Bundle
 import android.os.Environment
+import android.os.Handler
+import android.os.Looper
 import android.os.PowerManager
 import android.provider.MediaStore
 import android.provider.OpenableColumns
@@ -47,6 +49,8 @@ class MainActivity : FlutterActivity() {
         private const val REQ_PICK_FILE = 47821
         private const val REQ_SCAN_QR = 47822
         private const val MAX_FILE_TRANSFER_BYTES = 500L * 1024 * 1024
+        private const val WAKE_LOCK_TIMEOUT_MS = 4 * 60 * 60 * 1000L
+        private const val WAKE_LOCK_REFRESH_INTERVAL_MS = 60 * 60 * 1000L
     }
 
     private var eventSink: EventChannel.EventSink? = null
@@ -62,6 +66,18 @@ class MainActivity : FlutterActivity() {
     private var lanOnlyNetFilter = false
     private var wifiLock: WifiManager.WifiLock? = null
     private var wakeLock: PowerManager.WakeLock? = null
+    private var lowLatencyLocksActive = false
+    private val wakeLockHandler = Handler(Looper.getMainLooper())
+    private val wakeLockRefreshRunnable = object : Runnable {
+        override fun run() {
+            if (!lowLatencyLocksActive) return
+            try {
+                wakeLock?.acquire(WAKE_LOCK_TIMEOUT_MS)
+            } catch (_: Exception) {}
+            wakeLockHandler.removeCallbacks(this)
+            wakeLockHandler.postDelayed(this, WAKE_LOCK_REFRESH_INTERVAL_MS)
+        }
+    }
 
     private fun isClashFakeIpv4(host: String): Boolean {
         return host.startsWith("198.18.") || host.startsWith("198.19.") || host.startsWith("172.19.")
@@ -422,6 +438,7 @@ class MainActivity : FlutterActivity() {
 
     private fun setLowLatencyLocks(enabled: Boolean) {
         if (enabled) {
+            lowLatencyLocksActive = true
             if (wifiLock == null) {
                 val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
                 if (wm != null) {
@@ -445,11 +462,17 @@ class MainActivity : FlutterActivity() {
                 if (pm != null) {
                     wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "AirDesk:StreamWake").apply {
                         setReferenceCounted(false)
-                        if (!isHeld) acquire(4 * 60 * 60 * 1000L)
+                        if (!isHeld) acquire(WAKE_LOCK_TIMEOUT_MS)
                     }
                 }
+            } else if (wakeLock?.isHeld == false) {
+                wakeLock?.acquire(WAKE_LOCK_TIMEOUT_MS)
             }
+            wakeLockHandler.removeCallbacks(wakeLockRefreshRunnable)
+            wakeLockHandler.postDelayed(wakeLockRefreshRunnable, WAKE_LOCK_REFRESH_INTERVAL_MS)
         } else {
+            lowLatencyLocksActive = false
+            wakeLockHandler.removeCallbacks(wakeLockRefreshRunnable)
             try {
                 if (wifiLock?.isHeld == true) wifiLock?.release()
             } catch (_: Exception) {}

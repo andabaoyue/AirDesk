@@ -144,6 +144,7 @@ let wsHeartbeatTimer = null;
 let lastRemoteInputAt = Date.now();
 let isIdleThrottled = false;
 let activeTargetBitrateKbps = 15000;
+let lastAppliedVideoParams = null;
 let lastSyncedClipboardText = '';
 let syncingClipboardPending = false;
 let lastPliHandledAt = 0;
@@ -576,6 +577,16 @@ async function applyVideoParameters(maxBitrateKbps, maxFramerate) {
   activeTargetBitrateKbps = Math.max(500, Number(maxBitrateKbps) || 15000);
   if (!videoSender) return;
   const effectiveFps = Math.min(maxFramerate, captureMaxFps());
+  const currentTrack = videoSender.track || null;
+  if (
+    lastAppliedVideoParams &&
+    lastAppliedVideoParams.sender === videoSender &&
+    lastAppliedVideoParams.track === currentTrack &&
+    lastAppliedVideoParams.bitrateKbps === activeTargetBitrateKbps &&
+    lastAppliedVideoParams.fps === effectiveFps
+  ) {
+    return;
+  }
   try {
     const params = videoSender.getParameters();
     if (!params.encodings || params.encodings.length === 0) params.encodings = [{}];
@@ -593,15 +604,14 @@ async function applyVideoParameters(maxBitrateKbps, maxFramerate) {
       delete params.encodings[0].scalabilityMode;
       await videoSender.setParameters(params);
     }
+    lastAppliedVideoParams = {
+      sender: videoSender,
+      track: currentTrack,
+      bitrateKbps: activeTargetBitrateKbps,
+      fps: effectiveFps,
+    };
   } catch {
     // Ignore transient setParameters error
-  }
-  try {
-    if (videoSender.track && videoSender.track.applyConstraints) {
-      await videoSender.track.applyConstraints({ frameRate: { max: effectiveFps } });
-    }
-  } catch {
-    // Ignore track constraint rejection on platforms that lock desktop capture fps
   }
 }
 
@@ -951,6 +961,7 @@ function cleanupPeerConnection(scheduleIdleRelease = true) {
     pc = null;
   }
   videoSender = null;
+  lastAppliedVideoParams = null;
   audioSender = null;
   updateControlButtonUi();
   if (scheduleIdleRelease) {
@@ -1386,14 +1397,7 @@ async function handleOffer(remoteSdp) {
         }
         await mediaCapture.setDesktopAudioEnabled(Boolean(data.enabled), true);
       } else if (data.t === 'video:pli') {
-        const nowTs = Date.now();
-        if (nowTs - lastPliHandledAt >= 250) {
-          lastPliHandledAt = nowTs;
-          await applyVideoParameters(
-            abr.state.currentTargetKbps,
-            isIdleThrottled ? 8 : abr.state.adaptiveFpsCap || captureMaxFps()
-          );
-        }
+        lastPliHandledAt = Date.now();
       } else {
         await window.airdeskAPI.injectInput(data);
       }
@@ -1415,6 +1419,7 @@ async function handleOffer(remoteSdp) {
   if (vTrack && 'contentHint' in vTrack) {
     vTrack.contentHint = mediaCapture.initialTrackContentHint();
   }
+  lastAppliedVideoParams = null;
   videoSender = pc.addTrack(vTrack, localStream);
   if (enableAudioCheckbox && enableAudioCheckbox.checked) {
     await mediaCapture.maybeRouteVirtualAudioForStream();
