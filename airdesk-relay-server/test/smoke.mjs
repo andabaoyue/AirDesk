@@ -378,6 +378,29 @@ async function run() {
     for (const c of verifyFloodClients) c.close();
     badTokenClient.close();
     v2Client1.close();
+
+    // 7g. Host session:close frees active client slot immediately for new client join
+    const v2SessionClosedP = nextMsg(v2Client2, (m) => m.type === 'session:closed');
+    v2Host2.send(JSON.stringify({ type: 'session:close', reason: '电脑端已移除当前设备信任凭证' }));
+    const v2SessionClosed = await v2SessionClosedP;
+    assert.match(v2SessionClosed.reason, /移除/);
+
+    const v2Client3 = await openWs(baseWs);
+    const v2Wait3P = nextMsg(v2Client3, (m) => m.type === 'client:waiting_approval');
+    const v2Req3P = nextMsg(v2Host2, (m) => m.type === 'host:approval_request');
+    v2Client3.send(
+      JSON.stringify({
+        type: 'client:join',
+        protoVersion: 2,
+        code: v2Created2.code,
+        deviceLabel: 'New Phone',
+        platformHint: 'Android App',
+      })
+    );
+    await v2Wait3P;
+    assert.equal((await v2Req3P).client.deviceLabel, 'New Phone');
+
+    v2Client3.close();
     v2Client2.close();
     v2Host2.close();
     console.log('RELAY_SMOKE_TEST_ALL_7_CHECKS_PASSED');

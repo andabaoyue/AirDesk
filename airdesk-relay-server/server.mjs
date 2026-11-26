@@ -703,7 +703,26 @@ export function createRelayServer(options = {}) {
             reason: msg.reason || '对方已断开连接',
           });
         }
-        if (role === 'client') {
+        if (role === 'host') {
+          if (room.activeClientWs) {
+            const activeWs = room.activeClientWs;
+            room.activeClientWs = null;
+            room.activeSessionToken = null;
+            socketRoom.delete(activeWs);
+            try {
+              activeWs.close();
+            } catch {}
+          }
+          if (room.pendingClientWs) {
+            const pendingWs = room.pendingClientWs;
+            room.pendingClientWs = null;
+            room.pendingClientMeta = null;
+            socketRoom.delete(pendingWs);
+            try {
+              pendingWs.close();
+            } catch {}
+          }
+        } else {
           if (room.activeClientWs === ws) {
             room.activeClientWs = null;
             room.activeSessionToken = null;
