@@ -668,9 +668,11 @@ class _HomeConnectPageState extends State<HomeConnectPage> {
     await widget.storage.setCustomIceUrl(customIce);
 
     String? token;
+    String? hostId;
     if (tryToken) {
       final rk = WebRtcSessionService.tokenKeyForEndpoint(signalingUrl: relayUrl);
       token = await widget.storage.getTokenForKey(rk);
+      hostId = await widget.storage.getHostIdForKey(rk);
     }
     final pin = (pinOverride ?? _relayPinCtrl.text).replaceAll(RegExp(r'\D'), '');
     if ((token == null || token.isEmpty) && pin.length != 6) {
@@ -684,6 +686,7 @@ class _HomeConnectPageState extends State<HomeConnectPage> {
       customIceRaw: customIce.isEmpty ? null : customIce,
       pinCode: pin.length == 6 ? pin : null,
       sessionToken: token,
+      hostId: hostId,
     );
   }
 

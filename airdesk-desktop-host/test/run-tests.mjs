@@ -1,8 +1,13 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
+import { createRequire } from 'node:module';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+
+const require = createRequire(import.meta.url);
+const { createTrustStore } = require('../electron/modules/trust-store.cjs');
 
 import {
   isLanLikeConnection,
@@ -381,6 +386,70 @@ execFileSync(process.execPath, ['--input-type=module', '--check'], {
   assert.equal(abr.state.state, 'normal');
 }
 
+// 4. Unit tests: Persistent Host Identity & Unified Trust Store (trust-store.cjs)
+{
+  const tmpUserData = fs.mkdtempSync(path.join(os.tmpdir(), 'airdesk-trust-test-'));
+  try {
+    let changeNotifies = 0;
+    const store1 = createTrustStore({
+      userDataDir: tmpUserData,
+      onTrustedDevicesChanged: () => {
+        changeNotifies += 1;
+      },
+    });
+    const id1 = store1.getOrCreateHostIdentity();
+    assert.match(id1.hostId, /^\d{9}$/);
+    assert.ok(id1.hostSecret.length >= 32);
+
+    // Reloading from disk preserves exact same hostId & hostSecret
+    const store2 = createTrustStore({ userDataDir: tmpUserData });
+    const id2 = store2.getOrCreateHostIdentity();
+    assert.deepEqual(id2, id1);
+
+    // Default TTL is 7d; can switch to 30d and never
+    assert.equal(store1.getHostSettings().trustTtlOption, '7d');
+    const issued7d = store1.issueToken({
+      mode: 'full_control',
+      deviceLabel: 'Xiaomi 13',
+      platformHint: 'Android App',
+      ipMasked: '1.2.3.4',
+      source: 'relay',
+    });
+    assert.ok(issued7d.record.expiresAt > Date.now() + 6 * 24 * 60 * 60 * 1000);
+    assert.equal(changeNotifies >= 1, true);
+
+    store1.updateHostSettings({ trustTtlOption: 'never', autoStartOnBoot: true, autoHostOnStartup: true });
+    assert.deepEqual(store1.getHostSettings(), {
+      trustTtlOption: 'never',
+      autoStartOnBoot: true,
+      autoHostOnStartup: true,
+    });
+    const verifiedNever = store1.verifyAndTouchToken(issued7d.sessionToken, { ipMasked: '5.6.7.8' });
+    assert.equal(verifiedNever.ok, true);
+    assert.equal(verifiedNever.mode, 'full_control');
+    assert.equal(verifiedNever.record.expiresAt, null);
+
+    // Reload from disk preserves never-expiring token & settings
+    const store3 = createTrustStore({ userDataDir: tmpUserData });
+    assert.equal(store3.getHostSettings().trustTtlOption, 'never');
+    const listed = store3.listTrustedDevices();
+    assert.equal(listed.length, 1);
+    assert.equal(listed[0].source, 'relay');
+    assert.equal(listed[0].expiresAt, null);
+    assert.equal(listed[0].ipMasked, '5.6.7.8');
+
+    // Mode update & single-token revocation
+    assert.equal(store3.updateTokenMode(issued7d.sessionToken, 'view_only'), true);
+    assert.equal(store3.verifyAndTouchToken(issued7d.sessionToken).mode, 'view_only');
+    const revoked = store3.revokeToken(listed[0].tokenId);
+    assert.equal(revoked.length, 1);
+    assert.equal(store3.verifyAndTouchToken(issued7d.sessionToken).ok, false);
+    assert.equal(store3.listTrustedDevices().length, 0);
+  } finally {
+    fs.rmSync(tmpUserData, { recursive: true, force: true });
+  }
+}
+
 console.log(
-  `[AirDesk Tests] Passed syntax checks (${cjsFiles.length} CJS, ${mjsFiles.length} MJS, host.js) + sdp-codec & abr-controller unit tests.`
+  `[AirDesk Tests] Passed syntax checks (${cjsFiles.length} CJS, ${mjsFiles.length} MJS, host.js) + sdp-codec, abr-controller & trust-store unit tests.`
 );

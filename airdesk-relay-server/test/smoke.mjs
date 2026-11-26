@@ -185,7 +185,202 @@ async function run() {
 
     expiredWs.close();
     hostWs.close();
-    console.log('RELAY_SMOKE_TEST_ALL_6_CHECKS_PASSED');
+
+    // 7. v2 persistent hostId + hostSecret reclaim & desktop-delegated token verification
+    const hostId = '482910537';
+    const hostSecret = crypto.randomBytes(24).toString('hex');
+    const hostIssuedToken = crypto.randomBytes(16).toString('hex');
+
+    const v2Host1 = await openWs(baseWs);
+    const v2Created1P = nextMsg(v2Host1, (m) => m.type === 'host:created');
+    v2Host1.send(
+      JSON.stringify({
+        type: 'host:create',
+        protoVersion: 2,
+        hostId,
+        hostSecret,
+        accessKey: 'secret-room-key',
+        hostLabel: 'Home-PC',
+        audioEnabled: false,
+      })
+    );
+    const v2Created1 = await v2Created1P;
+    assert.equal(v2Created1.hostId, hostId);
+    assert.equal(v2Created1.protoVersion, 2);
+
+    // 7a. Initial 6-digit pairing returns hostId + host-issued sessionToken
+    const v2Client1 = await openWs(baseWs);
+    const v2ReqP = nextMsg(v2Host1, (m) => m.type === 'host:approval_request');
+    v2Client1.send(
+      JSON.stringify({
+        type: 'client:join',
+        protoVersion: 2,
+        code: v2Created1.code,
+        deviceLabel: 'Xiaomi 13',
+        platformHint: 'Android App',
+      })
+    );
+    await v2ReqP;
+    const v2App1P = nextMsg(v2Client1, (m) => m.type === 'client:approved');
+    v2Host1.send(
+      JSON.stringify({
+        type: 'host:approval_decision',
+        approved: true,
+        mode: 'full_control',
+        sessionToken: hostIssuedToken,
+      })
+    );
+    const v2App1 = await v2App1P;
+    assert.equal(v2App1.hostId, hostId);
+    assert.equal(v2App1.sessionToken, hostIssuedToken);
+
+    // 7b. Host disconnects -> client joining with hostId + sessionToken gets HOST_OFFLINE (retryable)
+    const v2ClosedP = nextMsg(v2Client1, (m) => m.type === 'session:closed');
+    v2Host1.close();
+    await v2ClosedP;
+    await new Promise((r) => setTimeout(r, 40));
+
+    const offlineClient = await openWs(baseWs);
+    const offlineErrP = nextMsg(offlineClient, (m) => m.type === 'error');
+    offlineClient.send(
+      JSON.stringify({
+        type: 'client:join',
+        protoVersion: 2,
+        hostId,
+        sessionToken: hostIssuedToken,
+      })
+    );
+    const offlineErr = await offlineErrP;
+    assert.equal(offlineErr.code, 'HOST_OFFLINE');
+    assert.equal(offlineErr.retryable, true);
+    offlineClient.close();
+
+    // 7c. Wrong hostSecret attempting to hijack hostId is rejected
+    const rogueHost = await openWs(baseWs);
+    const rogueErrP = nextMsg(rogueHost, (m) => m.type === 'error');
+    rogueHost.send(
+      JSON.stringify({
+        type: 'host:create',
+        protoVersion: 2,
+        hostId,
+        hostSecret: 'wrong-host-secret-000000',
+        accessKey: 'secret-room-key',
+      })
+    );
+    const rogueErr = await rogueErrP;
+    assert.match(rogueErr.message, /校验失败/);
+    rogueHost.close();
+
+    // 7d. Genuine host reconnects and reclaims same hostId; client reconnects via host:verify_token
+    const v2Host2 = await openWs(baseWs);
+    const v2Created2P = nextMsg(v2Host2, (m) => m.type === 'host:created');
+    v2Host2.send(
+      JSON.stringify({
+        type: 'host:create',
+        protoVersion: 2,
+        hostId,
+        hostSecret,
+        accessKey: 'secret-room-key',
+        hostLabel: 'Home-PC',
+      })
+    );
+    const v2Created2 = await v2Created2P;
+    assert.equal(v2Created2.hostId, hostId);
+    assert.notEqual(v2Created2.code, v2Created1.code);
+
+    // Keep v2Client1 open until host approves new socket -> must only kick v2Client1 AFTER approved === true
+    const v2Client2 = await openWs(baseWs);
+    const verifyReqP = nextMsg(v2Host2, (m) => m.type === 'host:verify_token');
+    v2Client2.send(
+      JSON.stringify({
+        type: 'client:join',
+        protoVersion: 2,
+        hostId,
+        sessionToken: hostIssuedToken,
+        deviceLabel: 'Xiaomi 13',
+      })
+    );
+    const verifyReq = await verifyReqP;
+    assert.equal(verifyReq.sessionToken, hostIssuedToken);
+    assert.ok(verifyReq.verifyId);
+
+    const v2App2P = nextMsg(v2Client2, (m) => m.type === 'client:approved');
+    const v2HostReconnP = nextMsg(v2Host2, (m) => m.type === 'host:client_reconnected');
+    v2Host2.send(
+      JSON.stringify({
+        type: 'host:token_verified',
+        verifyId: verifyReq.verifyId,
+        approved: true,
+        mode: 'full_control',
+      })
+    );
+    const v2App2 = await v2App2P;
+    assert.equal(v2App2.reconnected, true);
+    assert.equal(v2App2.hostId, hostId);
+    assert.equal(v2App2.mode, 'full_control');
+    assert.equal((await v2HostReconnP).mode, 'full_control');
+
+    // 7e. Rejected host:token_verified keeps activeClientWs intact and records IP failure
+    const badTokenClient = await openWs(baseWs);
+    const verifyBadP = nextMsg(v2Host2, (m) => m.type === 'host:verify_token');
+    badTokenClient.send(
+      JSON.stringify({
+        type: 'client:join',
+        protoVersion: 2,
+        hostId,
+        sessionToken: 'revoked-token-1234567890',
+      })
+    );
+    const verifyBad = await verifyBadP;
+    const badTokenErrP = nextMsg(badTokenClient, (m) => m.type === 'error');
+    v2Host2.send(
+      JSON.stringify({
+        type: 'host:token_verified',
+        verifyId: verifyBad.verifyId,
+        approved: false,
+        reason: '凭证已被电脑端撤销',
+      })
+    );
+    const badTokenErr = await badTokenErrP;
+    assert.equal(badTokenErr.code, 'TOKEN_INVALID');
+    assert.equal(v2Client2.readyState, WebSocket.OPEN);
+
+    // 7f. Concurrent verifyId cap (max 4)
+    const verifyFloodClients = [];
+    for (let i = 0; i < 4; i += 1) {
+      const c = await openWs(baseWs);
+      verifyFloodClients.push(c);
+      const p = nextMsg(v2Host2, (m) => m.type === 'host:verify_token');
+      c.send(
+        JSON.stringify({
+          type: 'client:join',
+          protoVersion: 2,
+          hostId,
+          sessionToken: `flood-token-${i}-1234567890`,
+        })
+      );
+      await p;
+    }
+    const fifthClient = await openWs(baseWs);
+    const fifthErrP = nextMsg(fifthClient, (m) => m.type === 'error');
+    fifthClient.send(
+      JSON.stringify({
+        type: 'client:join',
+        protoVersion: 2,
+        hostId,
+        sessionToken: 'flood-token-5-1234567890',
+      })
+    );
+    const fifthErr = await fifthErrP;
+    assert.equal(fifthErr.retryable, true);
+
+    fifthClient.close();
+    for (const c of verifyFloodClients) c.close();
+    badTokenClient.close();
+    v2Client1.close();
+    v2Client2.close();
+    v2Host2.close();
+    console.log('RELAY_SMOKE_TEST_ALL_7_CHECKS_PASSED');
   } finally {
     await relay.close();
   }

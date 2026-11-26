@@ -100,6 +100,7 @@ class WebRtcSessionService extends ChangeNotifier {
   String? _activeHostIp;
   int _activeHostPort = 47820;
   String? _activeSignalingUrl;
+  String? _activeHostId;
   String? _activeCustomIceRaw;
   List<Map<String, dynamic>> _activeIceServers = const [];
 
@@ -214,6 +215,53 @@ class WebRtcSessionService extends ChangeNotifier {
     notifyListeners();
   }
 
+  @visibleForTesting
+  static bool shouldClearSavedTokenOnError(
+    String type,
+    Map<String, dynamic> msg, {
+    required bool hadToken,
+  }) {
+    if (!hadToken) return false;
+    if (type == 'client:rejected') return true;
+    if (type != 'error') return false;
+    final errCode = (msg['code'] ?? '').toString().trim();
+    if (errCode == 'HOST_OFFLINE') return false;
+    if (msg['retryable'] == true) return false;
+    if (errCode == 'TOKEN_INVALID') return true;
+    final reason = (msg['reason'] ?? msg['message'] ?? '').toString();
+    return reason.contains('凭证') ||
+        reason.contains('过期') ||
+        reason.contains('撤销') ||
+        reason.contains('拒绝');
+  }
+
+  @visibleForTesting
+  static Map<String, dynamic> buildClientJoinPayload({
+    required String deviceLabel,
+    String platformHint = 'Android App',
+    String? pinCode,
+    String? sessionToken,
+    String? hostId,
+  }) {
+    final payload = <String, dynamic>{
+      'type': 'client:join',
+      'protoVersion': 2,
+      'deviceLabel': deviceLabel,
+      'platformHint': platformHint,
+    };
+    final cleanToken = sessionToken?.trim() ?? '';
+    final cleanHostId = hostId?.trim() ?? '';
+    if (cleanToken.isNotEmpty) {
+      payload['sessionToken'] = cleanToken;
+      if (cleanHostId.isNotEmpty) {
+        payload['hostId'] = cleanHostId;
+      }
+    } else {
+      payload['code'] = (pinCode ?? '').replaceAll(RegExp(r'\D'), '');
+    }
+    return payload;
+  }
+
   Future<void> connect({
     String hostIp = '',
     int port = 47820,
@@ -221,6 +269,7 @@ class WebRtcSessionService extends ChangeNotifier {
     String? customIceRaw,
     String? pinCode,
     String? sessionToken,
+    String? hostId,
     List<String> iceStunUrls = const [],
   }) async {
     await ensureRendererReady();
@@ -240,6 +289,7 @@ class WebRtcSessionService extends ChangeNotifier {
     _activeHostIp = isRelayMode ? null : cleanHostIp;
     _activeHostPort = port;
     _activeSignalingUrl = isRelayMode ? relayUrl : null;
+    _activeHostId = hostId?.trim();
     _activeCustomIceRaw = customIceRaw?.trim();
 
     final isOverlay = !isRelayMode && isOverlayHost(cleanHostIp);
@@ -327,16 +377,12 @@ class WebRtcSessionService extends ChangeNotifier {
       },
     );
 
-    final joinPayload = <String, dynamic>{
-      'type': 'client:join',
-      'deviceLabel': deviceLabel,
-      'platformHint': 'Android App',
-    };
-    if (sessionToken != null && sessionToken.isNotEmpty) {
-      joinPayload['sessionToken'] = sessionToken;
-    } else {
-      joinPayload['code'] = (pinCode ?? '').replaceAll(RegExp(r'\D'), '');
-    }
+    final joinPayload = buildClientJoinPayload(
+      deviceLabel: deviceLabel,
+      pinCode: pinCode,
+      sessionToken: sessionToken,
+      hostId: isRelayMode ? hostId : null,
+    );
     _sendWs(joinPayload);
   }
 
@@ -397,8 +443,9 @@ class WebRtcSessionService extends ChangeNotifier {
       hostLabel = (msg['hostLabel'] ?? (isRelayMode ? '远程电脑' : hostIp)).toString();
       _setPhase(SessionPhase.waitingApproval, '等待电脑审批（可在电脑按 Ctrl+Alt+Y 批准）...');
     } else if (type == 'client:rejected' || type == 'error') {
-      if (hadToken) {
+      if (shouldClearSavedTokenOnError(type, msg, hadToken: hadToken)) {
         await storage.removeTokenForKey(tokenKey);
+        await storage.removeHostIdForKey(tokenKey);
       }
       final reason = (msg['reason'] ?? msg['message'] ?? '连接被拒绝').toString();
       _setPhase(SessionPhase.error, reason);
@@ -410,6 +457,11 @@ class WebRtcSessionService extends ChangeNotifier {
       final newToken = (msg['sessionToken'] ?? '').toString();
       if (newToken.isNotEmpty) {
         await storage.saveTokenForKey(tokenKey, newToken);
+      }
+      final approvedHostId = (msg['hostId'] ?? '').toString().trim();
+      if (isRelayMode && approvedHostId.isNotEmpty) {
+        _activeHostId = approvedHostId;
+        await storage.saveHostIdForKey(tokenKey, approvedHostId);
       }
       if (!isRelayMode && hostIp.isNotEmpty) {
         await storage.saveRecentHost(hostIp, port, hostLabel);
@@ -1727,11 +1779,13 @@ class WebRtcSessionService extends ChangeNotifier {
     if (_activeSignalingUrl != null && _activeSignalingUrl!.isNotEmpty) {
       final key = tokenKeyForEndpoint(signalingUrl: _activeSignalingUrl);
       final tok = await storage.getTokenForKey(key);
+      final hostId = await storage.getHostIdForKey(key) ?? _activeHostId;
       if (tok != null && tok.isNotEmpty) {
         await connect(
           signalingUrl: _activeSignalingUrl,
           customIceRaw: _activeCustomIceRaw,
           sessionToken: tok,
+          hostId: hostId,
         );
       }
       return;

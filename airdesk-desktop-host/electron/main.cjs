@@ -24,6 +24,7 @@ const { createVirtualAudioManager } = require('./modules/virtual-audio.cjs');
 const { createNativeHelperManager } = require('./modules/native-helper.cjs');
 const { createInputRouter } = require('./modules/input-router.cjs');
 const { createLanServerManager } = require('./modules/lan-server.cjs');
+const { createTrustStore } = require('./modules/trust-store.cjs');
 
 // Prevent uncaught EPIPE if parent terminal/pipe closes before Electron exits
 if (process.stdout && typeof process.stdout.on === 'function') {
@@ -170,9 +171,18 @@ const inputRouter = createInputRouter({
   activePressedMouseButtons,
 });
 
+const trustStore = createTrustStore({
+  userDataDir: app.getPath('userData'),
+  onTrustedDevicesChanged: () => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('airdesk:trusted-devices-updated');
+    }
+  },
+});
+
 const lanServerManager = createLanServerManager({
-  app,
   appVersion: APP_VERSION,
+  trustStore,
   getMainWindow: () => mainWindow,
   getHasActiveSession: () => hasActiveSession,
   getAuthoritativeControl: () => authoritativeControlEnabled,
@@ -323,12 +333,32 @@ function createTray() {
   }
 }
 
-function createWindow() {
+function applyLoginItemSetting(enabled) {
+  if (process.platform !== 'win32' && process.platform !== 'darwin') {
+    return { ok: false, supported: false };
+  }
+  try {
+    const opts = app.isPackaged
+      ? { openAtLogin: Boolean(enabled), args: ['--autostart'] }
+      : {
+          openAtLogin: Boolean(enabled),
+          path: process.execPath,
+          args: [path.resolve(APP_ROOT_DIR), '--autostart'],
+        };
+    app.setLoginItemSettings(opts);
+    return { ok: true, supported: true };
+  } catch (err) {
+    return { ok: false, supported: false, error: err && err.message ? err.message : String(err) };
+  }
+}
+
+function createWindow(startHidden = false) {
   mainWindow = new BrowserWindow({
     width: 1060,
     height: 740,
     minWidth: 880,
     minHeight: 620,
+    show: !startHidden,
     backgroundColor: '#070B11',
     autoHideMenuBar: true,
     title: 'AirDesk Desktop Host',
@@ -390,8 +420,13 @@ app.whenReady().then(async () => {
     console.warn('[AirDesk Local Signaling] Failed to auto-start:', err.message);
   }
 
-  createWindow();
+  const hostSettings = trustStore.getHostSettings();
+  const startMinimizedToTray = Boolean(hostSettings.autoHostOnStartup);
+  createWindow(startMinimizedToTray);
   createTray();
+  if (startMinimizedToTray && !tray && mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.show();
+  }
   registerGlobalShortcuts();
 
   // Monitor display hot-plug events and push updated list to renderer
@@ -476,6 +511,8 @@ ipcMain.handle('airdesk:get-system-info', (event) => {
     firewall: lanServerManager.checkFirewallRule(lanServerManager.getLocalSignalingPort()),
     shortcuts: registeredShortcuts,
     controlEnabled: authoritativeControlEnabled,
+    hostIdentity: trustStore.getOrCreateHostIdentity(),
+    hostSettings: trustStore.getHostSettings(),
   };
 });
 
@@ -549,10 +586,64 @@ ipcMain.handle('airdesk:revoke-trusted-device', (event, tokenIdOrAll) => {
   validateIpcSender(event);
   if (tokenIdOrAll === '*') {
     lanServerManager.revokeAllTrustedTokens();
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('airdesk:trusted-token-revoked', { all: true });
+    }
   } else if (typeof tokenIdOrAll === 'string' && tokenIdOrAll.length >= 6) {
     lanServerManager.revokeTrustedToken(tokenIdOrAll);
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('airdesk:trusted-token-revoked', { tokenPrefix: tokenIdOrAll });
+    }
   }
   return lanServerManager.listTrustedDevices();
+});
+
+ipcMain.handle('airdesk:get-host-settings', (event) => {
+  validateIpcSender(event);
+  return trustStore.getHostSettings();
+});
+
+ipcMain.handle('airdesk:update-host-settings', (event, patch) => {
+  validateIpcSender(event);
+  const safePatch = patch && typeof patch === 'object' ? patch : {};
+  const next = trustStore.updateHostSettings(safePatch);
+  let loginItemResult = null;
+  if (Object.prototype.hasOwnProperty.call(safePatch, 'autoStartOnBoot')) {
+    loginItemResult = applyLoginItemSetting(next.autoStartOnBoot);
+  }
+  return { settings: next, loginItemResult };
+});
+
+ipcMain.handle('airdesk:issue-relay-trusted-token', (event, opts) => {
+  validateIpcSender(event);
+  const safe = opts && typeof opts === 'object' ? opts : {};
+  const issued = trustStore.issueToken({
+    mode: safe.mode === 'full_control' ? 'full_control' : 'view_only',
+    deviceLabel: typeof safe.deviceLabel === 'string' ? safe.deviceLabel : '远程移动设备',
+    platformHint: typeof safe.platformHint === 'string' ? safe.platformHint : 'Mobile',
+    ipMasked: typeof safe.ipMasked === 'string' ? safe.ipMasked : 'WAN',
+    source: 'relay',
+  });
+  return { sessionToken: issued.sessionToken, expiresAt: issued.record.expiresAt };
+});
+
+ipcMain.handle('airdesk:verify-relay-trusted-token', (event, opts) => {
+  validateIpcSender(event);
+  const safe = opts && typeof opts === 'object' ? opts : {};
+  return trustStore.verifyAndTouchToken(typeof safe.sessionToken === 'string' ? safe.sessionToken : '', {
+    ipMasked: typeof safe.ipMasked === 'string' ? safe.ipMasked : undefined,
+    deviceLabel: typeof safe.deviceLabel === 'string' ? safe.deviceLabel : undefined,
+    platformHint: typeof safe.platformHint === 'string' ? safe.platformHint : undefined,
+  });
+});
+
+ipcMain.handle('airdesk:update-relay-token-mode', (event, opts) => {
+  validateIpcSender(event);
+  const safe = opts && typeof opts === 'object' ? opts : {};
+  return trustStore.updateTokenMode(
+    typeof safe.sessionToken === 'string' ? safe.sessionToken : '',
+    safe.mode
+  );
 });
 
 ipcMain.handle('airdesk:generate-qr', async (event, text) => {

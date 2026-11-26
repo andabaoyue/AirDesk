@@ -32,6 +32,7 @@ class RecentHostEntry {
 
 class StorageService {
   static const _kTokensMap = 'airdesk_trusted_tokens_v1';
+  static const _kRelayHostIdsMap = 'airdesk_relay_host_ids_v1';
   static const _kRecentHosts = 'airdesk_recent_hosts_v1';
   static const _kRemoteHosts = 'airdesk_remote_hosts_v1';
   static const _kAllowOverlayTun = 'airdesk_allow_overlay_tun_v1';
@@ -87,6 +88,40 @@ class StorageService {
 
   Future<void> removeTokenForHost(String ip, int port) =>
       removeTokenForKey('$ip:$port');
+
+  Future<Map<String, String>> _getHostIdsMap() async {
+    final prefs = await SharedPreferences.getInstance();
+    final raw = prefs.getString(_kRelayHostIdsMap);
+    if (raw == null || raw.isEmpty) return {};
+    try {
+      final decoded = jsonDecode(raw) as Map<String, dynamic>;
+      return decoded.map((k, v) => MapEntry(k, v.toString()));
+    } catch (_) {
+      return {};
+    }
+  }
+
+  Future<String?> getHostIdForKey(String key) async {
+    final map = await _getHostIdsMap();
+    final val = map[key]?.trim();
+    return (val != null && val.isNotEmpty) ? val : null;
+  }
+
+  Future<void> saveHostIdForKey(String key, String hostId) async {
+    final clean = hostId.trim();
+    if (clean.isEmpty) return;
+    final prefs = await SharedPreferences.getInstance();
+    final map = await _getHostIdsMap();
+    map[key] = clean;
+    await prefs.setString(_kRelayHostIdsMap, jsonEncode(map));
+  }
+
+  Future<void> removeHostIdForKey(String key) async {
+    final prefs = await SharedPreferences.getInstance();
+    final map = await _getHostIdsMap();
+    map.remove(key);
+    await prefs.setString(_kRelayHostIdsMap, jsonEncode(map));
+  }
 
   Future<List<RecentHostEntry>> getRecentHosts() async {
     final prefs = await SharedPreferences.getInstance();

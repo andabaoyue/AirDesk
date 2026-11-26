@@ -8,7 +8,6 @@ const { execFileSync } = require('child_process');
 const { WebSocketServer, WebSocket } = require('ws');
 
 const PAIR_CODE_TTL_MS = 30 * 60 * 1000; // 30 分钟
-const TRUSTED_TOKEN_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 天
 
 function isOverlayIp(ip) {
   const s = String(ip || '').trim().replace(/^::ffff:/i, '');
@@ -16,8 +15,8 @@ function isOverlayIp(ip) {
 }
 
 function createLanServerManager({
-  app,
   appVersion,
+  trustStore,
   getMainWindow,
   getHasActiveSession,
   getAuthoritativeControl,
@@ -37,7 +36,6 @@ function createLanServerManager({
 
   let revokeAllTrustedTokensCallback = null;
   let revokeOneTrustedTokenCallback = null;
-  let listLiveTrustedTokensCallback = null;
   let updateActiveTrustedTokenModeCallback = null;
 
   function notifyTrustedDevicesUpdated() {
@@ -45,88 +43,6 @@ function createLanServerManager({
     if (win && !win.isDestroyed()) {
       win.webContents.send('airdesk:trusted-devices-updated');
     }
-  }
-
-  function getTrustedTokensPath() {
-    return path.join(app.getPath('userData'), 'trusted-tokens.json');
-  }
-
-  function normalizeTrustedTokenRecord(rec) {
-    return {
-      mode: rec.mode || 'view_only',
-      deviceLabel: String(rec.deviceLabel || '局域网移动设备').slice(0, 64),
-      platformHint: String(rec.platformHint || 'Mobile').slice(0, 32),
-      ipMasked: String(rec.ipMasked || 'LAN').slice(0, 64),
-      createdAt: Number.isFinite(rec.createdAt) ? rec.createdAt : Date.now(),
-      lastSeenAt: Number.isFinite(rec.lastSeenAt) ? rec.lastSeenAt : Date.now(),
-      expiresAt: rec.expiresAt,
-    };
-  }
-
-  function loadPersistedTrustedTokens() {
-    const map = new Map();
-    try {
-      const filePath = getTrustedTokensPath();
-      if (!fs.existsSync(filePath)) return map;
-      const raw = JSON.parse(fs.readFileSync(filePath, 'utf8'));
-      const nowTs = Date.now();
-      if (raw && typeof raw === 'object') {
-        for (const [tok, rec] of Object.entries(raw)) {
-          if (
-            typeof tok === 'string' &&
-            tok.length >= 16 &&
-            rec &&
-            Number.isFinite(rec.expiresAt) &&
-            rec.expiresAt > nowTs
-          ) {
-            map.set(tok, normalizeTrustedTokenRecord(rec));
-          }
-        }
-      }
-    } catch {
-      // Non-fatal token load error
-    }
-    return map;
-  }
-
-  function savePersistedTrustedTokens(tokensMap) {
-    try {
-      const filePath = getTrustedTokensPath();
-      fs.mkdirSync(path.dirname(filePath), { recursive: true });
-      const out = {};
-      const nowTs = Date.now();
-      if (tokensMap) {
-        for (const [tok, rec] of tokensMap.entries()) {
-          if (rec && rec.expiresAt > nowTs) {
-            out[tok] = normalizeTrustedTokenRecord(rec);
-          }
-        }
-      }
-      fs.writeFileSync(filePath, JSON.stringify(out, null, 2), 'utf8');
-    } catch {
-      // Non-fatal token save error
-    }
-  }
-
-  function formatTrustedDeviceList(tokensMap) {
-    const nowTs = Date.now();
-    const list = [];
-    if (!tokensMap) return list;
-    for (const [tok, rec] of tokensMap.entries()) {
-      if (!rec || rec.expiresAt <= nowTs) continue;
-      list.push({
-        tokenId: tok.slice(0, 10),
-        mode: rec.mode || 'view_only',
-        deviceLabel: rec.deviceLabel || '局域网移动设备',
-        platformHint: rec.platformHint || 'Mobile',
-        ipMasked: rec.ipMasked || 'LAN',
-        createdAt: rec.createdAt || nowTs,
-        lastSeenAt: rec.lastSeenAt || nowTs,
-        expiresAt: rec.expiresAt,
-      });
-    }
-    list.sort((a, b) => (b.lastSeenAt || 0) - (a.lastSeenAt || 0));
-    return list;
   }
 
   function getLocalNetworkInterfaces() {
@@ -392,7 +308,6 @@ function createLanServerManager({
 
       revokeAllTrustedTokensCallback = () => {
         for (const room of new Set(roomsByCode.values())) {
-          if (room.trustedTokens) room.trustedTokens.clear();
           room.activeSessionToken = null;
           if (room.activeClientWs) {
             sendWs(room.activeClientWs, {
@@ -402,61 +317,33 @@ function createLanServerManager({
             });
           }
         }
-        savePersistedTrustedTokens(null);
+        trustStore.revokeAllTokens();
         notifyTrustedDevicesUpdated();
       };
 
       revokeOneTrustedTokenCallback = (tokenPrefix) => {
         if (!tokenPrefix || typeof tokenPrefix !== 'string') return;
-        let updatedMap = null;
+        const revokedTokens = trustStore.revokeToken(tokenPrefix);
         for (const room of new Set(roomsByCode.values())) {
-          if (!room.trustedTokens) continue;
-          for (const tok of Array.from(room.trustedTokens.keys())) {
-            if (tok.startsWith(tokenPrefix)) {
-              room.trustedTokens.delete(tok);
-              if (room.activeSessionToken === tok) {
-                room.activeSessionToken = null;
-                if (room.activeClientWs) {
-                  const target = room.activeClientWs;
-                  room.activeClientWs = null;
-                  socketRoom.delete(target);
-                  sendWs(target, { type: 'session:closed', reason: '电脑端已移除当前设备信任凭证' });
-                  try { target.close(); } catch {}
-                }
-              }
+          if (room.activeSessionToken && revokedTokens.includes(room.activeSessionToken)) {
+            room.activeSessionToken = null;
+            if (room.activeClientWs) {
+              const target = room.activeClientWs;
+              room.activeClientWs = null;
+              socketRoom.delete(target);
+              sendWs(target, { type: 'session:closed', reason: '电脑端已移除当前设备信任凭证' });
+              try { target.close(); } catch {}
             }
           }
-          updatedMap = room.trustedTokens;
-        }
-        if (updatedMap) {
-          savePersistedTrustedTokens(updatedMap);
-        } else {
-          const persisted = loadPersistedTrustedTokens();
-          for (const tok of Array.from(persisted.keys())) {
-            if (tok.startsWith(tokenPrefix)) persisted.delete(tok);
-          }
-          savePersistedTrustedTokens(persisted);
         }
         notifyTrustedDevicesUpdated();
-      };
-
-      listLiveTrustedTokensCallback = () => {
-        for (const room of new Set(roomsByCode.values())) {
-          if (room.trustedTokens) return formatTrustedDeviceList(room.trustedTokens);
-        }
-        return formatTrustedDeviceList(loadPersistedTrustedTokens());
       };
 
       updateActiveTrustedTokenModeCallback = (nextMode) => {
         if (nextMode !== 'full_control' && nextMode !== 'view_only') return;
         for (const room of new Set(roomsByCode.values())) {
-          if (room.activeSessionToken && room.trustedTokens && room.trustedTokens.has(room.activeSessionToken)) {
-            const rec = room.trustedTokens.get(room.activeSessionToken);
-            if (rec) {
-              rec.mode = nextMode;
-              savePersistedTrustedTokens(room.trustedTokens);
-              notifyTrustedDevicesUpdated();
-            }
+          if (room.activeSessionToken) {
+            trustStore.updateTokenMode(room.activeSessionToken, nextMode);
           }
         }
       };
@@ -527,19 +414,7 @@ function createLanServerManager({
         const authoritativeControlEnabled = getAuthoritativeControl();
         const tok = String(req.headers['x-airdesk-token'] || '').trim();
         if (tok && tok.length >= 16) {
-          let matchedRec = null;
-          for (const room of new Set(roomsByCode.values())) {
-            const rec = room.trustedTokens && room.trustedTokens.get(tok);
-            if (rec && rec.expiresAt > nowTs) {
-              matchedRec = rec;
-              break;
-            }
-          }
-          if (!matchedRec) {
-            const persisted = loadPersistedTrustedTokens();
-            const prec = persisted.get(tok);
-            if (prec && prec.expiresAt > nowTs) matchedRec = prec;
-          }
+          const matchedRec = trustStore.getValidTokenRecord(tok);
           if (matchedRec) {
             if (requireWrite && ((hasActiveSession && !authoritativeControlEnabled) || matchedRec.mode !== 'full_control')) {
               return { ok: false, status: 403, error: '当前为只读模式，禁止向电脑上传文件' };
@@ -846,7 +721,6 @@ function createLanServerManager({
               activeClientWs: null,
               activeSessionToken: null,
               failedAttempts: 0,
-              trustedTokens: loadPersistedTrustedTokens(),
             };
             roomsByCode.set(code, room);
             socketRoom.set(ws, { room, role: 'host' });
@@ -856,21 +730,20 @@ function createLanServerManager({
           if (msg.type === 'client:join') {
             const isOverlayPeer = isOverlayIp(maskedIp);
             if (typeof msg.sessionToken === 'string' && msg.sessionToken.length >= 16) {
-              let matchedRoom = null;
-              let tokenRecord = null;
-              const nowTs = Date.now();
-              for (const candidateRoom of new Set(roomsByCode.values())) {
-                const rec = candidateRoom.trustedTokens && candidateRoom.trustedTokens.get(msg.sessionToken);
-                if (rec && rec.expiresAt > nowTs) {
-                  matchedRoom = candidateRoom;
-                  tokenRecord = rec;
-                  break;
-                }
-              }
-              if (!matchedRoom || !tokenRecord) {
-                sendWs(ws, { type: 'error', message: '自动重连凭证已过期，请重新扫码或输入 6 位配对码' });
+              const firstRoom = roomsByCode.values().next().value || null;
+              const verify = firstRoom
+                ? trustStore.verifyAndTouchToken(msg.sessionToken, {
+                    ipMasked: maskedIp,
+                    deviceLabel: msg.deviceLabel,
+                    platformHint: msg.platformHint,
+                  })
+                : { ok: false };
+              if (!firstRoom || !verify.ok) {
+                sendWs(ws, { type: 'error', code: 'TOKEN_INVALID', message: '自动重连凭证已过期，请重新扫码或输入 6 位配对码' });
                 return;
               }
+              const matchedRoom = firstRoom;
+              const tokenRecord = verify.record;
               if (matchedRoom.activeClientWs && matchedRoom.activeClientWs !== ws) {
                 const staleWs = matchedRoom.activeClientWs;
                 matchedRoom.activeClientWs = null;
@@ -880,13 +753,6 @@ function createLanServerManager({
               matchedRoom.activeClientWs = ws;
               matchedRoom.activeSessionToken = msg.sessionToken;
               socketRoom.set(ws, { room: matchedRoom, role: 'client' });
-              tokenRecord.expiresAt = nowTs + TRUSTED_TOKEN_TTL_MS;
-              tokenRecord.lastSeenAt = nowTs;
-              tokenRecord.ipMasked = maskedIp;
-              if (msg.deviceLabel) tokenRecord.deviceLabel = String(msg.deviceLabel).slice(0, 64);
-              if (msg.platformHint) tokenRecord.platformHint = String(msg.platformHint).slice(0, 32);
-              savePersistedTrustedTokens(matchedRoom.trustedTokens);
-              notifyTrustedDevicesUpdated();
               sendWs(ws, {
                 type: 'client:approved',
                 mode: tokenRecord.mode,
@@ -957,10 +823,8 @@ function createLanServerManager({
               room.audioEnabled = msg.audioEnabled;
             }
             if (msg.activeMode === 'full_control' || msg.activeMode === 'view_only') {
-              if (room.activeSessionToken && room.trustedTokens && room.trustedTokens.has(room.activeSessionToken)) {
-                room.trustedTokens.get(room.activeSessionToken).mode = msg.activeMode;
-                savePersistedTrustedTokens(room.trustedTokens);
-                notifyTrustedDevicesUpdated();
+              if (room.activeSessionToken) {
+                trustStore.updateTokenMode(room.activeSessionToken, msg.activeMode);
               }
             }
             return;
@@ -978,20 +842,15 @@ function createLanServerManager({
             }
             room.activeClientWs = pending;
             const approvedMode = msg.mode || 'view_only';
-            const sessionToken = crypto.randomBytes(16).toString('hex');
-            room.activeSessionToken = sessionToken;
-            const nowTs = Date.now();
-            room.trustedTokens.set(sessionToken, {
+            const issued = trustStore.issueToken({
               mode: approvedMode,
               deviceLabel: pendingMeta.deviceLabel || '局域网移动设备',
               platformHint: pendingMeta.platformHint || 'Mobile',
               ipMasked: pendingMeta.ipMasked || 'LAN',
-              createdAt: nowTs,
-              lastSeenAt: nowTs,
-              expiresAt: nowTs + TRUSTED_TOKEN_TTL_MS,
+              source: 'lan',
             });
-            savePersistedTrustedTokens(room.trustedTokens);
-            notifyTrustedDevicesUpdated();
+            const sessionToken = issued.sessionToken;
+            room.activeSessionToken = sessionToken;
             sendWs(pending, {
               type: 'client:approved',
               mode: approvedMode,
@@ -1002,11 +861,7 @@ function createLanServerManager({
             return;
           }
           if (role === 'host' && msg.type === 'host:emergency_stop') {
-            if (room.trustedTokens) {
-              room.trustedTokens.clear();
-              savePersistedTrustedTokens(room.trustedTokens);
-              notifyTrustedDevicesUpdated();
-            }
+            trustStore.revokeAllTokens();
             room.activeSessionToken = null;
             if (room.activeClientWs) {
               sendWs(room.activeClientWs, {
@@ -1078,7 +933,6 @@ function createLanServerManager({
         localSignalingRunning = false;
         revokeAllTrustedTokensCallback = null;
         revokeOneTrustedTokenCallback = null;
-        listLiveTrustedTokensCallback = null;
         updateActiveTrustedTokenModeCallback = null;
       });
 
@@ -1087,7 +941,6 @@ function createLanServerManager({
         localSignalingRunning = false;
         revokeAllTrustedTokensCallback = null;
         revokeOneTrustedTokenCallback = null;
-        listLiveTrustedTokensCallback = null;
         updateActiveTrustedTokenModeCallback = null;
         reject(err);
       });
@@ -1139,7 +992,6 @@ function createLanServerManager({
   function stopLocalSignalingServer() {
     revokeAllTrustedTokensCallback = null;
     revokeOneTrustedTokenCallback = null;
-    listLiveTrustedTokensCallback = null;
     updateActiveTrustedTokenModeCallback = null;
     if (localUdpDiscoverySocket) {
       try {
@@ -1164,18 +1016,14 @@ function createLanServerManager({
   }
 
   function listTrustedDevices() {
-    if (listLiveTrustedTokensCallback) {
-      return listLiveTrustedTokensCallback();
-    }
-    return formatTrustedDeviceList(loadPersistedTrustedTokens());
+    return trustStore.listTrustedDevices();
   }
 
   function revokeAllTrustedTokens() {
     if (revokeAllTrustedTokensCallback) {
       revokeAllTrustedTokensCallback();
     } else {
-      savePersistedTrustedTokens(null);
-      notifyTrustedDevicesUpdated();
+      trustStore.revokeAllTokens();
     }
   }
 
@@ -1183,12 +1031,7 @@ function createLanServerManager({
     if (revokeOneTrustedTokenCallback) {
       revokeOneTrustedTokenCallback(tokenPrefix);
     } else {
-      const persisted = loadPersistedTrustedTokens();
-      for (const tok of Array.from(persisted.keys())) {
-        if (tok.startsWith(tokenPrefix)) persisted.delete(tok);
-      }
-      savePersistedTrustedTokens(persisted);
-      notifyTrustedDevicesUpdated();
+      trustStore.revokeToken(tokenPrefix);
     }
   }
 

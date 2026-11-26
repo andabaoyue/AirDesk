@@ -224,7 +224,7 @@
     <section id="tab-overview" class="tab-panel active">
       <div class="card hero-grid">
         <div>
-          <div class="card-title">当前 6 位配对码（30 分钟有效 · 已批准设备 7 天免密秒连）</div>
+          <div class="card-title">当前 6 位配对码（30 分钟有效 · 已批准设备支持长期免密秒连）</div>
           <div class="code-row">
             <div id="pairCode" class="code">------</div>
             <button id="btnCopyCode" type="button" class="secondary sm">复制配对码</button>
@@ -384,6 +384,14 @@
               <input id="lanNoStun" type="checkbox" checked />
               <span>纯局域网 / 手机热点免 STUN 极速直连</span>
             </label>
+            <label class="toggle-chip" title="随系统登录后自动启动 AirDesk Host">
+              <input id="enableAutoStart" type="checkbox" />
+              <span>开机自动启动</span>
+            </label>
+            <label class="toggle-chip" title="启动后自动恢复上次选中的局域网/公网共享模式并隐藏窗口到托盘">
+              <input id="enableAutoHostOnStart" type="checkbox" />
+              <span>启动后自动开启上次共享模式并最小化到托盘</span>
+            </label>
           </div>
         </div>
       </div>
@@ -393,8 +401,13 @@
     <section id="tab-devices" class="tab-panel">
       <div class="card">
         <div class="card-head">
-          <div class="card-title">已信任免密设备管理（7 天有效 · 物理急停 Ctrl+Alt+Esc 自动清空）</div>
+          <div class="card-title">已信任免密设备管理（物理急停 Ctrl+Alt+Esc 自动清空）</div>
           <div class="row" style="margin-top:0;">
+            <select id="trustTtlSelect" style="width:auto; padding:5px 9px; font-size:12px;" title="配置已批准设备的免密有效期">
+              <option value="7d" selected>免密有效期：7 天</option>
+              <option value="30d">免密有效期：30 天</option>
+              <option value="never">免密有效期：长期有效（直到手动撤销）</option>
+            </select>
             <button id="btnRefreshTrusted" type="button" class="secondary sm">刷新</button>
             <button id="btnRevokeAllTokens" type="button" class="danger sm">清空全部免密凭证</button>
           </div>
