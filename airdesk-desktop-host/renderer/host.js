@@ -47,6 +47,12 @@ const btnUsbTether = document.getElementById('btnUsbTether');
 const usbDirectHintEl = document.getElementById('usbDirectHint');
 const pairCodeEl = document.getElementById('pairCode');
 const btnCopyCode = document.getElementById('btnCopyCode');
+const hostIdTextEl = document.getElementById('hostIdText');
+const btnCopyHostId = document.getElementById('btnCopyHostId');
+const unattendedPwBadgeEl = document.getElementById('unattendedPwBadge');
+const unattendedPwInput = document.getElementById('unattendedPwInput');
+const btnSetUnattendedPw = document.getElementById('btnSetUnattendedPw');
+const btnClearUnattendedPw = document.getElementById('btnClearUnattendedPw');
 const qrImg = document.getElementById('qrImg');
 const qrPlaceholder = document.getElementById('qrPlaceholder');
 const qrLinkText = document.getElementById('qrLinkText');
@@ -415,6 +421,45 @@ document.querySelectorAll('.tab-btn').forEach((btn) => {
     });
   });
 });
+
+function updateUnattendedPasswordUi(st) {
+  if (unattendedPwBadgeEl) {
+    const spans = unattendedPwBadgeEl.querySelectorAll('span');
+    unattendedPwBadgeEl.style.borderColor = '';
+    unattendedPwBadgeEl.style.color = '';
+    if (st && st.locked) {
+      unattendedPwBadgeEl.className = 'pill';
+      unattendedPwBadgeEl.style.borderColor = '#F59E0B';
+      unattendedPwBadgeEl.style.color = '#FBBF24';
+      if (spans.length >= 2) spans[1].textContent = '已锁定 (' + (st.remainingLockSec || 0) + 's)';
+    } else if (st && st.enabled) {
+      unattendedPwBadgeEl.className = 'pill live';
+      if (spans.length >= 2) spans[1].textContent = '已启用';
+    } else {
+      unattendedPwBadgeEl.className = 'pill';
+      if (spans.length >= 2) spans[1].textContent = '未启用';
+    }
+  }
+  if (btnClearUnattendedPw) {
+    btnClearUnattendedPw.style.display = st && st.enabled ? 'inline-block' : 'none';
+  }
+}
+
+if (btnCopyHostId) {
+  btnCopyHostId.onclick = async () => {
+    const hid = (hostIdentity && hostIdentity.hostId) || '';
+    if (!hid) {
+      showNotice('主机 ID 尚未就绪');
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(hid);
+      showNotice('已复制主机 ID：' + hid);
+    } catch {
+      showNotice('本机主机 ID：' + hid);
+    }
+  };
+}
 
 if (btnCopyCode) {
   btnCopyCode.onclick = async () => {
@@ -1261,6 +1306,56 @@ function connectSignalingSocket(wsUrl) {
           : (hasTurn
               ? '公网信令已就绪（已配 TURN 中继兜底' + hostIdNote + '）：等待手机接入...'
               : '公网信令已就绪（STUN P2P 穿透' + hostIdNote + '）：等待手机接入...');
+    } else if (msg.type === 'host:password_challenge_request') {
+      const chalRes = await window.airdeskAPI.createPasswordChallenge({
+        challengeId: msg.challengeId,
+      });
+      if (ws === sock && sock.readyState === WebSocket.OPEN) {
+        sock.send(
+          JSON.stringify({
+            type: 'host:password_challenge_reply',
+            challengeId: msg.challengeId,
+            ok: Boolean(chalRes && chalRes.ok),
+            nonce: (chalRes && chalRes.nonce) || '',
+            salt: (chalRes && chalRes.salt) || '',
+            kdf: (chalRes && chalRes.kdf) || 'scrypt',
+            n: (chalRes && chalRes.n) || 16384,
+            r: (chalRes && chalRes.r) || 8,
+            p: (chalRes && chalRes.p) || 1,
+            dkLen: (chalRes && chalRes.dkLen) || 32,
+            code: (chalRes && chalRes.code) || '',
+            message: (chalRes && chalRes.message) || '',
+          })
+        );
+      }
+    } else if (msg.type === 'host:password_verify') {
+      const clientMeta = msg.client || {};
+      const verifyRes = await window.airdeskAPI.verifyPasswordChallenge({
+        challengeId: msg.challengeId,
+        proof: msg.proof,
+        deviceLabel: clientMeta.deviceLabel,
+        platformHint: clientMeta.platformHint,
+        ipMasked: clientMeta.ipMasked,
+      });
+      if (verifyRes && verifyRes.ok) {
+        activeRelaySessionToken = verifyRes.sessionToken;
+      }
+      if (window.airdeskAPI.getUnattendedPasswordStatus) {
+        updateUnattendedPasswordUi(await window.airdeskAPI.getUnattendedPasswordStatus());
+      }
+      if (ws === sock && sock.readyState === WebSocket.OPEN) {
+        sock.send(
+          JSON.stringify({
+            type: 'host:password_verified',
+            challengeId: msg.challengeId,
+            approved: Boolean(verifyRes && verifyRes.ok),
+            sessionToken: (verifyRes && verifyRes.sessionToken) || '',
+            mode: (verifyRes && verifyRes.mode) || 'full_control',
+            code: (verifyRes && verifyRes.code) || '',
+            message: (verifyRes && verifyRes.message) || '',
+          })
+        );
+      }
     } else if (msg.type === 'host:verify_token') {
       const clientMeta = msg.client || {};
       const verifyRes = await window.airdeskAPI.verifyRelayTrustedToken({
@@ -1299,7 +1394,11 @@ function connectSignalingSocket(wsUrl) {
         ' 请求连接';
       approvalCard.style.display = 'block';
     } else if (msg.type === 'rtc:offer') {
-      await handleOffer(msg.sdp);
+      if (msg.iceRestart === true && pc && pc.signalingState !== 'closed') {
+        await handleIceRestartOffer(msg.sdp);
+      } else {
+        await handleOffer(msg.sdp);
+      }
     } else if (msg.type === 'rtc:ice') {
       if (pc && pc.remoteDescription) {
         await pc.addIceCandidate(msg.candidate).catch(() => {});
@@ -1354,6 +1453,49 @@ function scheduleRelayWsReconnect(wsUrl) {
     wsReconnectTimer = null;
     connectSignalingSocket(wsUrl);
   }, delayMs);
+}
+
+async function handleIceRestartOffer(remoteSdp) {
+  if (!pc || pc.signalingState === 'closed' || !ws || ws.readyState !== WebSocket.OPEN) {
+    return handleOffer(remoteSdp);
+  }
+  const currentPc = pc;
+  if (disconnectGraceTimer) {
+    clearTimeout(disconnectGraceTimer);
+    disconnectGraceTimer = null;
+  }
+  const tier = computeTieredVideoBitrates();
+  const boostedOfferSdp = boostVideoSdpBitrate(remoteSdp, tier.minKbps, tier.startKbps, tier.maxKbps);
+  const offerExt = ensurePlayoutDelayExtInSdp(boostedOfferSdp);
+  const tunedOfferSdp = enhanceAudioOpusSdp(offerExt.sdp);
+  try {
+    await currentPc.setRemoteDescription({ type: 'offer', sdp: tunedOfferSdp });
+  } catch (err) {
+    console.warn('[AirDesk] iceRestart boosted SDP rejected, falling back:', err.message);
+    await currentPc.setRemoteDescription({ type: 'offer', sdp: remoteSdp });
+  }
+  if (pc !== currentPc) return;
+
+  for (const cand of pendingIceCandidates) {
+    await currentPc.addIceCandidate(cand).catch(() => {});
+  }
+  pendingIceCandidates = [];
+
+  const answer = await currentPc.createAnswer();
+  const ansExt = ensurePlayoutDelayExtInSdp(answer.sdp, offerExt.extId);
+  const tunedAnswerSdp = enhanceAudioOpusSdp(ansExt.sdp);
+  let sentAnswer = answer;
+  try {
+    const tweakedAnswer = { type: answer.type, sdp: tunedAnswerSdp };
+    await currentPc.setLocalDescription(tweakedAnswer);
+    sentAnswer = tweakedAnswer;
+  } catch (err) {
+    console.warn('[AirDesk] iceRestart answer SDP rejected, falling back:', err.message);
+    await currentPc.setLocalDescription(answer);
+  }
+  if (pc !== currentPc || !ws || ws.readyState !== WebSocket.OPEN) return;
+  ws.send(JSON.stringify({ type: 'rtc:answer', sdp: sentAnswer.sdp, iceRestart: true }));
+  statusEl.textContent = '收到手机端切网 iceRestart 请求，正在原地刷新通道...';
 }
 
 async function handleOffer(remoteSdp) {
@@ -1425,15 +1567,33 @@ async function handleOffer(remoteSdp) {
       updateControlButtonUi();
     } else if (state === 'disconnected') {
       if (!disconnectGraceTimer) {
-        statusEl.textContent = 'WebRTC 链路波动 (disconnected)，等待 2.5s 自动恢复...';
+        statusEl.textContent = 'WebRTC 链路波动 (disconnected)，等待切网恢复 / iceRestart...';
         disconnectGraceTimer = setTimeout(() => {
           disconnectGraceTimer = null;
           if (pc === currentPc && currentPc.connectionState !== 'connected') {
             resetOnConnectionLost(currentPc.connectionState).catch(() => {});
           }
-        }, 2500);
+        }, 8000);
       }
-    } else if (state === 'failed' || state === 'closed') {
+    } else if (state === 'failed') {
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        if (!disconnectGraceTimer) {
+          statusEl.textContent = 'WebRTC 链路中断 (failed)，等待手机端发起 iceRestart...';
+          disconnectGraceTimer = setTimeout(() => {
+            disconnectGraceTimer = null;
+            if (pc === currentPc && currentPc.connectionState !== 'connected') {
+              resetOnConnectionLost(currentPc.connectionState).catch(() => {});
+            }
+          }, 3000);
+        }
+      } else {
+        if (disconnectGraceTimer) {
+          clearTimeout(disconnectGraceTimer);
+          disconnectGraceTimer = null;
+        }
+        await resetOnConnectionLost(state);
+      }
+    } else if (state === 'closed') {
       if (disconnectGraceTimer) {
         clearTimeout(disconnectGraceTimer);
         disconnectGraceTimer = null;
@@ -1681,6 +1841,10 @@ function rejectRequest() {
 async function init() {
   const info = await window.airdeskAPI.getSystemInfo();
   hostIdentity = info.hostIdentity || null;
+  if (hostIdTextEl) {
+    hostIdTextEl.textContent = (hostIdentity && hostIdentity.hostId) || '------------';
+  }
+  updateUnattendedPasswordUi(info.unattendedPasswordStatus || null);
   const hostSettings = info.hostSettings || {};
   displaysMeta = info.displays || [];
   localSignalingInfo = info.localSignaling || null;
@@ -2215,6 +2379,27 @@ async function init() {
           ? '已开启：下次启动时自动恢复上次共享模式并最小化到托盘'
           : '已关闭启动后自动开启共享'
       );
+    };
+  }
+  if (btnSetUnattendedPw && unattendedPwInput) {
+    btnSetUnattendedPw.onclick = async () => {
+      const pw = unattendedPwInput.value || '';
+      const res = await window.airdeskAPI.setUnattendedPassword(pw);
+      if (!res || !res.ok) {
+        showNotice((res && res.message) || '设置密码失败（至少 6 位）');
+        return;
+      }
+      unattendedPwInput.value = '';
+      updateUnattendedPasswordUi(res.status);
+      showNotice('已启用/更新无人值守固定访问密码（仅本机 scrypt 加密存储）');
+    };
+  }
+  if (btnClearUnattendedPw) {
+    btnClearUnattendedPw.onclick = async () => {
+      const res = await window.airdeskAPI.clearUnattendedPassword();
+      if (unattendedPwInput) unattendedPwInput.value = '';
+      updateUnattendedPasswordUi(res && res.status ? res.status : { enabled: false });
+      showNotice('已清除无人值守固定访问密码');
     };
   }
   await refreshTrustedDevicesUi();

@@ -15,6 +15,7 @@ const MAX_IP_BUCKETS = 10000;
 const MAX_HOST_REGISTRY = 10000;
 const MAX_PENDING_VERIFIES_PER_ROOM = 4;
 const VERIFY_TIMEOUT_MS = 10000;
+const CHALLENGE_TIMEOUT_MS = 60000;
 const HOST_ID_RE = /^[a-zA-Z0-9_-]{6,32}$/;
 
 function safeEqualStrings(a, b) {
@@ -106,6 +107,7 @@ export function createRelayServer(options = {}) {
   const roomsByCode = new Map();
   const roomsByHostId = new Map();
   const socketRoom = new Map();
+  const wsPendingChallenge = new WeakMap();
   const ipAttemptBuckets = new Map();
 
   function getIceServers() {
@@ -240,6 +242,21 @@ export function createRelayServer(options = {}) {
           }
         }
       }
+      if (room.pendingChallenges && room.pendingChallenges.size > 0) {
+        for (const [cid, pending] of room.pendingChallenges.entries()) {
+          if (now - pending.createdAt > CHALLENGE_TIMEOUT_MS) {
+            room.pendingChallenges.delete(cid);
+            if (pending.ws) wsPendingChallenge.delete(pending.ws);
+            if (pending.ws && pending.ws.readyState === 1) {
+              sendWs(pending.ws, {
+                type: 'error',
+                code: 'CHALLENGE_EXPIRED',
+                message: '密码验证超时，请重试',
+              });
+            }
+          }
+        }
+      }
     }
     for (const [ip, bucket] of ipAttemptBuckets.entries()) {
       if (now > bucket.resetAt) ipAttemptBuckets.delete(ip);
@@ -351,6 +368,20 @@ export function createRelayServer(options = {}) {
               }
               existing.pendingVerifies.clear();
             }
+            if (existing.pendingChallenges) {
+              for (const pending of existing.pendingChallenges.values()) {
+                if (pending.ws) wsPendingChallenge.delete(pending.ws);
+                if (pending.ws && pending.ws.readyState === 1) {
+                  sendWs(pending.ws, {
+                    type: 'error',
+                    code: 'HOST_OFFLINE',
+                    retryable: true,
+                    message: '目标电脑正在重新上线，请稍后重试',
+                  });
+                }
+              }
+              existing.pendingChallenges.clear();
+            }
           } else if (roomsByHostId.size >= MAX_HOST_REGISTRY) {
             let evictKey = null;
             for (const [k, r] of roomsByHostId.entries()) {
@@ -382,6 +413,7 @@ export function createRelayServer(options = {}) {
           pendingClientWs: null,
           pendingClientMeta: null,
           pendingVerifies: new Map(),
+          pendingChallenges: new Map(),
           activeClientWs: null,
           activeSessionToken: null,
           failedAttempts: 0,
@@ -413,6 +445,67 @@ export function createRelayServer(options = {}) {
           return;
         }
         const targetHostId = typeof msg.hostId === 'string' ? msg.hostId.trim() : '';
+        if (msg.authMode === 'password') {
+          if (!targetHostId || !HOST_ID_RE.test(targetHostId)) {
+            checkAndRecordIpFailure(maskedIp);
+            sendWs(ws, { type: 'error', code: 'INVALID_HOST_ID', message: '请输入有效的主机 ID' });
+            return;
+          }
+          const room = roomsByHostId.get(targetHostId);
+          if (!room || !room.hostWs || room.hostWs.readyState !== 1) {
+            sendWs(ws, {
+              type: 'error',
+              code: 'HOST_OFFLINE',
+              retryable: true,
+              message: '目标电脑暂不在线（等待恢复）',
+            });
+            return;
+          }
+          for (const [cid, pending] of room.pendingChallenges.entries()) {
+            if (!pending.ws || pending.ws.readyState !== 1) {
+              room.pendingChallenges.delete(cid);
+              if (pending.ws) wsPendingChallenge.delete(pending.ws);
+            }
+          }
+          if (room.pendingChallenges.size >= MAX_PENDING_VERIFIES_PER_ROOM) {
+            sendWs(ws, {
+              type: 'error',
+              retryable: true,
+              message: '电脑端正在处理过多验证请求，请稍后再试',
+            });
+            return;
+          }
+          const prevChal = wsPendingChallenge.get(ws);
+          if (prevChal && prevChal.room && prevChal.room.pendingChallenges) {
+            prevChal.room.pendingChallenges.delete(prevChal.challengeId);
+          }
+          const challengeId = crypto.randomUUID();
+          const clientMeta = {
+            deviceLabel: String(msg.deviceLabel || '远程移动设备').slice(0, 64),
+            platformHint: String(msg.platformHint || 'Mobile').slice(0, 32),
+            ipMasked: maskedIp,
+          };
+          room.pendingChallenges.set(challengeId, {
+            ws,
+            deviceLabel: clientMeta.deviceLabel,
+            platformHint: clientMeta.platformHint,
+            ipMasked: maskedIp,
+            createdAt: Date.now(),
+            nonceIssued: false,
+            responseSent: false,
+          });
+          wsPendingChallenge.set(ws, { room, challengeId });
+          ws.once('close', () => {
+            room.pendingChallenges.delete(challengeId);
+            wsPendingChallenge.delete(ws);
+          });
+          sendWs(room.hostWs, {
+            type: 'host:password_challenge_request',
+            challengeId,
+            client: clientMeta,
+          });
+          return;
+        }
         if (typeof msg.sessionToken === 'string' && msg.sessionToken.length >= 16 && targetHostId) {
           const room = roomsByHostId.get(targetHostId);
           if (!room || !room.hostWs || room.hostWs.readyState !== 1) {
@@ -560,6 +653,37 @@ export function createRelayServer(options = {}) {
         return;
       }
 
+      if (msg.type === 'client:password_response') {
+        const entry = wsPendingChallenge.get(ws);
+        if (!entry || !entry.room || !entry.room.pendingChallenges) return;
+        if (msg.challengeId !== entry.challengeId) return;
+        const pending = entry.room.pendingChallenges.get(entry.challengeId);
+        if (!pending || pending.ws !== ws || !pending.nonceIssued || pending.responseSent) return;
+        pending.responseSent = true;
+        if (!entry.room.hostWs || entry.room.hostWs.readyState !== 1) {
+          entry.room.pendingChallenges.delete(entry.challengeId);
+          wsPendingChallenge.delete(ws);
+          sendWs(ws, {
+            type: 'error',
+            code: 'HOST_OFFLINE',
+            retryable: true,
+            message: '目标电脑暂不在线（等待恢复）',
+          });
+          return;
+        }
+        sendWs(entry.room.hostWs, {
+          type: 'host:password_verify',
+          challengeId: entry.challengeId,
+          proof: typeof msg.proof === 'string' ? msg.proof : '',
+          client: {
+            deviceLabel: pending.deviceLabel,
+            platformHint: pending.platformHint,
+            ipMasked: pending.ipMasked,
+          },
+        });
+        return;
+      }
+
       const meta = socketRoom.get(ws);
       if (!meta) return;
       const { room, role } = meta;
@@ -577,6 +701,97 @@ export function createRelayServer(options = {}) {
           if (room.trustedTokens) room.trustedTokens.clear();
           room.activeSessionToken = null;
         }
+        return;
+      }
+
+      if (role === 'host' && msg.type === 'host:password_challenge_reply') {
+        const challengeId = typeof msg.challengeId === 'string' ? msg.challengeId : '';
+        const pending = room.pendingChallenges && room.pendingChallenges.get(challengeId);
+        if (!pending) return;
+        if (!pending.ws || pending.ws.readyState !== 1) {
+          room.pendingChallenges.delete(challengeId);
+          wsPendingChallenge.delete(pending.ws);
+          return;
+        }
+        if (msg.ok !== true) {
+          room.pendingChallenges.delete(challengeId);
+          wsPendingChallenge.delete(pending.ws);
+          if (msg.code === 'PASSWORD_LOCKED' || msg.code === 'PASSWORD_DISABLED') {
+            checkAndRecordIpFailure(pending.ipMasked);
+          }
+          sendWs(pending.ws, {
+            type: 'error',
+            code: msg.code || 'PASSWORD_AUTH_UNAVAILABLE',
+            message: msg.message || '无法发起访问密码验证',
+          });
+          return;
+        }
+        pending.nonceIssued = true;
+        pending.responseSent = false;
+        sendWs(pending.ws, {
+          type: 'client:password_challenge',
+          challengeId,
+          hostId: room.hostId,
+          hostLabel: room.hostLabel,
+          nonce: msg.nonce,
+          salt: msg.salt,
+          kdf: msg.kdf || 'scrypt',
+          n: msg.n || 16384,
+          r: msg.r || 8,
+          p: msg.p || 1,
+          dkLen: msg.dkLen || 32,
+        });
+        return;
+      }
+
+      if (role === 'host' && msg.type === 'host:password_verified') {
+        const challengeId = typeof msg.challengeId === 'string' ? msg.challengeId : '';
+        const pending = room.pendingChallenges && room.pendingChallenges.get(challengeId);
+        if (!pending) return;
+        room.pendingChallenges.delete(challengeId);
+        wsPendingChallenge.delete(pending.ws);
+        if (!pending.ws || pending.ws.readyState !== 1) return;
+
+        if (msg.approved !== true) {
+          checkAndRecordIpFailure(pending.ipMasked);
+          sendWs(pending.ws, {
+            type: 'error',
+            code: msg.code || 'PASSWORD_INVALID',
+            message: msg.message || '访问密码校验失败',
+          });
+          return;
+        }
+
+        // Only kick previous active client after password approval and confirmed OPEN socket
+        if (room.activeClientWs && room.activeClientWs !== pending.ws) {
+          const staleWs = room.activeClientWs;
+          room.activeClientWs = null;
+          socketRoom.delete(staleWs);
+          try {
+            staleWs.close();
+          } catch {}
+        }
+        room.activeClientWs = pending.ws;
+        room.activeSessionToken = msg.sessionToken || null;
+        socketRoom.set(pending.ws, { room, role: 'client' });
+
+        const approvedMode = msg.mode === 'full_control' ? 'full_control' : 'view_only';
+        const approvedPayload = {
+          type: 'client:approved',
+          mode: approvedMode,
+          hostLabel: room.hostLabel,
+          audioEnabled: Boolean(room.audioEnabled),
+          sessionToken: msg.sessionToken,
+          iceServers: getIceServers(),
+        };
+        if (room.hostId) approvedPayload.hostId = room.hostId;
+        sendWs(pending.ws, approvedPayload);
+        sendWs(room.hostWs, {
+          type: 'host:client_reconnected',
+          mode: approvedMode,
+          deviceLabel: pending.deviceLabel,
+          ipMasked: pending.ipMasked,
+        });
         return;
       }
 
@@ -771,6 +986,20 @@ export function createRelayServer(options = {}) {
             }
           }
           room.pendingVerifies.clear();
+        }
+        if (room.pendingChallenges && room.pendingChallenges.size > 0) {
+          for (const pending of room.pendingChallenges.values()) {
+            if (pending.ws) wsPendingChallenge.delete(pending.ws);
+            if (pending.ws && pending.ws.readyState === 1) {
+              sendWs(pending.ws, {
+                type: 'error',
+                code: 'HOST_OFFLINE',
+                retryable: true,
+                message: '目标电脑暂不在线（等待恢复）',
+              });
+            }
+          }
+          room.pendingChallenges.clear();
         }
       } else {
         const wasActive = room.activeClientWs === ws;

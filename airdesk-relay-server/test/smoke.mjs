@@ -403,7 +403,182 @@ async function run() {
     v2Client3.close();
     v2Client2.close();
     v2Host2.close();
-    console.log('RELAY_SMOKE_TEST_ALL_7_CHECKS_PASSED');
+
+    // 8. Unattended password challenge-response forwarding & protection
+    const p2HostId = 'k7m2p9x4q1w8';
+    const p2HostSecret = crypto.randomBytes(24).toString('hex');
+    const p2HostWs = await openWs(baseWs);
+    const p2CreatedP = nextMsg(p2HostWs, (m) => m.type === 'host:created');
+    p2HostWs.send(
+      JSON.stringify({
+        type: 'host:create',
+        protoVersion: 2,
+        hostId: p2HostId,
+        hostSecret: p2HostSecret,
+        accessKey: 'secret-room-key',
+        hostLabel: 'P2-PC',
+      })
+    );
+    const p2Created = await p2CreatedP;
+    assert.equal(p2Created.hostId, p2HostId);
+
+    // 8a. Password disabled error
+    const pwDisabledClient = await openWs(baseWs);
+    const chalReq1P = nextMsg(p2HostWs, (m) => m.type === 'host:password_challenge_request');
+    pwDisabledClient.send(
+      JSON.stringify({
+        type: 'client:join',
+        protoVersion: 2,
+        authMode: 'password',
+        hostId: p2HostId,
+      })
+    );
+    const chalReq1 = await chalReq1P;
+    const pwDisabledErrP = nextMsg(pwDisabledClient, (m) => m.type === 'error');
+    p2HostWs.send(
+      JSON.stringify({
+        type: 'host:password_challenge_reply',
+        challengeId: chalReq1.challengeId,
+        ok: false,
+        code: 'PASSWORD_DISABLED',
+        message: '目标电脑未开启无人值守访问密码',
+      })
+    );
+    const pwDisabledErr = await pwDisabledErrP;
+    assert.equal(pwDisabledErr.code, 'PASSWORD_DISABLED');
+    pwDisabledClient.close();
+
+    // 8b. Existing active client stays connected during password challenge & failed attempts
+    const activeClient = await openWs(baseWs);
+    const activeReqP = nextMsg(p2HostWs, (m) => m.type === 'host:approval_request');
+    activeClient.send(JSON.stringify({ type: 'client:join', code: p2Created.code }));
+    await activeReqP;
+    const activeAppP = nextMsg(activeClient, (m) => m.type === 'client:approved');
+    p2HostWs.send(
+      JSON.stringify({
+        type: 'host:approval_decision',
+        approved: true,
+        mode: 'view_only',
+        sessionToken: crypto.randomBytes(16).toString('hex'),
+      })
+    );
+    await activeAppP;
+
+    const badPwClient = await openWs(baseWs);
+    const badChalReqP = nextMsg(p2HostWs, (m) => m.type === 'host:password_challenge_request');
+    badPwClient.send(
+      JSON.stringify({
+        type: 'client:join',
+        protoVersion: 2,
+        authMode: 'password',
+        hostId: p2HostId,
+      })
+    );
+    const badChalReq = await badChalReqP;
+    const clientChal1P = nextMsg(badPwClient, (m) => m.type === 'client:password_challenge');
+    p2HostWs.send(
+      JSON.stringify({
+        type: 'host:password_challenge_reply',
+        challengeId: badChalReq.challengeId,
+        ok: true,
+        nonce: 'n1'.repeat(12),
+        salt: 's1'.repeat(8),
+        kdf: 'scrypt',
+        n: 16384,
+        r: 8,
+        p: 1,
+        dkLen: 32,
+      })
+    );
+    const clientChal1 = await clientChal1P;
+    assert.equal(clientChal1.hostId, p2HostId);
+
+    const hostVerify1P = nextMsg(p2HostWs, (m) => m.type === 'host:password_verify');
+    badPwClient.send(
+      JSON.stringify({
+        type: 'client:password_response',
+        challengeId: clientChal1.challengeId,
+        proof: '00'.repeat(32),
+      })
+    );
+    const hostVerify1 = await hostVerify1P;
+    const badPwErrP = nextMsg(badPwClient, (m) => m.type === 'error');
+    p2HostWs.send(
+      JSON.stringify({
+        type: 'host:password_verified',
+        challengeId: hostVerify1.challengeId,
+        approved: false,
+        code: 'PASSWORD_INVALID',
+        message: '访问密码错误（还剩 4 次机会）',
+      })
+    );
+    const badPwErr = await badPwErrP;
+    assert.equal(badPwErr.code, 'PASSWORD_INVALID');
+    // Crucial: activeClient must NOT be kicked during challenge or on rejection
+    assert.equal(activeClient.readyState, WebSocket.OPEN);
+    badPwClient.close();
+
+    // 8c. Successful password challenge replaces activeClient ONLY after approved === true
+    const goodPwClient = await openWs(baseWs);
+    const goodChalReqP = nextMsg(p2HostWs, (m) => m.type === 'host:password_challenge_request');
+    goodPwClient.send(
+      JSON.stringify({
+        type: 'client:join',
+        protoVersion: 2,
+        authMode: 'password',
+        hostId: p2HostId,
+        deviceLabel: 'New Phone P2',
+      })
+    );
+    const goodChalReq = await goodChalReqP;
+    const clientChal2P = nextMsg(goodPwClient, (m) => m.type === 'client:password_challenge');
+    p2HostWs.send(
+      JSON.stringify({
+        type: 'host:password_challenge_reply',
+        challengeId: goodChalReq.challengeId,
+        ok: true,
+        nonce: 'n2'.repeat(12),
+        salt: 's1'.repeat(8),
+        kdf: 'scrypt',
+        n: 16384,
+        r: 8,
+        p: 1,
+        dkLen: 32,
+      })
+    );
+    await clientChal2P;
+
+    const hostVerify2P = nextMsg(p2HostWs, (m) => m.type === 'host:password_verify');
+    goodPwClient.send(
+      JSON.stringify({
+        type: 'client:password_response',
+        challengeId: goodChalReq.challengeId,
+        proof: 'ab'.repeat(32),
+      })
+    );
+    const hostVerify2 = await hostVerify2P;
+    const pwIssuedTok = crypto.randomBytes(16).toString('hex');
+    const goodAppP = nextMsg(goodPwClient, (m) => m.type === 'client:approved');
+    const hostReconnP2 = nextMsg(p2HostWs, (m) => m.type === 'host:client_reconnected');
+    p2HostWs.send(
+      JSON.stringify({
+        type: 'host:password_verified',
+        challengeId: hostVerify2.challengeId,
+        approved: true,
+        mode: 'full_control',
+        sessionToken: pwIssuedTok,
+      })
+    );
+    const goodApp = await goodAppP;
+    assert.equal(goodApp.hostId, p2HostId);
+    assert.equal(goodApp.sessionToken, pwIssuedTok);
+    assert.equal(goodApp.mode, 'full_control');
+    assert.equal((await hostReconnP2).deviceLabel, 'New Phone P2');
+
+    goodPwClient.close();
+    activeClient.close();
+    p2HostWs.close();
+    console.log('RELAY_SMOKE_TEST_ALL_8_CHECKS_PASSED');
   } finally {
     await relay.close();
   }

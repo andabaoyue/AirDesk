@@ -513,6 +513,7 @@ ipcMain.handle('airdesk:get-system-info', (event) => {
     controlEnabled: authoritativeControlEnabled,
     hostIdentity: trustStore.getOrCreateHostIdentity(),
     hostSettings: trustStore.getHostSettings(),
+    unattendedPasswordStatus: trustStore.getUnattendedPasswordStatus(),
   };
 });
 
@@ -644,6 +645,41 @@ ipcMain.handle('airdesk:update-relay-token-mode', (event, opts) => {
     typeof safe.sessionToken === 'string' ? safe.sessionToken : '',
     safe.mode
   );
+});
+
+ipcMain.handle('airdesk:get-unattended-password-status', (event) => {
+  validateIpcSender(event);
+  return trustStore.getUnattendedPasswordStatus();
+});
+
+ipcMain.handle('airdesk:set-unattended-password', (event, password) => {
+  validateIpcSender(event);
+  return trustStore.setUnattendedPassword(typeof password === 'string' ? password : '');
+});
+
+ipcMain.handle('airdesk:clear-unattended-password', (event) => {
+  validateIpcSender(event);
+  return trustStore.clearUnattendedPassword();
+});
+
+ipcMain.handle('airdesk:create-password-challenge', (event, opts) => {
+  validateIpcSender(event);
+  const safe = opts && typeof opts === 'object' ? opts : {};
+  return trustStore.createPasswordChallenge({
+    challengeId: typeof safe.challengeId === 'string' ? safe.challengeId : '',
+  });
+});
+
+ipcMain.handle('airdesk:verify-password-challenge', (event, opts) => {
+  validateIpcSender(event);
+  const safe = opts && typeof opts === 'object' ? opts : {};
+  return trustStore.verifyPasswordChallenge({
+    challengeId: typeof safe.challengeId === 'string' ? safe.challengeId : '',
+    proof: typeof safe.proof === 'string' ? safe.proof : '',
+    deviceLabel: typeof safe.deviceLabel === 'string' ? safe.deviceLabel : '远程移动设备',
+    platformHint: typeof safe.platformHint === 'string' ? safe.platformHint : 'Mobile',
+    ipMasked: typeof safe.ipMasked === 'string' ? safe.ipMasked : 'WAN',
+  });
 });
 
 ipcMain.handle('airdesk:generate-qr', async (event, text) => {
