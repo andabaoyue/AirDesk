@@ -275,6 +275,31 @@ class WebRtcSessionService extends ChangeNotifier {
     return payload;
   }
 
+  static int _parseStrictIntParam(dynamic raw, int defaultValue, String name) {
+    if (raw == null) return defaultValue;
+    if (raw is int) return raw;
+    if (raw is double && raw.isFinite && raw == raw.truncateToDouble()) {
+      return raw.toInt();
+    }
+    throw ArgumentError.value(raw, name, 'scrypt $name must be an integer');
+  }
+
+  @visibleForTesting
+  static ({int n, int r, int p, int dkLen}) parseAndValidateChallengeKdfParams(
+    Map<String, dynamic> msg,
+  ) {
+    final kdfRaw = msg['kdf'];
+    if (kdfRaw != null && kdfRaw.toString() != 'scrypt') {
+      throw ArgumentError.value(kdfRaw, 'kdf', 'Unsupported KDF algorithm');
+    }
+    final n = _parseStrictIntParam(msg['n'], 16384, 'n');
+    final r = _parseStrictIntParam(msg['r'], 8, 'r');
+    final p = _parseStrictIntParam(msg['p'], 1, 'p');
+    final dkLen = _parseStrictIntParam(msg['dkLen'], 32, 'dkLen');
+    ScryptHelper.validateScryptParams(n: n, r: r, p: p, dkLen: dkLen);
+    return (n: n, r: r, p: p, dkLen: dkLen);
+  }
+
   Future<void> connect({
     String hostIp = '',
     int port = 47820,
@@ -478,18 +503,36 @@ class WebRtcSessionService extends ChangeNotifier {
         _setPhase(SessionPhase.error, '访问密码验证参数缺失');
         return;
       }
+      final ({int n, int r, int p, int dkLen}) kdfParams;
+      try {
+        kdfParams = parseAndValidateChallengeKdfParams(msg);
+      } on ArgumentError {
+        _setPhase(SessionPhase.error, '安全验证参数异常');
+        return;
+      }
       _setPhase(SessionPhase.waitingApproval, '正在进行安全密码验证...');
-      final proof = await ScryptHelper.computeChallengeProofAsync(
-        password: pw,
-        saltHex: saltHex,
-        hostId: chalHostId,
-        challengeId: challengeId,
-        nonce: nonce,
-        n: (msg['n'] as num?)?.toInt() ?? 16384,
-        r: (msg['r'] as num?)?.toInt() ?? 8,
-        p: (msg['p'] as num?)?.toInt() ?? 1,
-        dkLen: (msg['dkLen'] as num?)?.toInt() ?? 32,
-      );
+      final String proof;
+      try {
+        proof = await ScryptHelper.computeChallengeProofAsync(
+          password: pw,
+          saltHex: saltHex,
+          hostId: chalHostId,
+          challengeId: challengeId,
+          nonce: nonce,
+          n: kdfParams.n,
+          r: kdfParams.r,
+          p: kdfParams.p,
+          dkLen: kdfParams.dkLen,
+        );
+      } on ArgumentError {
+        if (_manualDisconnect || _ws != sock || _wsGen != wsGen) return;
+        _setPhase(SessionPhase.error, '安全验证参数异常');
+        return;
+      } on FormatException {
+        if (_manualDisconnect || _ws != sock || _wsGen != wsGen) return;
+        _setPhase(SessionPhase.error, '安全验证参数异常');
+        return;
+      }
       if (_manualDisconnect || _ws != sock || _wsGen != wsGen) return;
       _sendWs({
         'type': 'client:password_response',
