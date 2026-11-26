@@ -8,6 +8,23 @@ const TRUST_TTL_OPTIONS = Object.freeze({
   never: null,
 });
 
+const HOST_ID_ALPHABET = '0123456789abcdefghijklmnopqrstuvwxyz';
+const HOST_ID_LENGTH = 12;
+const MIN_PASSWORD_LENGTH = 6;
+const MAX_PASSWORD_ATTEMPTS = 5;
+const PASSWORD_LOCK_DURATION_MS = 5 * 60 * 1000;
+const CHALLENGE_TTL_MS = 60 * 1000;
+const MAX_ACTIVE_CHALLENGES = 16;
+const SCRYPT_PARAMS = Object.freeze({ N: 16384, r: 8, p: 1, dkLen: 32 });
+
+function generateHostId() {
+  let out = '';
+  for (let i = 0; i < HOST_ID_LENGTH; i += 1) {
+    out += HOST_ID_ALPHABET[crypto.randomInt(0, HOST_ID_ALPHABET.length)];
+  }
+  return out;
+}
+
 function atomicWriteJson(filePath, data) {
   const dir = path.dirname(filePath);
   fs.mkdirSync(dir, { recursive: true });
@@ -61,10 +78,13 @@ function createTrustStore({ userDataDir, onTrustedDevicesChanged } = {}) {
   const identityPath = path.join(userDataDir, 'host-identity.json');
   const tokensPath = path.join(userDataDir, 'trusted-tokens.json');
   const settingsPath = path.join(userDataDir, 'host-settings.json');
+  const securityPath = path.join(userDataDir, 'host-security.json');
 
   let cachedIdentity = null;
   let cachedSettings = null;
+  let cachedSecurity = null;
   let tokensMap = null;
+  const pendingChallenges = new Map();
 
   function notifyChanged() {
     if (typeof onTrustedDevicesChanged === 'function') {
@@ -92,7 +112,7 @@ function createTrustStore({ userDataDir, onTrustedDevicesChanged } = {}) {
       return cachedIdentity;
     }
     const created = {
-      hostId: String(crypto.randomInt(100000000, 1000000000)),
+      hostId: generateHostId(),
       hostSecret: crypto.randomBytes(32).toString('hex'),
       createdAt: Date.now(),
     };
@@ -306,6 +326,234 @@ function createTrustStore({ userDataDir, onTrustedDevicesChanged } = {}) {
     return hadAny;
   }
 
+  function ensureSecurityLoaded() {
+    if (cachedSecurity) return cachedSecurity;
+    const raw = readJsonSafe(securityPath);
+    const hasHash =
+      raw &&
+      typeof raw.salt === 'string' &&
+      /^[0-9a-f]{32}$/i.test(raw.salt) &&
+      typeof raw.hash === 'string' &&
+      /^[0-9a-f]{64}$/i.test(raw.hash);
+    cachedSecurity = {
+      salt: hasHash ? raw.salt : null,
+      hash: hasHash ? raw.hash : null,
+      failedAttempts: raw && Number.isFinite(raw.failedAttempts) ? Math.max(0, raw.failedAttempts) : 0,
+      lockedUntilMs: raw && Number.isFinite(raw.lockedUntilMs) ? Math.max(0, raw.lockedUntilMs) : 0,
+      updatedAt: raw && Number.isFinite(raw.updatedAt) ? raw.updatedAt : 0,
+    };
+    return cachedSecurity;
+  }
+
+  function persistSecurity() {
+    const sec = ensureSecurityLoaded();
+    atomicWriteJson(securityPath, sec);
+  }
+
+  function formatRemainingLock(remainingSec) {
+    const mins = Math.floor(remainingSec / 60);
+    const secs = remainingSec % 60;
+    return mins > 0 ? `${mins} 分 ${secs} 秒` : `${secs} 秒`;
+  }
+
+  function getUnattendedPasswordStatus(nowTs = Date.now()) {
+    const sec = ensureSecurityLoaded();
+    const enabled = Boolean(sec.salt && sec.hash);
+    const locked = enabled && sec.lockedUntilMs > nowTs;
+    const remainingLockSec = locked ? Math.max(1, Math.ceil((sec.lockedUntilMs - nowTs) / 1000)) : 0;
+    return {
+      enabled,
+      locked,
+      lockedUntilMs: locked ? sec.lockedUntilMs : 0,
+      remainingLockSec,
+      failedAttempts: locked ? sec.failedAttempts : (sec.lockedUntilMs > 0 && nowTs >= sec.lockedUntilMs ? 0 : sec.failedAttempts),
+      updatedAt: sec.updatedAt || 0,
+    };
+  }
+
+  function setUnattendedPassword(password) {
+    if (typeof password !== 'string' || password.length < MIN_PASSWORD_LENGTH) {
+      return { ok: false, message: `访问密码长度不能少于 ${MIN_PASSWORD_LENGTH} 位` };
+    }
+    if (password.length > 128) {
+      return { ok: false, message: '访问密码长度不能超过 128 位' };
+    }
+    const saltBuf = crypto.randomBytes(16);
+    const hashBuf = crypto.scryptSync(password, saltBuf, SCRYPT_PARAMS.dkLen, {
+      N: SCRYPT_PARAMS.N,
+      r: SCRYPT_PARAMS.r,
+      p: SCRYPT_PARAMS.p,
+    });
+    cachedSecurity = {
+      salt: saltBuf.toString('hex'),
+      hash: hashBuf.toString('hex'),
+      failedAttempts: 0,
+      lockedUntilMs: 0,
+      updatedAt: Date.now(),
+    };
+    persistSecurity();
+    pendingChallenges.clear();
+    return { ok: true, status: getUnattendedPasswordStatus() };
+  }
+
+  function clearUnattendedPassword() {
+    cachedSecurity = {
+      salt: null,
+      hash: null,
+      failedAttempts: 0,
+      lockedUntilMs: 0,
+      updatedAt: Date.now(),
+    };
+    persistSecurity();
+    pendingChallenges.clear();
+    return { ok: true, status: getUnattendedPasswordStatus() };
+  }
+
+  function createPasswordChallenge({ challengeId, nowTs = Date.now() } = {}) {
+    const sec = ensureSecurityLoaded();
+    if (!sec.salt || !sec.hash) {
+      return {
+        ok: false,
+        code: 'PASSWORD_DISABLED',
+        message: '目标电脑未开启无人值守访问密码',
+      };
+    }
+    if (sec.lockedUntilMs > nowTs) {
+      const remainingSec = Math.max(1, Math.ceil((sec.lockedUntilMs - nowTs) / 1000));
+      return {
+        ok: false,
+        code: 'PASSWORD_LOCKED',
+        lockedUntilMs: sec.lockedUntilMs,
+        remainingSec,
+        message: `访问密码错误次数过多，已锁定，请 ${formatRemainingLock(remainingSec)}后再试`,
+      };
+    }
+    if (sec.lockedUntilMs > 0 && nowTs >= sec.lockedUntilMs) {
+      sec.failedAttempts = 0;
+      sec.lockedUntilMs = 0;
+      persistSecurity();
+    }
+    for (const [cid, entry] of pendingChallenges.entries()) {
+      if (entry.expiresAt <= nowTs) pendingChallenges.delete(cid);
+    }
+    while (pendingChallenges.size >= MAX_ACTIVE_CHALLENGES) {
+      const oldest = pendingChallenges.keys().next().value;
+      if (oldest !== undefined) pendingChallenges.delete(oldest);
+      else break;
+    }
+    const id = typeof challengeId === 'string' && challengeId.length > 0 ? challengeId : crypto.randomUUID();
+    const nonce = crypto.randomBytes(24).toString('hex');
+    pendingChallenges.set(id, {
+      nonce,
+      expiresAt: nowTs + CHALLENGE_TTL_MS,
+    });
+    return {
+      ok: true,
+      challengeId: id,
+      nonce,
+      salt: sec.salt,
+      kdf: 'scrypt',
+      n: SCRYPT_PARAMS.N,
+      r: SCRYPT_PARAMS.r,
+      p: SCRYPT_PARAMS.p,
+      dkLen: SCRYPT_PARAMS.dkLen,
+    };
+  }
+
+  function verifyPasswordChallenge({
+    challengeId,
+    proof,
+    deviceLabel = '远程移动设备',
+    platformHint = 'Mobile',
+    ipMasked = 'WAN',
+    nowTs = Date.now(),
+  } = {}) {
+    const id = typeof challengeId === 'string' ? challengeId : '';
+    const challenge = pendingChallenges.get(id);
+    // Single-use nonce: always consume immediately regardless of pass/fail
+    if (id) pendingChallenges.delete(id);
+
+    const sec = ensureSecurityLoaded();
+    if (!sec.salt || !sec.hash) {
+      return {
+        ok: false,
+        code: 'PASSWORD_DISABLED',
+        message: '目标电脑未开启无人值守访问密码',
+      };
+    }
+    if (sec.lockedUntilMs > nowTs) {
+      const remainingSec = Math.max(1, Math.ceil((sec.lockedUntilMs - nowTs) / 1000));
+      return {
+        ok: false,
+        code: 'PASSWORD_LOCKED',
+        lockedUntilMs: sec.lockedUntilMs,
+        remainingSec,
+        message: `访问密码错误次数过多，已锁定，请 ${formatRemainingLock(remainingSec)}后再试`,
+      };
+    }
+    if (!challenge || challenge.expiresAt <= nowTs) {
+      return {
+        ok: false,
+        code: 'CHALLENGE_EXPIRED',
+        message: '密码验证挑战已过期，请重试',
+      };
+    }
+
+    const identity = getOrCreateHostIdentity();
+    const expected = crypto
+      .createHmac('sha256', Buffer.from(sec.hash, 'hex'))
+      .update(`airdesk-pw-v1:${identity.hostId}:${id}:${challenge.nonce}`)
+      .digest();
+    const proofBuf =
+      typeof proof === 'string' && /^[0-9a-f]{64}$/i.test(proof)
+        ? Buffer.from(proof, 'hex')
+        : null;
+
+    if (proofBuf && proofBuf.length === expected.length && crypto.timingSafeEqual(proofBuf, expected)) {
+      sec.failedAttempts = 0;
+      sec.lockedUntilMs = 0;
+      persistSecurity();
+      const issued = issueToken({
+        mode: 'full_control',
+        deviceLabel,
+        platformHint,
+        ipMasked,
+        source: 'relay',
+      });
+      return {
+        ok: true,
+        sessionToken: issued.sessionToken,
+        mode: 'full_control',
+      };
+    }
+
+    if (sec.lockedUntilMs > 0 && nowTs >= sec.lockedUntilMs) {
+      sec.failedAttempts = 0;
+      sec.lockedUntilMs = 0;
+    }
+    sec.failedAttempts = (sec.failedAttempts || 0) + 1;
+    if (sec.failedAttempts >= MAX_PASSWORD_ATTEMPTS) {
+      sec.lockedUntilMs = nowTs + PASSWORD_LOCK_DURATION_MS;
+      persistSecurity();
+      const remainingSec = Math.ceil(PASSWORD_LOCK_DURATION_MS / 1000);
+      return {
+        ok: false,
+        code: 'PASSWORD_LOCKED',
+        lockedUntilMs: sec.lockedUntilMs,
+        remainingSec,
+        message: `访问密码连续错误 ${MAX_PASSWORD_ATTEMPTS} 次，已锁定 5 分钟`,
+      };
+    }
+    persistSecurity();
+    const remainingAttempts = MAX_PASSWORD_ATTEMPTS - sec.failedAttempts;
+    return {
+      ok: false,
+      code: 'PASSWORD_INVALID',
+      remainingAttempts,
+      message: `访问密码错误（还剩 ${remainingAttempts} 次机会）`,
+    };
+  }
+
   return {
     TRUST_TTL_OPTIONS,
     getOrCreateHostIdentity,
@@ -318,6 +566,11 @@ function createTrustStore({ userDataDir, onTrustedDevicesChanged } = {}) {
     listTrustedDevices,
     revokeToken,
     revokeAllTokens,
+    getUnattendedPasswordStatus,
+    setUnattendedPassword,
+    clearUnattendedPassword,
+    createPasswordChallenge,
+    verifyPasswordChallenge,
   };
 }
 

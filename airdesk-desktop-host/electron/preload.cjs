@@ -117,6 +117,22 @@ const airdeskAPI = Object.freeze({
       'airdesk:update-relay-token-mode',
       opts && typeof opts === 'object' ? opts : {}
     ),
+  getUnattendedPasswordStatus: () =>
+    ipcRenderer.invoke('airdesk:get-unattended-password-status'),
+  setUnattendedPassword: (password) =>
+    ipcRenderer.invoke('airdesk:set-unattended-password', String(password || '')),
+  clearUnattendedPassword: () =>
+    ipcRenderer.invoke('airdesk:clear-unattended-password'),
+  createPasswordChallenge: (opts) =>
+    ipcRenderer.invoke(
+      'airdesk:create-password-challenge',
+      opts && typeof opts === 'object' ? opts : {}
+    ),
+  verifyPasswordChallenge: (opts) =>
+    ipcRenderer.invoke(
+      'airdesk:verify-password-challenge',
+      opts && typeof opts === 'object' ? opts : {}
+    ),
   generateQrDataUrl: (text) => {
     if (typeof text !== 'string' || text.length > 512) {
       return Promise.resolve({ dataUrl: '' });

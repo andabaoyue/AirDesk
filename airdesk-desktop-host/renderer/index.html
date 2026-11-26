@@ -229,6 +229,11 @@
             <div id="pairCode" class="code">------</div>
             <button id="btnCopyCode" type="button" class="secondary sm">复制配对码</button>
           </div>
+          <div id="hostIdRow" class="row" style="margin-top:0; margin-bottom:6px;">
+            <span class="mono">本机持久化主机 ID：</span>
+            <span id="hostIdText" class="hk-key">------------</span>
+            <button id="btnCopyHostId" type="button" class="secondary sm">复制主机 ID</button>
+          </div>
           <div id="qrLinkText" class="mono" style="word-break: break-all;">启动串流后将生成直连地址与二维码</div>
           <div id="tailscaleLinkRow" class="row" style="display:none;">
             <span id="tailscaleLinkText" class="mono" style="color:#34D399; word-break:break-all;"></span>
@@ -413,6 +418,21 @@
           </div>
         </div>
         <div id="trustedDevicesList" class="mono">暂无已信任设备</div>
+      </div>
+
+      <div class="card">
+        <div class="card-head">
+          <div class="card-title">无人值守固定访问密码（默认关闭 · 仅本机 scrypt 校验）</div>
+          <span id="unattendedPwBadge" class="pill"><span class="pill-dot"></span><span>未启用</span></span>
+        </div>
+        <div class="mono" style="margin-bottom:8px; line-height:1.5;">
+          配合「本机持久化主机 ID」使用，作为手机换机/清缓存后的兜底接入方式；连续 5 次输错自动锁定 5 分钟。
+        </div>
+        <div class="row" style="margin-top:0;">
+          <input id="unattendedPwInput" type="password" style="flex:1; min-width:180px; background:#080C13; color:var(--text); border:1px solid #2A374C; border-radius:9px; padding:8px 11px; font-size:12.5px; outline:none;" placeholder="设置至少 6 位固定访问密码" />
+          <button id="btnSetUnattendedPw" type="button" class="sm">设置 / 更新密码</button>
+          <button id="btnClearUnattendedPw" type="button" class="danger sm" style="display:none;">清除密码</button>
+        </div>
       </div>
 
       <div class="card">

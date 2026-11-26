@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import crypto from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import { createRequire } from 'node:module';
@@ -398,13 +399,31 @@ execFileSync(process.execPath, ['--input-type=module', '--check'], {
       },
     });
     const id1 = store1.getOrCreateHostIdentity();
-    assert.match(id1.hostId, /^\d{9}$/);
+    assert.match(id1.hostId, /^[0-9a-z]{12}$/);
     assert.ok(id1.hostSecret.length >= 32);
 
     // Reloading from disk preserves exact same hostId & hostSecret
     const store2 = createTrustStore({ userDataDir: tmpUserData });
     const id2 = store2.getOrCreateHostIdentity();
     assert.deepEqual(id2, id1);
+
+    // Backward compatibility: legacy 9-digit hostId persisted on disk is preserved as-is
+    const legacyDir = fs.mkdtempSync(path.join(os.tmpdir(), 'airdesk-legacy-id-'));
+    try {
+      fs.writeFileSync(
+        path.join(legacyDir, 'host-identity.json'),
+        JSON.stringify({
+          hostId: '482910537',
+          hostSecret: 'a'.repeat(64),
+          createdAt: 1700000000000,
+        }),
+        'utf8'
+      );
+      const legacyStore = createTrustStore({ userDataDir: legacyDir });
+      assert.equal(legacyStore.getOrCreateHostIdentity().hostId, '482910537');
+    } finally {
+      fs.rmSync(legacyDir, { recursive: true, force: true });
+    }
 
     // Default TTL is 7d; can switch to 30d and never
     assert.equal(store1.getHostSettings().trustTtlOption, '7d');
@@ -445,6 +464,97 @@ execFileSync(process.execPath, ['--input-type=module', '--check'], {
     assert.equal(revoked.length, 1);
     assert.equal(store3.verifyAndTouchToken(issued7d.sessionToken).ok, false);
     assert.equal(store3.listTrustedDevices().length, 0);
+
+    // 5. Unattended fixed access password: min length, scrypt challenge-response, single-use nonce & 5-attempt lockout
+    assert.equal(store3.getUnattendedPasswordStatus().enabled, false);
+    assert.equal(store3.createPasswordChallenge({ challengeId: 'c0' }).code, 'PASSWORD_DISABLED');
+    assert.equal(store3.setUnattendedPassword('12345').ok, false);
+
+    const testPw = 'AirDesk@2026!中文';
+    assert.equal(store3.setUnattendedPassword(testPw).ok, true);
+    assert.equal(store3.getUnattendedPasswordStatus().enabled, true);
+
+    const chal1 = store3.createPasswordChallenge({ challengeId: 'c1', nowTs: 10000 });
+    assert.equal(chal1.ok, true);
+    assert.equal(chal1.kdf, 'scrypt');
+    assert.ok(chal1.nonce.length >= 32);
+
+    const dk = crypto.scryptSync(testPw, Buffer.from(chal1.salt, 'hex'), chal1.dkLen, {
+      N: chal1.n,
+      r: chal1.r,
+      p: chal1.p,
+    });
+    const goodProof = crypto
+      .createHmac('sha256', dk)
+      .update(`airdesk-pw-v1:${id1.hostId}:c1:${chal1.nonce}`)
+      .digest('hex');
+
+    const okVerify = store3.verifyPasswordChallenge({
+      challengeId: 'c1',
+      proof: goodProof,
+      deviceLabel: 'Test Phone',
+      platformHint: 'Android App',
+      ipMasked: '1.2.3.4',
+      nowTs: 11000,
+    });
+    assert.equal(okVerify.ok, true);
+    assert.equal(okVerify.mode, 'full_control');
+    assert.ok(okVerify.sessionToken.length >= 16);
+
+    // Replay of same challengeId/nonce must fail (single-use nonce)
+    const replayVerify = store3.verifyPasswordChallenge({
+      challengeId: 'c1',
+      proof: goodProof,
+      nowTs: 12000,
+    });
+    assert.equal(replayVerify.ok, false);
+    assert.equal(replayVerify.code, 'CHALLENGE_EXPIRED');
+
+    // Failed verification also consumes nonce and triggers 5-attempt lockout for 5 minutes
+    for (let attempt = 1; attempt <= 5; attempt += 1) {
+      const cid = `bad-${attempt}`;
+      const ch = store3.createPasswordChallenge({ challengeId: cid, nowTs: 20000 + attempt * 100 });
+      assert.equal(ch.ok, true);
+      const res = store3.verifyPasswordChallenge({
+        challengeId: cid,
+        proof: '00'.repeat(32),
+        nowTs: 20050 + attempt * 100,
+      });
+      assert.equal(res.ok, false);
+      if (attempt < 5) {
+        assert.equal(res.code, 'PASSWORD_INVALID');
+        assert.equal(res.remainingAttempts, 5 - attempt);
+      } else {
+        assert.equal(res.code, 'PASSWORD_LOCKED');
+      }
+      // Same nonce cannot be reused even after failure
+      const reuseBad = store3.verifyPasswordChallenge({
+        challengeId: cid,
+        proof: '00'.repeat(32),
+        nowTs: 20060 + attempt * 100,
+      });
+      assert.equal(reuseBad.ok, false);
+    }
+
+    const lockedUntil = store3.getUnattendedPasswordStatus(21000).lockedUntilMs;
+    assert.ok(lockedUntil > 21000);
+    // Attempts during lockout must NOT extend lockedUntilMs
+    const lockedChal = store3.createPasswordChallenge({ challengeId: 'c-locked', nowTs: 60000 });
+    assert.equal(lockedChal.ok, false);
+    assert.equal(lockedChal.code, 'PASSWORD_LOCKED');
+    assert.equal(store3.getUnattendedPasswordStatus(60000).lockedUntilMs, lockedUntil);
+
+    // Lockout persists across store reload and clears after 5 minutes
+    const store4 = createTrustStore({ userDataDir: tmpUserData });
+    assert.equal(store4.getUnattendedPasswordStatus(60000).locked, true);
+    const unlockedAfter = store4.createPasswordChallenge({
+      challengeId: 'c-after-lock',
+      nowTs: lockedUntil + 1000,
+    });
+    assert.equal(unlockedAfter.ok, true);
+
+    assert.equal(store4.clearUnattendedPassword().ok, true);
+    assert.equal(store4.getUnattendedPasswordStatus().enabled, false);
   } finally {
     fs.rmSync(tmpUserData, { recursive: true, force: true });
   }

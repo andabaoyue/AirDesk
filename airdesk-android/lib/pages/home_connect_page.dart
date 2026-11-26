@@ -30,6 +30,8 @@ class _HomeConnectPageState extends State<HomeConnectPage> {
   final _pinCtrl = TextEditingController();
   final _relayUrlCtrl = TextEditingController();
   final _relayPinCtrl = TextEditingController();
+  final _relayHostIdCtrl = TextEditingController();
+  final _relayPasswordCtrl = TextEditingController();
   final _customIceCtrl = TextEditingController();
 
   List<AirDeskHostInfo> _discovered = [];
@@ -42,6 +44,7 @@ class _HomeConnectPageState extends State<HomeConnectPage> {
   bool _allowOverlayTun = false;
   bool _preferHevc = false;
   bool _relayHasToken = false;
+  bool _relayUsePasswordAuth = false;
   bool _showRelayIceAdvanced = false;
   String? _localTailscaleIp;
   List<String> _overlayIps = [];
@@ -63,6 +66,8 @@ class _HomeConnectPageState extends State<HomeConnectPage> {
     _pinCtrl.dispose();
     _relayUrlCtrl.dispose();
     _relayPinCtrl.dispose();
+    _relayHostIdCtrl.dispose();
+    _relayPasswordCtrl.dispose();
     _customIceCtrl.dispose();
     super.dispose();
   }
@@ -84,9 +89,11 @@ class _HomeConnectPageState extends State<HomeConnectPage> {
       tokMap['${r.ip}:${r.port}'] = t != null && t.isNotEmpty;
     }
     var relayTok = false;
+    String? savedRelayHostId;
     if (savedRelay.isNotEmpty) {
       final rk = WebRtcSessionService.tokenKeyForEndpoint(signalingUrl: savedRelay);
       final rt = await widget.storage.getTokenForKey(rk);
+      savedRelayHostId = await widget.storage.getHostIdForKey(rk);
       relayTok = rt != null && rt.isNotEmpty;
     }
     if (!mounted) return;
@@ -103,6 +110,9 @@ class _HomeConnectPageState extends State<HomeConnectPage> {
       _relayHasToken = relayTok;
       if (savedRelay.isNotEmpty && _relayUrlCtrl.text.isEmpty) {
         _relayUrlCtrl.text = savedRelay;
+      }
+      if (savedRelayHostId != null && savedRelayHostId.isNotEmpty && _relayHostIdCtrl.text.isEmpty) {
+        _relayHostIdCtrl.text = savedRelayHostId;
       }
       if (savedCustomIce.isNotEmpty && _customIceCtrl.text.isEmpty) {
         _customIceCtrl.text = savedCustomIce;
@@ -628,8 +638,14 @@ class _HomeConnectPageState extends State<HomeConnectPage> {
     }
     final rk = WebRtcSessionService.tokenKeyForEndpoint(signalingUrl: clean);
     final tok = await widget.storage.getTokenForKey(rk);
+    final hid = await widget.storage.getHostIdForKey(rk);
     if (mounted) {
-      setState(() => _relayHasToken = tok != null && tok.isNotEmpty);
+      setState(() {
+        _relayHasToken = tok != null && tok.isNotEmpty;
+        if (hid != null && hid.isNotEmpty && _relayHostIdCtrl.text.isEmpty) {
+          _relayHostIdCtrl.text = hid;
+        }
+      });
     }
   }
 
@@ -666,6 +682,26 @@ class _HomeConnectPageState extends State<HomeConnectPage> {
     final customIce = _customIceCtrl.text.trim();
     await widget.storage.setRemoteRelayUrl(relayUrl);
     await widget.storage.setCustomIceUrl(customIce);
+
+    if (!tryToken && _relayUsePasswordAuth) {
+      final inputHostId = _relayHostIdCtrl.text.trim();
+      final inputPassword = _relayPasswordCtrl.text;
+      if (!RegExp(r'^[a-zA-Z0-9_-]{6,32}$').hasMatch(inputHostId)) {
+        _showSnack('请输入有效的电脑端主机 ID（6~32 位字母或数字）');
+        return;
+      }
+      if (inputPassword.length < 6) {
+        _showSnack('请输入至少 6 位无人值守访问密码');
+        return;
+      }
+      await widget.session.connect(
+        signalingUrl: relayUrl,
+        customIceRaw: customIce.isEmpty ? null : customIce,
+        hostId: inputHostId,
+        password: inputPassword,
+      );
+      return;
+    }
 
     String? token;
     String? hostId;
@@ -1680,37 +1716,71 @@ class _HomeConnectPageState extends State<HomeConnectPage> {
             style: TextStyle(fontSize: 11.5, color: Color(0xFF94A3B8)),
           ),
           const SizedBox(height: 10),
+          TextField(
+            controller: _relayUrlCtrl,
+            decoration: const InputDecoration(
+              labelText: '公网信令地址（https://...）',
+              border: OutlineInputBorder(),
+              isDense: true,
+            ),
+            onChanged: _parseRelayInput,
+          ),
+          const SizedBox(height: 10),
           Row(
             children: [
-              Expanded(
-                flex: 3,
-                child: TextField(
-                  controller: _relayUrlCtrl,
-                  decoration: const InputDecoration(
-                    labelText: '公网信令地址（https://...）',
-                    border: OutlineInputBorder(),
-                    isDense: true,
-                  ),
-                  onChanged: _parseRelayInput,
-                ),
+              ChoiceChip(
+                label: const Text('6 位临时配对码', style: TextStyle(fontSize: 11.5)),
+                selected: !_relayUsePasswordAuth,
+                onSelected: busy ? null : (_) => setState(() => _relayUsePasswordAuth = false),
               ),
               const SizedBox(width: 8),
-              Expanded(
-                flex: 2,
-                child: TextField(
-                  controller: _relayPinCtrl,
-                  keyboardType: TextInputType.number,
-                  maxLength: 6,
-                  decoration: const InputDecoration(
-                    labelText: '6 位配对码',
-                    counterText: '',
-                    border: OutlineInputBorder(),
-                    isDense: true,
-                  ),
-                ),
+              ChoiceChip(
+                label: const Text('主机 ID + 固定密码', style: TextStyle(fontSize: 11.5)),
+                selected: _relayUsePasswordAuth,
+                onSelected: busy ? null : (_) => setState(() => _relayUsePasswordAuth = true),
               ),
             ],
           ),
+          const SizedBox(height: 10),
+          if (!_relayUsePasswordAuth)
+            TextField(
+              controller: _relayPinCtrl,
+              keyboardType: TextInputType.number,
+              maxLength: 6,
+              decoration: const InputDecoration(
+                labelText: '6 位配对码',
+                counterText: '',
+                border: OutlineInputBorder(),
+                isDense: true,
+              ),
+            )
+          else
+            Row(
+              children: [
+                Expanded(
+                  child: TextField(
+                    controller: _relayHostIdCtrl,
+                    decoration: const InputDecoration(
+                      labelText: '电脑主机 ID',
+                      border: OutlineInputBorder(),
+                      isDense: true,
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: TextField(
+                    controller: _relayPasswordCtrl,
+                    obscureText: true,
+                    decoration: const InputDecoration(
+                      labelText: '无人值守访问密码',
+                      border: OutlineInputBorder(),
+                      isDense: true,
+                    ),
+                  ),
+                ),
+              ],
+            ),
           if (_showRelayIceAdvanced) ...[
             const SizedBox(height: 10),
             TextField(
@@ -1723,18 +1793,42 @@ class _HomeConnectPageState extends State<HomeConnectPage> {
             ),
           ],
           const SizedBox(height: 12),
-          SizedBox(
-            width: double.infinity,
-            height: 44,
-            child: FilledButton.icon(
-              style: FilledButton.styleFrom(
-                backgroundColor: _relayHasToken ? const Color(0xFF059669) : const Color(0xFF2563EB),
+          if (_relayHasToken) ...[
+            SizedBox(
+              width: double.infinity,
+              height: 44,
+              child: FilledButton.icon(
+                style: FilledButton.styleFrom(
+                  backgroundColor: const Color(0xFF059669),
+                ),
+                onPressed: busy ? null : () => _connectRelay(tryToken: true),
+                icon: const Icon(Icons.public_rounded, size: 18),
+                label: const Text('公网中继免密秒连'),
               ),
-              onPressed: busy ? null : () => _connectRelay(tryToken: true),
-              icon: const Icon(Icons.public_rounded, size: 18),
-              label: Text(_relayHasToken ? '公网中继免密秒连' : '通过公网中继连接'),
             ),
-          ),
+            const SizedBox(height: 8),
+            SizedBox(
+              width: double.infinity,
+              height: 40,
+              child: OutlinedButton.icon(
+                onPressed: busy ? null : () => _connectRelay(tryToken: false),
+                icon: Icon(_relayUsePasswordAuth ? Icons.key_rounded : Icons.pin_rounded, size: 17),
+                label: Text(_relayUsePasswordAuth ? '改用主机 ID + 密码验证连接' : '改用 6 位配对码连接'),
+              ),
+            ),
+          ] else
+            SizedBox(
+              width: double.infinity,
+              height: 44,
+              child: FilledButton.icon(
+                style: FilledButton.styleFrom(
+                  backgroundColor: const Color(0xFF2563EB),
+                ),
+                onPressed: busy ? null : () => _connectRelay(tryToken: false),
+                icon: Icon(_relayUsePasswordAuth ? Icons.key_rounded : Icons.public_rounded, size: 18),
+                label: Text(_relayUsePasswordAuth ? '通过主机 ID + 密码连接' : '通过公网中继连接'),
+              ),
+            ),
         ],
       ),
     );

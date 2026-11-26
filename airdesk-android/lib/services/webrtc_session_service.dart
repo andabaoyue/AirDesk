@@ -6,6 +6,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 import '../models/airdesk_models.dart';
 import 'native_bridge.dart';
+import 'scrypt_helper.dart';
 import 'storage_service.dart';
 
 enum SessionPhase {
@@ -102,6 +103,14 @@ class WebRtcSessionService extends ChangeNotifier {
   String? _activeSignalingUrl;
   String? _activeHostId;
   String? _activeCustomIceRaw;
+  String? _pendingAuthPassword;
+  Timer? _iceRestartTimer;
+  Timer? _iceRestartWatchdogTimer;
+  int _iceRestartAttempts = 0;
+  bool _iceRestartInFlight = false;
+  static const int _maxIceRestartAttempts = 2;
+  static const Duration _iceDisconnectRestartDelay = Duration(milliseconds: 2000);
+  static const Duration _iceRestartWatchdogDelay = Duration(milliseconds: 6000);
   List<Map<String, dynamic>> _activeIceServers = const [];
 
   SessionPhase phase = SessionPhase.idle;
@@ -242,6 +251,7 @@ class WebRtcSessionService extends ChangeNotifier {
     String? pinCode,
     String? sessionToken,
     String? hostId,
+    String? authMode,
   }) {
     final payload = <String, dynamic>{
       'type': 'client:join',
@@ -251,7 +261,10 @@ class WebRtcSessionService extends ChangeNotifier {
     };
     final cleanToken = sessionToken?.trim() ?? '';
     final cleanHostId = hostId?.trim() ?? '';
-    if (cleanToken.isNotEmpty) {
+    if (authMode == 'password' && cleanHostId.isNotEmpty) {
+      payload['authMode'] = 'password';
+      payload['hostId'] = cleanHostId;
+    } else if (cleanToken.isNotEmpty) {
       payload['sessionToken'] = cleanToken;
       if (cleanHostId.isNotEmpty) {
         payload['hostId'] = cleanHostId;
@@ -270,6 +283,7 @@ class WebRtcSessionService extends ChangeNotifier {
     String? pinCode,
     String? sessionToken,
     String? hostId,
+    String? password,
     List<String> iceStunUrls = const [],
   }) async {
     await ensureRendererReady();
@@ -291,6 +305,7 @@ class WebRtcSessionService extends ChangeNotifier {
     _activeSignalingUrl = isRelayMode ? relayUrl : null;
     _activeHostId = hostId?.trim();
     _activeCustomIceRaw = customIceRaw?.trim();
+    _pendingAuthPassword = (password != null && password.isNotEmpty) ? password : null;
 
     final isOverlay = !isRelayMode && isOverlayHost(cleanHostIp);
 
@@ -344,6 +359,12 @@ class WebRtcSessionService extends ChangeNotifier {
       });
     }
 
+    final usePasswordAuth = isRelayMode &&
+        _pendingAuthPassword != null &&
+        _pendingAuthPassword!.isNotEmpty &&
+        hostId != null &&
+        hostId.trim().isNotEmpty;
+
     sock.listen(
       (raw) {
         if (_ws != sock || _wsGen != myWsGen) return;
@@ -356,12 +377,15 @@ class WebRtcSessionService extends ChangeNotifier {
           isRelayMode: isRelayMode,
           customIceRaw: customIceRaw,
           hadToken: sessionToken != null,
+          sock: sock,
+          wsGen: myWsGen,
         );
       },
       onError: (err) {
         if (_ws != sock || _wsGen != myWsGen) return;
         _wsHeartbeatTimer?.cancel();
         _wsHeartbeatTimer = null;
+        _pendingAuthPassword = null;
         if (!_manualDisconnect) {
           _setPhase(SessionPhase.error, '信令连接异常：$err');
         }
@@ -370,6 +394,7 @@ class WebRtcSessionService extends ChangeNotifier {
         if (_ws != sock || _wsGen != myWsGen) return;
         _wsHeartbeatTimer?.cancel();
         _wsHeartbeatTimer = null;
+        _pendingAuthPassword = null;
         if (!_manualDisconnect && phase != SessionPhase.error) {
           _cleanupRtc();
           _setPhase(SessionPhase.disconnected, '信令连接已断开');
@@ -380,8 +405,9 @@ class WebRtcSessionService extends ChangeNotifier {
     final joinPayload = buildClientJoinPayload(
       deviceLabel: deviceLabel,
       pinCode: pinCode,
-      sessionToken: sessionToken,
+      sessionToken: usePasswordAuth ? null : sessionToken,
       hostId: isRelayMode ? hostId : null,
+      authMode: usePasswordAuth ? 'password' : null,
     );
     _sendWs(joinPayload);
   }
@@ -428,6 +454,8 @@ class WebRtcSessionService extends ChangeNotifier {
     required bool isRelayMode,
     String? customIceRaw,
     required bool hadToken,
+    required WebSocket sock,
+    required int wsGen,
   }) async {
     Map<String, dynamic> msg;
     try {
@@ -439,10 +467,40 @@ class WebRtcSessionService extends ChangeNotifier {
     final type = (msg['type'] ?? '').toString();
     if (type == 'ws:pong') {
       return;
+    } else if (type == 'client:password_challenge') {
+      final pw = _pendingAuthPassword;
+      _pendingAuthPassword = null;
+      final challengeId = (msg['challengeId'] ?? '').toString();
+      final nonce = (msg['nonce'] ?? '').toString();
+      final saltHex = (msg['salt'] ?? '').toString();
+      final chalHostId = (msg['hostId'] ?? _activeHostId ?? '').toString();
+      if (pw == null || pw.isEmpty || challengeId.isEmpty || nonce.isEmpty || saltHex.isEmpty) {
+        _setPhase(SessionPhase.error, '访问密码验证参数缺失');
+        return;
+      }
+      _setPhase(SessionPhase.waitingApproval, '正在进行安全密码验证...');
+      final proof = await ScryptHelper.computeChallengeProofAsync(
+        password: pw,
+        saltHex: saltHex,
+        hostId: chalHostId,
+        challengeId: challengeId,
+        nonce: nonce,
+        n: (msg['n'] as num?)?.toInt() ?? 16384,
+        r: (msg['r'] as num?)?.toInt() ?? 8,
+        p: (msg['p'] as num?)?.toInt() ?? 1,
+        dkLen: (msg['dkLen'] as num?)?.toInt() ?? 32,
+      );
+      if (_manualDisconnect || _ws != sock || _wsGen != wsGen) return;
+      _sendWs({
+        'type': 'client:password_response',
+        'challengeId': challengeId,
+        'proof': proof,
+      });
     } else if (type == 'client:waiting_approval') {
       hostLabel = (msg['hostLabel'] ?? (isRelayMode ? '远程电脑' : hostIp)).toString();
       _setPhase(SessionPhase.waitingApproval, '等待电脑审批（可在电脑按 Ctrl+Alt+Y 批准）...');
     } else if (type == 'client:rejected' || type == 'error') {
+      _pendingAuthPassword = null;
       if (shouldClearSavedTokenOnError(type, msg, hadToken: hadToken)) {
         await storage.removeTokenForKey(tokenKey);
         await storage.removeHostIdForKey(tokenKey);
@@ -450,6 +508,7 @@ class WebRtcSessionService extends ChangeNotifier {
       final reason = (msg['reason'] ?? msg['message'] ?? '连接被拒绝').toString();
       _setPhase(SessionPhase.error, reason);
     } else if (type == 'client:approved') {
+      _pendingAuthPassword = null;
       hostLabel = (msg['hostLabel'] ?? (isRelayMode ? '远程电脑' : hostIp)).toString();
       controlEnabled = msg['mode'] == 'full_control';
       hostAudioEnabled = msg['audioEnabled'] == true;
@@ -544,6 +603,12 @@ class WebRtcSessionService extends ChangeNotifier {
       if (isStale()) return;
       if (state == RTCIceConnectionState.RTCIceConnectionStateConnected ||
           state == RTCIceConnectionState.RTCIceConnectionStateCompleted) {
+        _iceRestartTimer?.cancel();
+        _iceRestartTimer = null;
+        _iceRestartWatchdogTimer?.cancel();
+        _iceRestartWatchdogTimer = null;
+        _iceRestartAttempts = 0;
+        _iceRestartInFlight = false;
         if (phase != SessionPhase.connected) {
           final isRelay = _activeSignalingUrl != null && _activeSignalingUrl!.isNotEmpty;
           final overlayConn = !isRelay && _activeHostIp != null && isOverlayHost(_activeHostIp!);
@@ -554,10 +619,19 @@ class WebRtcSessionService extends ChangeNotifier {
                 : (overlayConn ? '已异地直连 $hostLabel' : '已直连 $hostLabel'),
           );
         }
-      } else if (state == RTCIceConnectionState.RTCIceConnectionStateFailed ||
-          state == RTCIceConnectionState.RTCIceConnectionStateDisconnected) {
-        if (!_manualDisconnect) {
-          _setPhase(SessionPhase.disconnected, '视频通道中断 (${state.name})');
+      } else if (state == RTCIceConnectionState.RTCIceConnectionStateDisconnected) {
+        _iceRestartTimer?.cancel();
+        _iceRestartTimer = Timer(_iceDisconnectRestartDelay, () {
+          _iceRestartTimer = null;
+          if (!isStale()) {
+            unawaited(_tryIceRestart(pc, myRtcGen, reason: 'ice_disconnected'));
+          }
+        });
+      } else if (state == RTCIceConnectionState.RTCIceConnectionStateFailed) {
+        _iceRestartTimer?.cancel();
+        _iceRestartTimer = null;
+        if (!isStale()) {
+          unawaited(_tryIceRestart(pc, myRtcGen, reason: 'ice_failed'));
         }
       }
     };
@@ -720,6 +794,55 @@ class WebRtcSessionService extends ChangeNotifier {
     _diagTimer = Timer.periodic(const Duration(seconds: 2), (_) {
       _collectAndSendRxDiag();
     });
+  }
+
+  Future<void> _tryIceRestart(
+    RTCPeerConnection targetPc,
+    int myRtcGen, {
+    required String reason,
+  }) async {
+    if (_manualDisconnect || _rtcGen != myRtcGen || _pc != targetPc) return;
+    if (_iceRestartInFlight) return;
+
+    final wsReady = _ws != null && _ws!.readyState == WebSocket.open;
+    if (!wsReady || _iceRestartAttempts >= _maxIceRestartAttempts) {
+      _iceRestartWatchdogTimer?.cancel();
+      _iceRestartWatchdogTimer = null;
+      _setPhase(SessionPhase.disconnected, '视频通道中断 ($reason)');
+      if (!_manualDisconnect && (_activeSignalingUrl != null || _activeHostIp != null)) {
+        unawaited(reconnectSaved());
+      }
+      return;
+    }
+
+    _iceRestartInFlight = true;
+    _iceRestartAttempts += 1;
+    try {
+      _emitToast('检测到切网/链路波动，正在无缝刷新通道 ($_iceRestartAttempts/$_maxIceRestartAttempts)...');
+      final preferHevc = await storage.getPreferHevc();
+      if (_manualDisconnect || _rtcGen != myRtcGen || _pc != targetPc) return;
+      final offer = await targetPc.createOffer({'iceRestart': true});
+      if (_manualDisconnect || _rtcGen != myRtcGen || _pc != targetPc) return;
+      final preferredSdp = _prioritizeVideoCodecsInSdp(offer.sdp ?? '', preferHevc: preferHevc);
+      final finalOffer = RTCSessionDescription(preferredSdp, offer.type);
+      await targetPc.setLocalDescription(finalOffer);
+      if (_manualDisconnect || _rtcGen != myRtcGen || _pc != targetPc) return;
+      _sendWs({'type': 'rtc:offer', 'sdp': finalOffer.sdp, 'iceRestart': true});
+
+      _iceRestartWatchdogTimer?.cancel();
+      _iceRestartWatchdogTimer = Timer(_iceRestartWatchdogDelay, () {
+        _iceRestartWatchdogTimer = null;
+        if (_manualDisconnect || _rtcGen != myRtcGen || _pc != targetPc) return;
+        unawaited(_tryIceRestart(targetPc, myRtcGen, reason: 'ice_restart_timeout'));
+      });
+    } catch (_) {
+      if (!_manualDisconnect && _rtcGen == myRtcGen && _pc == targetPc) {
+        _setPhase(SessionPhase.disconnected, '视频通道恢复失败 ($reason)');
+        unawaited(reconnectSaved());
+      }
+    } finally {
+      _iceRestartInFlight = false;
+    }
   }
 
   void _handleDcMessage(String text) {
@@ -1690,6 +1813,12 @@ class WebRtcSessionService extends ChangeNotifier {
   }
 
   Future<void> _cleanupRtc() async {
+    _iceRestartTimer?.cancel();
+    _iceRestartTimer = null;
+    _iceRestartWatchdogTimer?.cancel();
+    _iceRestartWatchdogTimer = null;
+    _iceRestartAttempts = 0;
+    _iceRestartInFlight = false;
     _clearPendingPointer();
     _lastPointerSentAtMs = 0;
     _pingTimer?.cancel();
@@ -1739,6 +1868,7 @@ class WebRtcSessionService extends ChangeNotifier {
 
   Future<void> disconnect({bool silent = false}) async {
     _manualDisconnect = true;
+    _pendingAuthPassword = null;
     _wsGen++;
     _rtcGen++;
     _clearPendingPointer();
