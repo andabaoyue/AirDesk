@@ -3,6 +3,47 @@ import 'dart:isolate';
 import 'dart:typed_data';
 
 class ScryptHelper {
+  static const int minN = 1024;
+  static const int maxN = 65536;
+  static const int minR = 1;
+  static const int maxR = 16;
+  static const int minP = 1;
+  static const int maxP = 4;
+  static const int minDkLen = 16;
+  static const int maxDkLen = 64;
+  static const int maxCost = 65536 * 8;
+
+  static void validateScryptParams({
+    required int n,
+    required int r,
+    required int p,
+    required int dkLen,
+  }) {
+    if (n < minN || n > maxN || (n & (n - 1)) != 0) {
+      throw ArgumentError.value(
+        n,
+        'n',
+        'scrypt N must be a power of 2 between $minN and $maxN',
+      );
+    }
+    if (r < minR || r > maxR) {
+      throw ArgumentError.value(r, 'r', 'scrypt r must be between $minR and $maxR');
+    }
+    if (p < minP || p > maxP) {
+      throw ArgumentError.value(p, 'p', 'scrypt p must be between $minP and $maxP');
+    }
+    if (dkLen < minDkLen || dkLen > maxDkLen) {
+      throw ArgumentError.value(
+        dkLen,
+        'dkLen',
+        'scrypt dkLen must be between $minDkLen and $maxDkLen',
+      );
+    }
+    if (n * r > maxCost) {
+      throw ArgumentError('scrypt work factor n * r (${n * r}) exceeds limit $maxCost');
+    }
+  }
+
   static const List<int> _sha256K = [
     0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
     0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
@@ -262,6 +303,7 @@ class ScryptHelper {
     int p = 1,
     int dkLen = 32,
   }) {
+    validateScryptParams(n: n, r: r, p: p, dkLen: dkLen);
     final blockBytesLen = 128 * r;
     final b = pbkdf2HmacSha256(password, salt, 1, p * blockBytesLen);
     for (int i = 0; i < p; i++) {
@@ -299,6 +341,7 @@ class ScryptHelper {
     int p = 1,
     int dkLen = 32,
   }) {
+    validateScryptParams(n: n, r: r, p: p, dkLen: dkLen);
     final pwBytes = Uint8List.fromList(utf8.encode(password));
     final saltBytes = hexToBytes(saltHex);
     final dk = scrypt(pwBytes, saltBytes, n: n, r: r, p: p, dkLen: dkLen);
@@ -316,7 +359,8 @@ class ScryptHelper {
     int r = 8,
     int p = 1,
     int dkLen = 32,
-  }) {
+  }) async {
+    validateScryptParams(n: n, r: r, p: p, dkLen: dkLen);
     return Isolate.run(
       () => computeChallengeProofSync(
         password: password,

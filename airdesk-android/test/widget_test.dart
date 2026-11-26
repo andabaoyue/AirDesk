@@ -129,4 +129,120 @@ void main() {
       isFalse,
     );
   });
+
+  test('ScryptHelper rejects out-of-bounds KDF parameters before allocation', () async {
+    // Valid boundary combinations
+    expect(
+      () => ScryptHelper.validateScryptParams(n: 1024, r: 1, p: 1, dkLen: 16),
+      returnsNormally,
+    );
+    expect(
+      () => ScryptHelper.validateScryptParams(n: 65536, r: 8, p: 4, dkLen: 64),
+      returnsNormally,
+    );
+
+    final pw = Uint8List.fromList(utf8.encode('secret'));
+    final salt = Uint8List.fromList(utf8.encode('0123456789abcdef'));
+
+    final invalidCases = <({int n, int r, int p, int dkLen})>[
+      // n out of bounds or not power of 2
+      (n: 512, r: 8, p: 1, dkLen: 32),
+      (n: 0, r: 8, p: 1, dkLen: 32),
+      (n: -16384, r: 8, p: 1, dkLen: 32),
+      (n: 131072, r: 1, p: 1, dkLen: 32),
+      (n: 1 << 24, r: 8, p: 1, dkLen: 32),
+      (n: 3000, r: 8, p: 1, dkLen: 32),
+      (n: 16385, r: 8, p: 1, dkLen: 32),
+      // r out of bounds
+      (n: 16384, r: 0, p: 1, dkLen: 32),
+      (n: 1024, r: 17, p: 1, dkLen: 32),
+      (n: 1024, r: 1024, p: 1, dkLen: 32),
+      // p out of bounds
+      (n: 16384, r: 8, p: 0, dkLen: 32),
+      (n: 16384, r: 8, p: 5, dkLen: 32),
+      // dkLen out of bounds
+      (n: 16384, r: 8, p: 1, dkLen: 15),
+      (n: 16384, r: 8, p: 1, dkLen: 0),
+      (n: 16384, r: 8, p: 1, dkLen: 65),
+      (n: 16384, r: 8, p: 1, dkLen: 1 << 20),
+      // n * r exceeds maxCost (65536 * 8)
+      (n: 65536, r: 16, p: 1, dkLen: 32),
+    ];
+
+    for (final c in invalidCases) {
+      expect(
+        () => ScryptHelper.validateScryptParams(n: c.n, r: c.r, p: c.p, dkLen: c.dkLen),
+        throwsArgumentError,
+      );
+      expect(
+        () => ScryptHelper.scrypt(pw, salt, n: c.n, r: c.r, p: c.p, dkLen: c.dkLen),
+        throwsArgumentError,
+      );
+      expect(
+        () => ScryptHelper.computeChallengeProofSync(
+          password: 'secret',
+          saltHex: '00112233445566778899aabbccddeeff',
+          hostId: 'host-1',
+          challengeId: 'chal-1',
+          nonce: 'nonce-1',
+          n: c.n,
+          r: c.r,
+          p: c.p,
+          dkLen: c.dkLen,
+        ),
+        throwsArgumentError,
+      );
+      await expectLater(
+        ScryptHelper.computeChallengeProofAsync(
+          password: 'secret',
+          saltHex: '00112233445566778899aabbccddeeff',
+          hostId: 'host-1',
+          challengeId: 'chal-1',
+          nonce: 'nonce-1',
+          n: c.n,
+          r: c.r,
+          p: c.p,
+          dkLen: c.dkLen,
+        ),
+        throwsArgumentError,
+      );
+    }
+  });
+
+  test('WebRtcSessionService validates relay password_challenge KDF parameters', () {
+    expect(
+      WebRtcSessionService.parseAndValidateChallengeKdfParams({}),
+      (n: 16384, r: 8, p: 1, dkLen: 32),
+    );
+    expect(
+      WebRtcSessionService.parseAndValidateChallengeKdfParams({
+        'kdf': 'scrypt',
+        'n': 32768.0,
+        'r': 8,
+        'p': 2,
+        'dkLen': 64,
+      }),
+      (n: 32768, r: 8, p: 2, dkLen: 64),
+    );
+
+    final badMsgs = <Map<String, dynamic>>[
+      {'kdf': 'argon2'},
+      {'n': 131072, 'r': 8, 'p': 1, 'dkLen': 32},
+      {'n': 3000, 'r': 8, 'p': 1, 'dkLen': 32},
+      {'n': 16384, 'r': 17, 'p': 1, 'dkLen': 32},
+      {'n': 16384, 'r': 8, 'p': 5, 'dkLen': 32},
+      {'n': 16384, 'r': 8, 'p': 1, 'dkLen': 15},
+      {'n': 16384, 'r': 8, 'p': 1, 'dkLen': 65},
+      {'n': 65536, 'r': 16, 'p': 1, 'dkLen': 32},
+      {'n': '16384'},
+      {'n': 16384.5},
+    ];
+
+    for (final msg in badMsgs) {
+      expect(
+        () => WebRtcSessionService.parseAndValidateChallengeKdfParams(msg),
+        throwsArgumentError,
+      );
+    }
+  });
 }
