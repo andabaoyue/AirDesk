@@ -137,7 +137,11 @@ void main() {
       returnsNormally,
     );
     expect(
-      () => ScryptHelper.validateScryptParams(n: 65536, r: 8, p: 4, dkLen: 64),
+      () => ScryptHelper.validateScryptParams(n: 65536, r: 8, p: 1, dkLen: 64),
+      returnsNormally,
+    );
+    expect(
+      () => ScryptHelper.validateScryptParams(n: 16384, r: 8, p: 4, dkLen: 64),
       returnsNormally,
     );
 
@@ -165,8 +169,9 @@ void main() {
       (n: 16384, r: 8, p: 1, dkLen: 0),
       (n: 16384, r: 8, p: 1, dkLen: 65),
       (n: 16384, r: 8, p: 1, dkLen: 1 << 20),
-      // n * r exceeds maxCost (65536 * 8)
+      // n * r * p exceeds maxCost (65536 * 8)
       (n: 65536, r: 16, p: 1, dkLen: 32),
+      (n: 65536, r: 8, p: 4, dkLen: 32),
     ];
 
     for (final c in invalidCases) {
@@ -234,6 +239,7 @@ void main() {
       {'n': 16384, 'r': 8, 'p': 1, 'dkLen': 15},
       {'n': 16384, 'r': 8, 'p': 1, 'dkLen': 65},
       {'n': 65536, 'r': 16, 'p': 1, 'dkLen': 32},
+      {'n': 65536, 'r': 8, 'p': 4, 'dkLen': 32},
       {'n': '16384'},
       {'n': 16384.5},
     ];

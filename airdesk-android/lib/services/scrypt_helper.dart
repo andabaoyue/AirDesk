@@ -39,8 +39,8 @@ class ScryptHelper {
         'scrypt dkLen must be between $minDkLen and $maxDkLen',
       );
     }
-    if (n * r > maxCost) {
-      throw ArgumentError('scrypt work factor n * r (${n * r}) exceeds limit $maxCost');
+    if (n * r * p > maxCost) {
+      throw ArgumentError('scrypt work factor n * r * p (${n * r * p}) exceeds limit $maxCost');
     }
   }
 
