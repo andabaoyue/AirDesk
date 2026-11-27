@@ -166,7 +166,7 @@ class WebRtcSessionService extends ChangeNotifier {
   }) {
     final s = signalingUrl?.trim() ?? '';
     if (s.isNotEmpty) {
-      final String base;
+      String base;
       try {
         final wsUrl = normalizeRelayWsUrl(s);
         final uri = Uri.parse(wsUrl);
