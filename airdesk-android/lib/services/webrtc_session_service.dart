@@ -531,9 +531,10 @@ class WebRtcSessionService extends ChangeNotifier {
     String? hostId,
     String? password,
     List<String> iceStunUrls = const [],
+    bool resetOfflineRetry = true,
   }) async {
     await ensureRendererReady();
-    await disconnect(silent: true);
+    await disconnect(silent: true, resetOfflineRetry: resetOfflineRetry);
 
     final relayUrl = signalingUrl?.trim() ?? '';
     final isRelayMode = relayUrl.isNotEmpty;
@@ -549,7 +550,9 @@ class WebRtcSessionService extends ChangeNotifier {
     );
 
     _manualDisconnect = false;
-    _hostOfflineRetryCount = 0;
+    if (resetOfflineRetry) {
+      _hostOfflineRetryCount = 0;
+    }
     final myWsGen = ++_wsGen;
     _activeHostIp = isRelayMode ? null : cleanHostIp;
     _activeHostPort = port;
@@ -793,6 +796,7 @@ class WebRtcSessionService extends ChangeNotifier {
               hostId: retryHostId,
               password: retryPw,
               iceStunUrls: retryIceStuns,
+              resetOfflineRetry: false,
             ),
           );
         });
@@ -1613,7 +1617,7 @@ class WebRtcSessionService extends ChangeNotifier {
     }
   }
 
-  Future<void> disconnect({bool silent = false}) async {
+  Future<void> disconnect({bool silent = false, bool resetOfflineRetry = true}) async {
     _manualDisconnect = true;
     _pendingAuthPassword = null;
     _activeSessionToken = null;
@@ -1621,7 +1625,9 @@ class WebRtcSessionService extends ChangeNotifier {
     _wsSilentReconnectAttempt = 0;
     _wsSilentReconnectTimer?.cancel();
     _wsSilentReconnectTimer = null;
-    _hostOfflineRetryCount = 0;
+    if (resetOfflineRetry) {
+      _hostOfflineRetryCount = 0;
+    }
     _hostOfflineRetryTimer?.cancel();
     _hostOfflineRetryTimer = null;
     _wsGen++;
