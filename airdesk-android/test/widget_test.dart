@@ -274,7 +274,14 @@ void main() {
       '192.168.1.10:47820',
     );
 
-    // Legacy token under baseKey works for matching/unset hostId, but does NOT leak to another hostId
+    // Unmapped legacy token must NOT be returned or deleted when a specific hostId is requested
+    await storage.saveTokenForKey(baseKey, 'unmapped-legacy');
+    expect(await storage.getTokenForRelay(baseKey), 'unmapped-legacy');
+    expect(await storage.getTokenForRelay(baseKey, hostId: 'hostB7654321'), isNull);
+    await storage.removeTokenForRelay(baseKey, hostId: 'hostB7654321');
+    expect(await storage.getTokenForRelay(baseKey), 'unmapped-legacy');
+
+    // Legacy token under baseKey works only for matching hostId, and does NOT leak to another hostId
     await storage.saveTokenForKey(baseKey, 'legacy-tok-A');
     await storage.saveHostIdForKey(baseKey, 'hostA1234567');
     expect(await storage.getTokenForRelay(baseKey, hostId: 'hostA1234567'), 'legacy-tok-A');

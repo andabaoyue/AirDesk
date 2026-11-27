@@ -92,8 +92,8 @@ class StorageService {
     if (legacy == null || legacy.isEmpty) return null;
     if (cleanHostId.isEmpty) return legacy;
     final savedLegacyHostId = await getHostIdForKey(baseKey);
-    if (savedLegacyHostId == null ||
-        savedLegacyHostId.isEmpty ||
+    if (savedLegacyHostId != null &&
+        savedLegacyHostId.isNotEmpty &&
         savedLegacyHostId == cleanHostId) {
       return legacy;
     }
@@ -112,8 +112,8 @@ class StorageService {
       if (tokensMap.remove(baseKey) != null) changed = true;
     } else {
       final savedLegacyHostId = await getHostIdForKey(baseKey);
-      if (savedLegacyHostId == null ||
-          savedLegacyHostId.isEmpty ||
+      if (savedLegacyHostId != null &&
+          savedLegacyHostId.isNotEmpty &&
           savedLegacyHostId == cleanHostId) {
         if (tokensMap.remove(baseKey) != null) changed = true;
       }
