@@ -86,6 +86,7 @@ function sendWs(ws, obj) {
 }
 
 export function createRelayServer(options = {}) {
+  const gracePeriodMs = parseIntSafe(options.gracePeriodMs, 20000);
   const accessKey = String(
     options.accessKey !== undefined ? options.accessKey : (process.env.RELAY_ACCESS_KEY || '')
   ).trim();
@@ -112,6 +113,50 @@ export function createRelayServer(options = {}) {
 
   function getIceServers() {
     return buildIceServersFromConfig(iceConfig);
+  }
+
+  function clearHostGraceTimer(room) {
+    if (room && room.hostGraceTimer) {
+      clearTimeout(room.hostGraceTimer);
+      room.hostGraceTimer = null;
+    }
+  }
+
+  function clearClientGraceTimer(room) {
+    if (room && room.clientGraceTimer) {
+      clearTimeout(room.clientGraceTimer);
+      room.clientGraceTimer = null;
+    }
+  }
+
+  function finalizeHostDisconnect(room, reason) {
+    clearHostGraceTimer(room);
+    if (room.hostWs && room.hostWs.readyState === 1) return;
+    if (room.code) roomsByCode.delete(room.code);
+    if (room.activeClientWs) {
+      const activeWs = room.activeClientWs;
+      room.activeClientWs = null;
+      room.activeSessionToken = null;
+      socketRoom.delete(activeWs);
+      sendWs(activeWs, { type: 'session:closed', reason });
+    }
+    if (room.pendingClientWs) {
+      const pendingWs = room.pendingClientWs;
+      room.pendingClientWs = null;
+      room.pendingClientMeta = null;
+      socketRoom.delete(pendingWs);
+      sendWs(pendingWs, { type: 'session:closed', reason });
+    }
+  }
+
+  function finalizeClientDisconnect(room, reason) {
+    clearClientGraceTimer(room);
+    if (room.activeClientWs && room.activeClientWs.readyState === 1) return;
+    room.activeClientWs = null;
+    room.activeSessionToken = null;
+    if (room.hostWs && room.hostWs.readyState === 1) {
+      sendWs(room.hostWs, { type: 'host:client_disconnected', reason });
+    }
   }
 
   function hasTurnConfigured() {
@@ -333,6 +378,12 @@ export function createRelayServer(options = {}) {
               } catch {}
               return;
             }
+            clearHostGraceTimer(existing);
+            const prevMeta = socketRoom.get(ws);
+            if (prevMeta && prevMeta.room && prevMeta.room !== existing) {
+              if (prevMeta.room.code) roomsByCode.delete(prevMeta.room.code);
+              socketRoom.delete(ws);
+            }
             if (existing.code) roomsByCode.delete(existing.code);
             if (existing.hostWs && existing.hostWs !== ws) {
               const oldHostWs = existing.hostWs;
@@ -341,12 +392,6 @@ export function createRelayServer(options = {}) {
               try {
                 oldHostWs.close(4000, 'reclaimed');
               } catch {}
-            }
-            if (existing.activeClientWs) {
-              const oldClient = existing.activeClientWs;
-              existing.activeClientWs = null;
-              socketRoom.delete(oldClient);
-              sendWs(oldClient, { type: 'session:closed', reason: '电脑端正在重新上线' });
             }
             if (existing.pendingClientWs) {
               const oldPending = existing.pendingClientWs;
@@ -382,6 +427,40 @@ export function createRelayServer(options = {}) {
               }
               existing.pendingChallenges.clear();
             }
+
+            if (msg.resumeIfActive === true && existing.activeClientWs && existing.activeClientWs.readyState === 1) {
+              const resumedCode = genCode();
+              existing.code = resumedCode;
+              existing.expiresAt = Date.now() + PAIR_CODE_TTL_MS;
+              existing.hostWs = ws;
+              existing.protoVersion = Math.max(2, protoVersion);
+              existing.hostLabel = String(msg.hostLabel || existing.hostLabel || 'AirDesk Desktop').slice(0, 64);
+              existing.audioEnabled = Boolean(msg.audioEnabled);
+              existing.failedAttempts = 0;
+              roomsByCode.set(resumedCode, existing);
+              roomsByHostId.delete(hostId);
+              roomsByHostId.set(hostId, existing);
+              socketRoom.set(ws, { room: existing, role: 'host' });
+              sendWs(existing.activeClientWs, { type: 'session:signaling_resumed', role: 'host' });
+              sendWs(ws, {
+                type: 'host:created',
+                code: resumedCode,
+                expiresAt: existing.expiresAt,
+                iceServers: getIceServers(),
+                hostId,
+                protoVersion: existing.protoVersion,
+                resumedActiveClient: true,
+              });
+              return;
+            }
+
+            clearClientGraceTimer(existing);
+            if (existing.activeClientWs) {
+              const oldClient = existing.activeClientWs;
+              existing.activeClientWs = null;
+              socketRoom.delete(oldClient);
+              sendWs(oldClient, { type: 'session:closed', reason: '电脑端正在重新上线' });
+            }
           } else if (roomsByHostId.size >= MAX_HOST_REGISTRY) {
             let evictKey = null;
             for (const [k, r] of roomsByHostId.entries()) {
@@ -416,6 +495,8 @@ export function createRelayServer(options = {}) {
           pendingChallenges: new Map(),
           activeClientWs: null,
           activeSessionToken: null,
+          hostGraceTimer: null,
+          clientGraceTimer: null,
           failedAttempts: 0,
           trustedTokens: hostId ? null : new Map(),
         };
@@ -531,6 +612,7 @@ export function createRelayServer(options = {}) {
             return;
           }
           const verifyId = crypto.randomUUID();
+          const attachExisting = msg.attachExisting === true;
           const clientMeta = {
             deviceLabel: String(msg.deviceLabel || '远程移动设备').slice(0, 64),
             platformHint: String(msg.platformHint || 'Mobile').slice(0, 32),
@@ -539,6 +621,7 @@ export function createRelayServer(options = {}) {
           room.pendingVerifies.set(verifyId, {
             ws,
             sessionToken: msg.sessionToken,
+            attachExisting,
             deviceLabel: clientMeta.deviceLabel,
             platformHint: clientMeta.platformHint,
             ipMasked: maskedIp,
@@ -551,6 +634,7 @@ export function createRelayServer(options = {}) {
             type: 'host:verify_token',
             verifyId,
             sessionToken: msg.sessionToken,
+            attachExisting,
             client: clientMeta,
           });
           return;
@@ -812,10 +896,15 @@ export function createRelayServer(options = {}) {
           return;
         }
 
+        clearClientGraceTimer(room);
+        const isReattach = Boolean(pending.attachExisting && msg.reattached === true);
         if (room.activeClientWs && room.activeClientWs !== pending.ws) {
           const staleWs = room.activeClientWs;
           room.activeClientWs = null;
           socketRoom.delete(staleWs);
+          if (!isReattach) {
+            sendWs(staleWs, { type: 'session:closed', reason: '另一台已信任设备已接管连接' });
+          }
           try {
             staleWs.close();
           } catch {}
@@ -833,11 +922,12 @@ export function createRelayServer(options = {}) {
           sessionToken: pending.sessionToken,
           iceServers: getIceServers(),
           reconnected: true,
+          reattached: isReattach,
         };
         if (room.hostId) approvedPayload.hostId = room.hostId;
         sendWs(pending.ws, approvedPayload);
         sendWs(room.hostWs, {
-          type: 'host:client_reconnected',
+          type: isReattach ? 'host:client_reattached' : 'host:client_reconnected',
           mode: approvedMode,
           deviceLabel: pending.deviceLabel,
           ipMasked: pending.ipMasked,
@@ -911,6 +1001,8 @@ export function createRelayServer(options = {}) {
       }
 
       if (msg.type === 'session:close') {
+        clearHostGraceTimer(room);
+        clearClientGraceTimer(room);
         const peer = role === 'host' ? room.activeClientWs || room.pendingClientWs : room.hostWs;
         if (peer) {
           sendWs(peer, {
@@ -960,13 +1052,6 @@ export function createRelayServer(options = {}) {
         if (room.hostWs !== ws) return;
         room.hostWs = null;
         if (room.code) roomsByCode.delete(room.code);
-        if (room.activeClientWs) {
-          const activeWs = room.activeClientWs;
-          room.activeClientWs = null;
-          room.activeSessionToken = null;
-          socketRoom.delete(activeWs);
-          sendWs(activeWs, { type: 'session:closed', reason: '电脑端已关闭共享' });
-        }
         if (room.pendingClientWs) {
           const pendingWs = room.pendingClientWs;
           room.pendingClientWs = null;
@@ -1001,13 +1086,27 @@ export function createRelayServer(options = {}) {
           }
           room.pendingChallenges.clear();
         }
+        if (room.hostId && room.activeClientWs && room.activeClientWs.readyState === 1) {
+          clearHostGraceTimer(room);
+          room.hostGraceTimer = setTimeout(() => {
+            finalizeHostDisconnect(room, '电脑端连接超时');
+          }, gracePeriodMs);
+        } else {
+          finalizeHostDisconnect(room, '电脑端已关闭共享');
+        }
       } else {
         const wasActive = room.activeClientWs === ws;
         const wasPending = room.pendingClientWs === ws;
         if (wasActive) {
           room.activeClientWs = null;
-          room.activeSessionToken = null;
-          sendWs(room.hostWs, { type: 'host:client_disconnected', reason: '控制设备已断开' });
+          if (room.hostId && room.hostWs && room.hostWs.readyState === 1) {
+            clearClientGraceTimer(room);
+            room.clientGraceTimer = setTimeout(() => {
+              finalizeClientDisconnect(room, '控制设备连接超时');
+            }, gracePeriodMs);
+          } else {
+            finalizeClientDisconnect(room, '控制设备已断开');
+          }
         } else if (wasPending) {
           room.pendingClientWs = null;
           room.pendingClientMeta = null;
@@ -1036,6 +1135,10 @@ export function createRelayServer(options = {}) {
   async function close() {
     clearInterval(maintenanceTimer);
     clearInterval(pingInterval);
+    for (const room of new Set([...roomsByCode.values(), ...roomsByHostId.values()])) {
+      clearHostGraceTimer(room);
+      clearClientGraceTimer(room);
+    }
     for (const client of wss.clients) {
       try {
         client.terminate();

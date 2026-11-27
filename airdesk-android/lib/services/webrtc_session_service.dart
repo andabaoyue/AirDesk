@@ -5,8 +5,10 @@ import 'dart:ui' show Offset;
 import 'package:flutter/foundation.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 import '../models/airdesk_models.dart';
+import 'file_transfer_manager.dart';
 import 'native_bridge.dart';
 import 'scrypt_helper.dart';
+import 'sdp_helper.dart';
 import 'storage_service.dart';
 
 enum SessionPhase {
@@ -47,29 +49,14 @@ class WebRtcSessionService extends ChangeNotifier {
   RTCPeerConnection? _pc;
   RTCDataChannel? _reliableDc;
   RTCDataChannel? _unreliableDc;
-  RTCDataChannel? _fileDc;
 
-  static const int _fileChunkBytes = 16384;
-  static const int _maxFileBytes = 500 * 1024 * 1024;
-  bool _sendingFile = false;
-  String? _pendingOfferId;
-  Completer<void>? _pendingOfferCompleter;
-  String? _pendingAckId;
-  Completer<Map<String, dynamic>>? _pendingAckCompleter;
-  String? _incomingFileId;
-  String? _incomingFileName;
-  String? _incomingFileMime;
-  int _incomingFileTotal = 0;
-  int _incomingFileReceived = 0;
-  File? _incomingTempFile;
-  IOSink? _incomingSink;
-  DateTime _lastFileUiNotifyAt = DateTime.fromMillisecondsSinceEpoch(0);
-  Future<void> _incomingFileChain = Future<void>.value();
-
-  FileTransferProgress? activeFileTransfer;
-  final List<FileTransferProgress> recentTransfers = [];
-  bool get fileChannelReady =>
-      _fileDc != null && _fileDc!.state == RTCDataChannelState.RTCDataChannelOpen;
+  late final FileTransferManager _fileTransfer = FileTransferManager(
+    onToast: _emitToast,
+    onNotify: notifyListeners,
+  );
+  FileTransferProgress? get activeFileTransfer => _fileTransfer.activeFileTransfer;
+  List<FileTransferProgress> get recentTransfers => _fileTransfer.recentTransfers;
+  bool get fileChannelReady => _fileTransfer.channelReady;
 
   Timer? _pingTimer;
   Timer? _diagTimer;
@@ -103,15 +90,30 @@ class WebRtcSessionService extends ChangeNotifier {
   int _activeHostPort = 47820;
   String? _activeSignalingUrl;
   String? _activeHostId;
+  String? _activeSessionToken;
   String? _activeCustomIceRaw;
   String? _pendingAuthPassword;
+  String? _lastConnectPinCode;
+  String? _lastConnectPassword;
+  List<String> _lastConnectIceStunUrls = const [];
+  RTCIceConnectionState? _lastIceConnectionState;
   Timer? _iceRestartTimer;
   Timer? _iceRestartWatchdogTimer;
+  Timer? _wsSilentReconnectTimer;
+  Timer? _pendingIceRestartTimer;
+  Timer? _hostOfflineRetryTimer;
+  int _wsSilentReconnectAttempt = 0;
+  bool _wsSilentReconnecting = false;
+  bool _pendingIceRestartAfterWs = false;
+  int _hostOfflineRetryCount = 0;
   int _iceRestartAttempts = 0;
   bool _iceRestartInFlight = false;
   static const int _maxIceRestartAttempts = 2;
+  static const int _maxWsSilentReconnectAttempts = 4;
+  static const List<int> _wsSilentReconnectDelaysSec = [1, 2, 4, 8];
   static const Duration _iceDisconnectRestartDelay = Duration(milliseconds: 2000);
   static const Duration _iceRestartWatchdogDelay = Duration(milliseconds: 6000);
+  static const Duration _pendingIceRestartWaitDelay = Duration(milliseconds: 8000);
 
   SessionPhase phase = SessionPhase.idle;
   String statusMessage = '未连接';
@@ -279,6 +281,14 @@ class WebRtcSessionService extends ChangeNotifier {
   }
 
   @visibleForTesting
+  static bool shouldSkipRtcRebuildOnApproved(
+    Map<String, dynamic> msg, {
+    required bool hasLivePc,
+  }) {
+    return msg['reattached'] == true && hasLivePc;
+  }
+
+  @visibleForTesting
   static Map<String, dynamic> buildClientJoinPayload({
     required String deviceLabel,
     String platformHint = 'Android App',
@@ -286,6 +296,7 @@ class WebRtcSessionService extends ChangeNotifier {
     String? sessionToken,
     String? hostId,
     String? authMode,
+    bool attachExisting = false,
   }) {
     final payload = <String, dynamic>{
       'type': 'client:join',
@@ -302,6 +313,9 @@ class WebRtcSessionService extends ChangeNotifier {
       payload['sessionToken'] = cleanToken;
       if (cleanHostId.isNotEmpty) {
         payload['hostId'] = cleanHostId;
+      }
+      if (attachExisting && cleanHostId.isNotEmpty) {
+        payload['attachExisting'] = true;
       }
     } else {
       payload['code'] = (pinCode ?? '').replaceAll(RegExp(r'\D'), '');
@@ -334,6 +348,179 @@ class WebRtcSessionService extends ChangeNotifier {
     return (n: n, r: r, p: p, dkLen: dkLen);
   }
 
+  bool get _hasLiveMediaSession =>
+      _pc != null &&
+      (phase == SessionPhase.connected ||
+          _reliableDc?.state == RTCDataChannelState.RTCDataChannelOpen ||
+          _iceRestartInFlight ||
+          _pendingIceRestartAfterWs);
+
+  void _startWsHeartbeat(WebSocket sock, int myWsGen) {
+    _wsHeartbeatTimer?.cancel();
+    _wsHeartbeatTimer = Timer.periodic(const Duration(seconds: 25), (_) {
+      if (_ws != sock || _wsGen != myWsGen) return;
+      _sendWs({'type': 'ws:ping', 'ts': DateTime.now().millisecondsSinceEpoch});
+      _clearWsPongTimeout();
+      _wsPongTimeoutTimer = Timer(const Duration(seconds: 10), () {
+        _wsPongTimeoutTimer = null;
+        if (_ws == sock && _wsGen == myWsGen) {
+          try {
+            sock.close(4008, 'pong timeout');
+          } catch (_) {}
+        }
+      });
+    });
+  }
+
+  void _attachRelayOrLanSocket({
+    required WebSocket sock,
+    required int myWsGen,
+    required String cleanHostIp,
+    required int port,
+    required List<String> iceStunUrls,
+    required String tokenKey,
+    required String baseRelayKey,
+    required bool isRelayMode,
+    required String? customIceRaw,
+    required bool hadToken,
+  }) {
+    sock.listen(
+      (raw) {
+        if (_ws != sock || _wsGen != myWsGen) return;
+        _handleWsMessage(
+          raw,
+          cleanHostIp,
+          port,
+          iceStunUrls,
+          tokenKey: tokenKey,
+          baseRelayKey: baseRelayKey,
+          isRelayMode: isRelayMode,
+          customIceRaw: customIceRaw,
+          hadToken: hadToken,
+          sock: sock,
+          wsGen: myWsGen,
+        );
+      },
+      onError: (err) {
+        if (_ws != sock || _wsGen != myWsGen) return;
+        _clearWsPongTimeout();
+        _wsHeartbeatTimer?.cancel();
+        _wsHeartbeatTimer = null;
+        _pendingAuthPassword = null;
+        if (isRelayMode && !_manualDisconnect && _hasLiveMediaSession) {
+          _ws = null;
+          if (!_wsSilentReconnecting) {
+            _scheduleWsSilentReconnect();
+          }
+          return;
+        }
+        if (!_manualDisconnect) {
+          _setPhase(SessionPhase.error, '信令连接异常：$err');
+        }
+      },
+      onDone: () {
+        if (_ws != sock || _wsGen != myWsGen) return;
+        _clearWsPongTimeout();
+        _wsHeartbeatTimer?.cancel();
+        _wsHeartbeatTimer = null;
+        _pendingAuthPassword = null;
+        if (isRelayMode && !_manualDisconnect && _hasLiveMediaSession) {
+          _ws = null;
+          if (!_wsSilentReconnecting) {
+            _scheduleWsSilentReconnect();
+          }
+          return;
+        }
+        if (!_manualDisconnect && phase != SessionPhase.error) {
+          _cleanupRtc();
+          _setPhase(SessionPhase.disconnected, '信令连接已断开');
+        }
+      },
+    );
+  }
+
+  void _scheduleWsSilentReconnect() {
+    if (_manualDisconnect || !_hasLiveMediaSession) {
+      _wsSilentReconnecting = false;
+      return;
+    }
+    final relayUrl = _activeSignalingUrl?.trim() ?? '';
+    final hostId = _activeHostId?.trim() ?? '';
+    final token = _activeSessionToken?.trim() ?? '';
+    if (relayUrl.isEmpty ||
+        hostId.isEmpty ||
+        token.isEmpty ||
+        _wsSilentReconnectAttempt >= _maxWsSilentReconnectAttempts) {
+      _wsSilentReconnecting = false;
+      _wsSilentReconnectTimer?.cancel();
+      _wsSilentReconnectTimer = null;
+      _pendingIceRestartAfterWs = false;
+      _pendingIceRestartTimer?.cancel();
+      _pendingIceRestartTimer = null;
+      unawaited(_cleanupRtc().then((_) {
+        if (!_manualDisconnect) {
+          _setPhase(SessionPhase.disconnected, '信令连接已断开');
+        }
+      }));
+      return;
+    }
+
+    final delaySec = _wsSilentReconnectDelaysSec[
+        _wsSilentReconnectAttempt.clamp(0, _wsSilentReconnectDelaysSec.length - 1)];
+    _wsSilentReconnectAttempt += 1;
+    _wsSilentReconnecting = true;
+    _wsSilentReconnectTimer?.cancel();
+    _wsSilentReconnectTimer = Timer(Duration(seconds: delaySec), () async {
+      _wsSilentReconnectTimer = null;
+      if (_manualDisconnect || !_hasLiveMediaSession) {
+        _wsSilentReconnecting = false;
+        return;
+      }
+      final myWsGen = ++_wsGen;
+      final baseRelayKey = tokenKeyForEndpoint(signalingUrl: relayUrl);
+      final tokenKey = tokenKeyForEndpoint(signalingUrl: relayUrl, hostId: hostId);
+      try {
+        final wsUrl = normalizeRelayWsUrl(relayUrl);
+        final sock = await WebSocket.connect(wsUrl).timeout(const Duration(seconds: 10));
+        if (_manualDisconnect || !_hasLiveMediaSession || _wsGen != myWsGen) {
+          try {
+            await sock.close();
+          } catch (_) {}
+          return;
+        }
+        _ws = sock;
+        _startWsHeartbeat(sock, myWsGen);
+        _attachRelayOrLanSocket(
+          sock: sock,
+          myWsGen: myWsGen,
+          cleanHostIp: '',
+          port: _activeHostPort,
+          iceStunUrls: _lastConnectIceStunUrls,
+          tokenKey: tokenKey,
+          baseRelayKey: baseRelayKey,
+          isRelayMode: true,
+          customIceRaw: _activeCustomIceRaw,
+          hadToken: true,
+        );
+        final deviceModel = await NativeBridge.getDeviceModelName();
+        final deviceLabel = await storage.getDeviceLabel('$deviceModel (APK)');
+        if (_manualDisconnect || _ws != sock || _wsGen != myWsGen) return;
+        _sendWs(
+          buildClientJoinPayload(
+            deviceLabel: deviceLabel,
+            sessionToken: token,
+            hostId: hostId,
+            attachExisting: true,
+          ),
+        );
+      } catch (_) {
+        if (!_manualDisconnect && _wsGen == myWsGen) {
+          _scheduleWsSilentReconnect();
+        }
+      }
+    });
+  }
+
   Future<void> connect({
     String hostIp = '',
     int port = 47820,
@@ -344,9 +531,10 @@ class WebRtcSessionService extends ChangeNotifier {
     String? hostId,
     String? password,
     List<String> iceStunUrls = const [],
+    bool resetOfflineRetry = true,
   }) async {
     await ensureRendererReady();
-    await disconnect(silent: true);
+    await disconnect(silent: true, resetOfflineRetry: resetOfflineRetry);
 
     final relayUrl = signalingUrl?.trim() ?? '';
     final isRelayMode = relayUrl.isNotEmpty;
@@ -362,13 +550,20 @@ class WebRtcSessionService extends ChangeNotifier {
     );
 
     _manualDisconnect = false;
+    if (resetOfflineRetry) {
+      _hostOfflineRetryCount = 0;
+    }
     final myWsGen = ++_wsGen;
     _activeHostIp = isRelayMode ? null : cleanHostIp;
     _activeHostPort = port;
     _activeSignalingUrl = isRelayMode ? relayUrl : null;
     _activeHostId = hostId?.trim();
+    _activeSessionToken = sessionToken?.trim();
     _activeCustomIceRaw = customIceRaw?.trim();
     _pendingAuthPassword = (password != null && password.isNotEmpty) ? password : null;
+    _lastConnectPinCode = pinCode;
+    _lastConnectPassword = password;
+    _lastConnectIceStunUrls = iceStunUrls;
 
     final isOverlay = !isRelayMode && isOverlayHost(cleanHostIp);
 
@@ -417,19 +612,7 @@ class WebRtcSessionService extends ChangeNotifier {
     }
 
     if (isRelayMode) {
-      _wsHeartbeatTimer = Timer.periodic(const Duration(seconds: 25), (_) {
-        if (_ws != sock || _wsGen != myWsGen) return;
-        _sendWs({'type': 'ws:ping', 'ts': DateTime.now().millisecondsSinceEpoch});
-        _clearWsPongTimeout();
-        _wsPongTimeoutTimer = Timer(const Duration(seconds: 10), () {
-          _wsPongTimeoutTimer = null;
-          if (_ws == sock && _wsGen == myWsGen) {
-            try {
-              sock.close(4008, 'pong timeout');
-            } catch (_) {}
-          }
-        });
-      });
+      _startWsHeartbeat(sock, myWsGen);
     }
 
     final usePasswordAuth = isRelayMode &&
@@ -438,44 +621,17 @@ class WebRtcSessionService extends ChangeNotifier {
         hostId != null &&
         hostId.trim().isNotEmpty;
 
-    sock.listen(
-      (raw) {
-        if (_ws != sock || _wsGen != myWsGen) return;
-        _handleWsMessage(
-          raw,
-          cleanHostIp,
-          port,
-          iceStunUrls,
-          tokenKey: tokenKey,
-          baseRelayKey: baseRelayKey,
-          isRelayMode: isRelayMode,
-          customIceRaw: customIceRaw,
-          hadToken: sessionToken != null,
-          sock: sock,
-          wsGen: myWsGen,
-        );
-      },
-      onError: (err) {
-        if (_ws != sock || _wsGen != myWsGen) return;
-        _clearWsPongTimeout();
-        _wsHeartbeatTimer?.cancel();
-        _wsHeartbeatTimer = null;
-        _pendingAuthPassword = null;
-        if (!_manualDisconnect) {
-          _setPhase(SessionPhase.error, '信令连接异常：$err');
-        }
-      },
-      onDone: () {
-        if (_ws != sock || _wsGen != myWsGen) return;
-        _clearWsPongTimeout();
-        _wsHeartbeatTimer?.cancel();
-        _wsHeartbeatTimer = null;
-        _pendingAuthPassword = null;
-        if (!_manualDisconnect && phase != SessionPhase.error) {
-          _cleanupRtc();
-          _setPhase(SessionPhase.disconnected, '信令连接已断开');
-        }
-      },
+    _attachRelayOrLanSocket(
+      sock: sock,
+      myWsGen: myWsGen,
+      cleanHostIp: cleanHostIp,
+      port: port,
+      iceStunUrls: iceStunUrls,
+      tokenKey: tokenKey,
+      baseRelayKey: baseRelayKey,
+      isRelayMode: isRelayMode,
+      customIceRaw: customIceRaw,
+      hadToken: sessionToken != null,
     );
 
     final joinPayload = buildClientJoinPayload(
@@ -602,6 +758,53 @@ class WebRtcSessionService extends ChangeNotifier {
       _setPhase(SessionPhase.waitingApproval, '等待电脑审批（可在电脑按 Ctrl+Alt+Y 批准）...');
     } else if (type == 'client:rejected' || type == 'error') {
       _pendingAuthPassword = null;
+      if (type == 'error' &&
+          msg['code'] == 'HOST_OFFLINE' &&
+          msg['retryable'] == true &&
+          isRelayMode &&
+          !_manualDisconnect &&
+          _hostOfflineRetryCount < 2) {
+        _hostOfflineRetryCount += 1;
+        final delayMs = _hostOfflineRetryCount == 1 ? 1500 : 3000;
+        if (_hasLiveMediaSession) {
+          _hostOfflineRetryTimer?.cancel();
+          _hostOfflineRetryTimer = Timer(Duration(milliseconds: delayMs), () {
+            _hostOfflineRetryTimer = null;
+            if (_manualDisconnect || !_hasLiveMediaSession) return;
+            _scheduleWsSilentReconnect();
+          });
+          return;
+        }
+        final retryRelayUrl = _activeSignalingUrl;
+        final retryHostId = _activeHostId;
+        final retryToken = _activeSessionToken;
+        final retryCustomIce = _activeCustomIceRaw;
+        final retryPin = _lastConnectPinCode;
+        final retryPw = _lastConnectPassword;
+        final retryIceStuns = _lastConnectIceStunUrls;
+        _setPhase(SessionPhase.connectingWs, '目标电脑正在恢复上线，正在自动重连 ($_hostOfflineRetryCount/2)...');
+        _hostOfflineRetryTimer?.cancel();
+        _hostOfflineRetryTimer = Timer(Duration(milliseconds: delayMs), () {
+          _hostOfflineRetryTimer = null;
+          if (_manualDisconnect || retryRelayUrl == null) return;
+          unawaited(
+            connect(
+              signalingUrl: retryRelayUrl,
+              customIceRaw: retryCustomIce,
+              pinCode: retryPin,
+              sessionToken: retryToken,
+              hostId: retryHostId,
+              password: retryPw,
+              iceStunUrls: retryIceStuns,
+              resetOfflineRetry: false,
+            ),
+          );
+        });
+        return;
+      }
+      _wsSilentReconnecting = false;
+      _wsSilentReconnectTimer?.cancel();
+      _wsSilentReconnectTimer = null;
       if (shouldClearSavedTokenOnError(type, msg, hadToken: hadToken)) {
         if (isRelayMode) {
           await storage.removeTokenForRelay(baseRelayKey, hostId: _activeHostId);
@@ -615,16 +818,29 @@ class WebRtcSessionService extends ChangeNotifier {
           await storage.removeHostIdForKey(tokenKey);
         }
       }
+      if (_hasLiveMediaSession) {
+        await _cleanupRtc();
+      }
       final reason = (msg['reason'] ?? msg['message'] ?? '连接被拒绝').toString();
       _setPhase(SessionPhase.error, reason);
     } else if (type == 'client:approved') {
       _pendingAuthPassword = null;
+      _wsSilentReconnecting = false;
+      _wsSilentReconnectAttempt = 0;
+      _wsSilentReconnectTimer?.cancel();
+      _wsSilentReconnectTimer = null;
+      _hostOfflineRetryCount = 0;
+      _hostOfflineRetryTimer?.cancel();
+      _hostOfflineRetryTimer = null;
       hostLabel = (msg['hostLabel'] ?? (isRelayMode ? '远程电脑' : hostIp)).toString();
       controlEnabled = msg['mode'] == 'full_control';
       hostAudioEnabled = msg['audioEnabled'] == true;
       audioMuted = !hostAudioEnabled;
       final newToken = (msg['sessionToken'] ?? '').toString();
       final approvedHostId = (msg['hostId'] ?? '').toString().trim();
+      if (newToken.isNotEmpty) {
+        _activeSessionToken = newToken;
+      }
       if (isRelayMode && approvedHostId.isNotEmpty) {
         _activeHostId = approvedHostId;
         final scopedKey = tokenKeyForEndpoint(
@@ -642,6 +858,21 @@ class WebRtcSessionService extends ChangeNotifier {
       if (!isRelayMode && hostIp.isNotEmpty) {
         await storage.saveRecentHost(hostIp, port, hostLabel);
       }
+      if (shouldSkipRtcRebuildOnApproved(msg, hasLivePc: _pc != null && !_manualDisconnect)) {
+        _remoteAudioTrack?.enabled = !audioMuted;
+        _emitToast('信令通道已静默重连，画面保持中');
+        notifyListeners();
+        final shouldIceRestart = _pendingIceRestartAfterWs ||
+            _lastIceConnectionState == RTCIceConnectionState.RTCIceConnectionStateDisconnected ||
+            _lastIceConnectionState == RTCIceConnectionState.RTCIceConnectionStateFailed;
+        if (shouldIceRestart && _pc != null) {
+          _pendingIceRestartAfterWs = false;
+          _pendingIceRestartTimer?.cancel();
+          _pendingIceRestartTimer = null;
+          unawaited(_tryIceRestart(_pc!, _rtcGen, reason: 'ws_reattached'));
+        }
+        return;
+      }
       final iceServers = _resolveIceServers(
         isRelayMode: isRelayMode,
         iceStunUrls: iceStunUrls,
@@ -649,6 +880,11 @@ class WebRtcSessionService extends ChangeNotifier {
         customIceRaw: customIceRaw,
       );
       await _startRtc(iceServers);
+    } else if (type == 'session:signaling_resumed') {
+      _hostOfflineRetryCount = 0;
+      _hostOfflineRetryTimer?.cancel();
+      _hostOfflineRetryTimer = null;
+      _emitToast('电脑端信令已恢复');
     } else if (type == 'rtc:answer' && _pc != null) {
       final sdp = (msg['sdp'] ?? '').toString();
       await _pc!.setRemoteDescription(RTCSessionDescription(sdp, 'answer'));
@@ -714,12 +950,16 @@ class WebRtcSessionService extends ChangeNotifier {
 
     pc.onIceConnectionState = (state) {
       if (isStale()) return;
+      _lastIceConnectionState = state;
       if (state == RTCIceConnectionState.RTCIceConnectionStateConnected ||
           state == RTCIceConnectionState.RTCIceConnectionStateCompleted) {
         _iceRestartTimer?.cancel();
         _iceRestartTimer = null;
         _iceRestartWatchdogTimer?.cancel();
         _iceRestartWatchdogTimer = null;
+        _pendingIceRestartAfterWs = false;
+        _pendingIceRestartTimer?.cancel();
+        _pendingIceRestartTimer = null;
         _iceRestartAttempts = 0;
         _iceRestartInFlight = false;
         if (phase != SessionPhase.connected) {
@@ -793,7 +1033,7 @@ class WebRtcSessionService extends ChangeNotifier {
     pc.onIceCandidate = (RTCIceCandidate candidate) {
       if (isStale()) return;
       final cs = candidate.candidate ?? '';
-      if (_isVirtualCandidate(cs)) return;
+      if (SdpHelper.isVirtualCandidate(cs)) return;
       _sendWs({
         'type': 'rtc:ice',
         'candidate': {
@@ -837,21 +1077,7 @@ class WebRtcSessionService extends ChangeNotifier {
       RTCDataChannelInit()..ordered = true,
     );
     if (isStale()) return;
-    _fileDc = fileDc;
-
-    fileDc.onDataChannelState = (state) {
-      if (isStale()) return;
-      if (state == RTCDataChannelState.RTCDataChannelClosed) {
-        _abortFileTransferWaiters('文件传输通道已关闭');
-      }
-      notifyListeners();
-    };
-    fileDc.onMessage = (RTCDataChannelMessage message) {
-      if (isStale()) return;
-      _incomingFileChain = _incomingFileChain
-          .then((_) => _handleFileDcMessage(message))
-          .catchError((_) {});
-    };
+    _fileTransfer.attachChannel(fileDc, isStale: isStale);
 
     reliableDc.onDataChannelState = (state) async {
       if (isStale()) return;
@@ -893,7 +1119,7 @@ class WebRtcSessionService extends ChangeNotifier {
     if (isStale()) return;
     final offer = await pc.createOffer();
     if (isStale()) return;
-    final preferredSdp = _prioritizeVideoCodecsInSdp(offer.sdp ?? '', preferHevc: preferHevc);
+    final preferredSdp = SdpHelper.prioritizeVideoCodecs(offer.sdp ?? '', preferHevc: preferHevc);
     final finalOffer = RTCSessionDescription(preferredSdp, offer.type);
     await pc.setLocalDescription(finalOffer);
     if (isStale()) return;
@@ -917,6 +1143,19 @@ class WebRtcSessionService extends ChangeNotifier {
     if (_iceRestartInFlight) return;
 
     final wsReady = _ws != null && _ws!.readyState == WebSocket.open;
+    if (!wsReady && _wsSilentReconnecting && _iceRestartAttempts < _maxIceRestartAttempts) {
+      _pendingIceRestartAfterWs = true;
+      _pendingIceRestartTimer ??= Timer(_pendingIceRestartWaitDelay, () {
+        _pendingIceRestartTimer = null;
+        if (_manualDisconnect || _rtcGen != myRtcGen || _pc != targetPc) return;
+        if (_pendingIceRestartAfterWs) {
+          _pendingIceRestartAfterWs = false;
+          _setPhase(SessionPhase.disconnected, '视频通道中断 ($reason)');
+          unawaited(reconnectSaved());
+        }
+      });
+      return;
+    }
     if (!wsReady || _iceRestartAttempts >= _maxIceRestartAttempts) {
       _iceRestartWatchdogTimer?.cancel();
       _iceRestartWatchdogTimer = null;
@@ -935,7 +1174,7 @@ class WebRtcSessionService extends ChangeNotifier {
       if (_manualDisconnect || _rtcGen != myRtcGen || _pc != targetPc) return;
       final offer = await targetPc.createOffer({'iceRestart': true});
       if (_manualDisconnect || _rtcGen != myRtcGen || _pc != targetPc) return;
-      final preferredSdp = _prioritizeVideoCodecsInSdp(offer.sdp ?? '', preferHevc: preferHevc);
+      final preferredSdp = SdpHelper.prioritizeVideoCodecs(offer.sdp ?? '', preferHevc: preferHevc);
       final finalOffer = RTCSessionDescription(preferredSdp, offer.type);
       await targetPc.setLocalDescription(finalOffer);
       if (_manualDisconnect || _rtcGen != myRtcGen || _pc != targetPc) return;
@@ -1023,181 +1262,6 @@ class WebRtcSessionService extends ChangeNotifier {
         notifyListeners();
       }
     }
-  }
-
-  bool _isVirtualCandidate(String candStr) {
-    final parts = candStr.split(' ');
-    if (parts.length < 5) return false;
-    final addr = parts[4];
-    if (RegExp(r'^198\.1[89]\.').hasMatch(addr)) return true;
-    if (RegExp(r'^172\.19\.').hasMatch(addr)) return true;
-    return false;
-  }
-
-  /// Reorders the m=video SDP payload types so H.265/HEVC (when [preferHevc] is enabled)
-  /// or H.264 (preferring Constrained Baseline 42e01f > 42001f) is listed first,
-  /// ensuring Android MediaCodec hardware decoding engages consistently.
-  String _prioritizeVideoCodecsInSdp(String sdp, {bool preferHevc = false}) {
-    if (sdp.isEmpty) return sdp;
-    final eol = sdp.contains('\r\n') ? '\r\n' : '\n';
-    final lines = sdp.split(RegExp(r'\r?\n'));
-    bool inVideo = false;
-    int mLineIdx = -1;
-    final Map<String, String> rtpmap = {};
-    final Map<String, String> fmtp = {};
-    final Map<String, String> rtxApt = {};
-
-    for (var i = 0; i < lines.length; i++) {
-      final line = lines[i];
-      if (line.startsWith('m=')) {
-        inVideo = line.startsWith('m=video ');
-        if (inVideo) mLineIdx = i;
-        continue;
-      }
-      if (!inVideo) continue;
-      final rm = RegExp(r'^a=rtpmap:(\d+)\s+([^\s]+)').firstMatch(line);
-      if (rm != null) {
-        rtpmap[rm.group(1)!] = rm.group(2)!.toLowerCase();
-        continue;
-      }
-      final fm = RegExp(r'^a=fmtp:(\d+)\s+(.+)$').firstMatch(line);
-      if (fm != null) {
-        final pt = fm.group(1)!;
-        final val = fm.group(2)!.toLowerCase();
-        fmtp[pt] = val;
-        final aptMatch = RegExp(r'apt=(\d+)').firstMatch(val);
-        if (aptMatch != null) {
-          rtxApt[aptMatch.group(1)!] = pt;
-        }
-      }
-    }
-
-    if (mLineIdx < 0) return sdp;
-    final parts = lines[mLineIdx].trim().split(RegExp(r'\s+'));
-    if (parts.length <= 4) return sdp;
-    final header = parts.take(3).toList();
-    final pts = parts.skip(3).toList();
-
-    final hevcPts = <String>[];
-    final h264Pts = <String>[];
-    final otherPts = <String>[];
-    final associatedRtx = <String>{};
-
-    for (final pt in pts) {
-      final codec = rtpmap[pt] ?? '';
-      if (codec.startsWith('h265/') || codec.startsWith('hevc/')) {
-        hevcPts.add(pt);
-        if (rtxApt.containsKey(pt)) associatedRtx.add(rtxApt[pt]!);
-      } else if (codec.startsWith('h264/')) {
-        h264Pts.add(pt);
-        if (rtxApt.containsKey(pt)) associatedRtx.add(rtxApt[pt]!);
-      }
-    }
-    if (h264Pts.isEmpty && (!preferHevc || hevcPts.isEmpty)) return sdp;
-
-    int scorePt(String pt) {
-      final f = fmtp[pt] ?? '';
-      if (f.contains('640c')) return 0;
-      if (f.contains('42e01f')) return 1;
-      if (f.contains('42e0')) return 2;
-      if (f.contains('42001f')) return 3;
-      if (f.contains('4200')) return 4;
-      if (f.contains('6400')) return 5;
-      return 6;
-    }
-
-    h264Pts.sort((a, b) => scorePt(a).compareTo(scorePt(b)));
-
-    final orderedHevcWithRtx = <String>[];
-    if (preferHevc) {
-      for (final pt in hevcPts) {
-        orderedHevcWithRtx.add(pt);
-        if (rtxApt.containsKey(pt)) orderedHevcWithRtx.add(rtxApt[pt]!);
-      }
-    }
-
-    final orderedH264WithRtx = <String>[];
-    for (final pt in h264Pts) {
-      orderedH264WithRtx.add(pt);
-      if (rtxApt.containsKey(pt)) orderedH264WithRtx.add(rtxApt[pt]!);
-    }
-
-    for (final pt in pts) {
-      final isIncludedHevc = preferHevc && hevcPts.contains(pt);
-      final isIncludedH264 = h264Pts.contains(pt);
-      final isIncludedRtx = associatedRtx.contains(pt) &&
-          (preferHevc || !hevcPts.any((hp) => rtxApt[hp] == pt));
-      if (!isIncludedHevc && !isIncludedH264 && !isIncludedRtx) {
-        otherPts.add(pt);
-      }
-    }
-
-    lines[mLineIdx] = [
-      ...header,
-      ...orderedHevcWithRtx,
-      ...orderedH264WithRtx,
-      ...otherPts,
-    ].join(' ');
-    return _ensurePlayoutDelayExtInSdp(lines.join(eol));
-  }
-
-  static const _playoutDelayExtUri =
-      'http://www.webrtc.org/experiments/rtp-hdrext/playout-delay';
-
-  String _ensurePlayoutDelayExtInSdp(String sdp) {
-    if (sdp.isEmpty) return sdp;
-    final eol = sdp.contains('\r\n') ? '\r\n' : '\n';
-    final lines = sdp.split(RegExp(r'\r?\n'));
-    final usedIds = <int>{};
-    bool inVideo = false;
-    int videoStartIdx = -1;
-    int videoEndIdx = lines.length;
-    int lastVideoExtIdx = -1;
-    int firstVideoRtpmapIdx = -1;
-
-    for (var i = 0; i < lines.length; i++) {
-      final line = lines[i];
-      final em = RegExp(r'^a=extmap:(\d+)(?:/[^\s]+)?\s+(\S+)', caseSensitive: false)
-          .firstMatch(line);
-      if (em != null) {
-        final id = int.tryParse(em.group(1)!);
-        if (id != null) usedIds.add(id);
-        if (inVideo) {
-          lastVideoExtIdx = i;
-          if (em.group(2)!.toLowerCase() == _playoutDelayExtUri) {
-            return sdp;
-          }
-        }
-        continue;
-      }
-      if (line.startsWith('m=')) {
-        if (inVideo && videoEndIdx == lines.length) {
-          videoEndIdx = i;
-        }
-        inVideo = line.startsWith('m=video ');
-        if (inVideo) videoStartIdx = i;
-        continue;
-      }
-      if (inVideo && firstVideoRtpmapIdx < 0 && line.startsWith('a=rtpmap:')) {
-        firstVideoRtpmapIdx = i;
-      }
-    }
-
-    if (videoStartIdx < 0) return sdp;
-    int? chosenId;
-    for (var id = 1; id <= 14; id++) {
-      if (!usedIds.contains(id)) {
-        chosenId = id;
-        break;
-      }
-    }
-    if (chosenId == null) return sdp;
-
-    final insertAt = lastVideoExtIdx >= 0
-        ? lastVideoExtIdx + 1
-        : (firstVideoRtpmapIdx >= 0 ? firstVideoRtpmapIdx : videoEndIdx);
-    lines.insert(insertAt, 'a=extmap:$chosenId $_playoutDelayExtUri');
-    return lines.join(eol);
   }
 
   Future<void> _collectAndSendRxDiag() async {
@@ -1499,436 +1563,17 @@ class WebRtcSessionService extends ChangeNotifier {
     notifyListeners();
   }
 
-  void _sendFileJson(Map<String, dynamic> obj) {
-    final dc = _fileDc;
-    if (dc != null && dc.state == RTCDataChannelState.RTCDataChannelOpen) {
-      dc.send(RTCDataChannelMessage(jsonEncode(obj)));
-    }
-  }
-
-  void _abortFileTransferWaiters(String reason) {
-    if (_pendingOfferCompleter != null && !_pendingOfferCompleter!.isCompleted) {
-      _pendingOfferCompleter!.completeError(StateError(reason));
-    }
-    _pendingOfferCompleter = null;
-    _pendingOfferId = null;
-
-    if (_pendingAckCompleter != null && !_pendingAckCompleter!.isCompleted) {
-      _pendingAckCompleter!.completeError(StateError(reason));
-    }
-    _pendingAckCompleter = null;
-    _pendingAckId = null;
-  }
-
-  void _recordTransferHistory(FileTransferProgress item) {
-    recentTransfers.insert(0, item);
-    if (recentTransfers.length > 8) {
-      recentTransfers.removeRange(8, recentTransfers.length);
-    }
-  }
-
-  Future<void> _closeIncomingTemp({bool deleteFile = true}) async {
-    final sink = _incomingSink;
-    _incomingSink = null;
-    if (sink != null) {
-      try {
-        await sink.flush();
-      } catch (_) {}
-      try {
-        await sink.close();
-      } catch (_) {}
-    }
-    final tf = _incomingTempFile;
-    _incomingTempFile = null;
-    if (deleteFile && tf != null) {
-      try {
-        if (await tf.exists()) await tf.delete();
-      } catch (_) {}
-    }
-    _incomingFileId = null;
-    _incomingFileName = null;
-    _incomingFileMime = null;
-    _incomingFileTotal = 0;
-    _incomingFileReceived = 0;
-  }
-
-  Future<void> _deleteTempFileSilently(String path) async {
-    try {
-      final f = File(path);
-      if (await f.exists()) await f.delete();
-    } catch (_) {}
-  }
-
-  Future<void> sendLocalFile(PickedLocalFile file) async {
-    if (!fileChannelReady) {
-      await _deleteTempFileSilently(file.path);
-      _emitToast('文件传输通道尚未就绪，请先建立连接');
-      return;
-    }
-    if (_sendingFile) {
-      await _deleteTempFileSilently(file.path);
-      _emitToast('当前正在发送文件，请等待完成');
-      return;
-    }
-    if (file.size > _maxFileBytes) {
-      await _deleteTempFileSilently(file.path);
-      _emitToast('文件过大，单文件上限为 500MB');
-      return;
-    }
-
-    _sendingFile = true;
-    final transferId = 'mob_${DateTime.now().millisecondsSinceEpoch}';
-    var progressItem = FileTransferProgress(
-      id: transferId,
-      name: file.name,
-      totalBytes: file.size,
-      transferredBytes: 0,
-      isOutgoing: true,
-      state: FileTransferState.negotiating,
-      message: '等待电脑确认接收...',
-    );
-    activeFileTransfer = progressItem;
-    notifyListeners();
-
-    try {
-      final offerCompleter = Completer<void>();
-      _pendingOfferId = transferId;
-      _pendingOfferCompleter = offerCompleter;
-
-      _sendFileJson({
-        't': 'file:offer',
-        'id': transferId,
-        'name': file.name,
-        'size': file.size,
-        'mime': file.mime,
-      });
-
-      await offerCompleter.future.timeout(
-        const Duration(seconds: 10),
-        onTimeout: () => throw TimeoutException('电脑端响应超时'),
-      );
-
-      progressItem = progressItem.copyWith(
-        state: FileTransferState.transferring,
-        message: '正在发送至电脑...',
-      );
-      activeFileTransfer = progressItem;
-      notifyListeners();
-
-      var sentBytes = 0;
-      var chunkCounter = 0;
-      var lastUiMs = 0;
-      final srcFile = File(file.path);
-      await for (final data in srcFile.openRead()) {
-        final u8 = data is Uint8List ? data : Uint8List.fromList(data);
-        var offset = 0;
-        while (offset < u8.length) {
-          if (!fileChannelReady) {
-            throw StateError('文件传输通道已断开');
-          }
-          final end = (offset + _fileChunkBytes <= u8.length)
-              ? offset + _fileChunkBytes
-              : u8.length;
-          final slice = Uint8List.sublistView(u8, offset, end);
-          await _fileDc!.send(RTCDataChannelMessage.fromBinary(slice));
-          offset = end;
-          sentBytes += slice.length;
-          chunkCounter++;
-
-          if (chunkCounter % 8 == 0) {
-            try {
-              var buffered = await _fileDc!.getBufferedAmount();
-              while (buffered > 524288 && fileChannelReady) {
-                await Future<void>.delayed(const Duration(milliseconds: 15));
-                buffered = await _fileDc!.getBufferedAmount();
-              }
-            } catch (_) {}
-          }
-
-          final nowMs = DateTime.now().millisecondsSinceEpoch;
-          if (nowMs - lastUiMs >= 90 || sentBytes >= file.size) {
-            lastUiMs = nowMs;
-            progressItem = progressItem.copyWith(
-              transferredBytes: sentBytes,
-              message: '发送中...',
-            );
-            activeFileTransfer = progressItem;
-            notifyListeners();
-          }
-        }
-      }
-
-      progressItem = progressItem.copyWith(
-        transferredBytes: sentBytes,
-        state: FileTransferState.finalizing,
-        message: '等待电脑落盘确认...',
-      );
-      activeFileTransfer = progressItem;
-      notifyListeners();
-
-      final ackCompleter = Completer<Map<String, dynamic>>();
-      _pendingAckId = transferId;
-      _pendingAckCompleter = ackCompleter;
-      _sendFileJson({'t': 'file:done', 'id': transferId, 'bytes': sentBytes});
-
-      final ack = await ackCompleter.future.timeout(
-        const Duration(seconds: 15),
-        onTimeout: () => throw TimeoutException('等待电脑落盘确认超时'),
-      );
-
-      final savedName = (ack['savedName'] ?? file.name).toString();
-      final savedPath = (ack['savedPath'] ?? '下载/AirDesk/$savedName').toString();
-      final doneItem = progressItem.copyWith(
-        transferredBytes: file.size,
-        state: FileTransferState.completed,
-        message: '已保存到电脑',
-        savedPath: savedPath,
-      );
-      activeFileTransfer = null;
-      _recordTransferHistory(doneItem);
-      _emitToast('已发送到电脑：$savedName');
-    } catch (e) {
-      _sendFileJson({'t': 'file:cancel', 'id': transferId, 'reason': e.toString()});
-      final failItem = progressItem.copyWith(
-        state: FileTransferState.failed,
-        message: e.toString(),
-      );
-      activeFileTransfer = null;
-      _recordTransferHistory(failItem);
-      _emitToast('发送失败：$e');
-    } finally {
-      _sendingFile = false;
-      _pendingOfferId = null;
-      _pendingOfferCompleter = null;
-      _pendingAckId = null;
-      _pendingAckCompleter = null;
-      try {
-        final f = File(file.path);
-        if (await f.exists()) await f.delete();
-      } catch (_) {}
-      notifyListeners();
-    }
-  }
-
-  Future<void> _handleFileDcMessage(RTCDataChannelMessage message) async {
-    if (!message.isBinary) {
-      Map<String, dynamic> d;
-      try {
-        d = jsonDecode(message.text) as Map<String, dynamic>;
-      } catch (_) {
-        return;
-      }
-      final t = (d['t'] ?? '').toString();
-      final id = (d['id'] ?? '').toString();
-
-      if (t == 'file:accept') {
-        if (_pendingOfferId == id &&
-            _pendingOfferCompleter != null &&
-            !_pendingOfferCompleter!.isCompleted) {
-          _pendingOfferCompleter!.complete();
-        }
-        return;
-      }
-      if (t == 'file:reject') {
-        if (_pendingOfferId == id &&
-            _pendingOfferCompleter != null &&
-            !_pendingOfferCompleter!.isCompleted) {
-          _pendingOfferCompleter!.completeError(
-            StateError((d['reason'] ?? '电脑拒绝接收').toString()),
-          );
-        }
-        return;
-      }
-      if (t == 'file:ack') {
-        if (_pendingAckId == id &&
-            _pendingAckCompleter != null &&
-            !_pendingAckCompleter!.isCompleted) {
-          if (d['ok'] == false) {
-            _pendingAckCompleter!.completeError(
-              StateError((d['message'] ?? '保存失败').toString()),
-            );
-          } else {
-            _pendingAckCompleter!.complete(d);
-          }
-        }
-        return;
-      }
-      if (t == 'file:cancel') {
-        if (_incomingFileId != null && (id.isEmpty || id == _incomingFileId)) {
-          final cancelledName = _incomingFileName ?? '文件';
-          await _closeIncomingTemp(deleteFile: true);
-          activeFileTransfer = null;
-          _emitToast('对方取消了传输：$cancelledName');
-          notifyListeners();
-        }
-        return;
-      }
-      if (t == 'file:offer') {
-        final size = (d['size'] as num?)?.toInt() ?? 0;
-        final name = (d['name'] ?? 'airdesk-file.bin').toString();
-        final mime = (d['mime'] ?? 'application/octet-stream').toString();
-        if (_incomingFileId != null) {
-          _sendFileJson({'t': 'file:reject', 'id': id, 'reason': '手机正在接收另一个文件'});
-          return;
-        }
-        if (size < 0 || size > _maxFileBytes) {
-          _sendFileJson({'t': 'file:reject', 'id': id, 'reason': '文件大小超出 500MB 上限'});
-          return;
-        }
-        try {
-          final tempFile = File(
-            '${Directory.systemTemp.path}/airdesk_rx_${DateTime.now().millisecondsSinceEpoch}.part',
-          );
-          _incomingSink = tempFile.openWrite();
-          _incomingTempFile = tempFile;
-          _incomingFileId = id;
-          _incomingFileName = name;
-          _incomingFileMime = mime;
-          _incomingFileTotal = size;
-          _incomingFileReceived = 0;
-          activeFileTransfer = FileTransferProgress(
-            id: id,
-            name: name,
-            totalBytes: size,
-            transferredBytes: 0,
-            isOutgoing: false,
-            state: FileTransferState.transferring,
-            message: '正在接收来自电脑的文件...',
-          );
-          notifyListeners();
-          _sendFileJson({'t': 'file:accept', 'id': id});
-        } catch (e) {
-          await _closeIncomingTemp(deleteFile: true);
-          _sendFileJson({'t': 'file:reject', 'id': id, 'reason': e.toString()});
-        }
-        return;
-      }
-      if (t == 'file:done') {
-        if (_incomingFileId != id || _incomingTempFile == null) return;
-        final fileName = _incomingFileName ?? 'airdesk-file.bin';
-        final mime = _incomingFileMime ?? 'application/octet-stream';
-        final total = _incomingFileTotal;
-        final received = _incomingFileReceived;
-        final declaredDone = (d['bytes'] as num?)?.toInt() ?? total;
-        final tempFile = _incomingTempFile!;
-        final sink = _incomingSink;
-        _incomingSink = null;
-        if (sink != null) {
-          try {
-            await sink.flush();
-            await sink.close();
-          } catch (_) {}
-        }
-        if (received != total || received != declaredDone) {
-          await _closeIncomingTemp(deleteFile: true);
-          final failItem = FileTransferProgress(
-            id: id,
-            name: fileName,
-            totalBytes: total,
-            transferredBytes: received,
-            isOutgoing: false,
-            state: FileTransferState.failed,
-            message: '接收文件字节数不完整 ($received/$total)',
-          );
-          activeFileTransfer = null;
-          _recordTransferHistory(failItem);
-          _sendFileJson({
-            't': 'file:ack',
-            'id': id,
-            'ok': false,
-            'message': '接收文件字节数不完整',
-          });
-          _emitToast('接收文件失败：分片不完整');
-          notifyListeners();
-          return;
-        }
-        activeFileTransfer = activeFileTransfer?.copyWith(
-          state: FileTransferState.finalizing,
-          message: '正在保存到 Download/AirDesk...',
-        );
-        notifyListeners();
-
-        final saved = await NativeBridge.saveFileToDownloads(
-          tempPath: tempFile.path,
-          fileName: fileName,
-          mimeType: mime,
-        );
-        await _closeIncomingTemp(deleteFile: !saved.ok);
-        if (saved.ok) {
-          final doneItem = FileTransferProgress(
-            id: id,
-            name: saved.savedName,
-            totalBytes: total,
-            transferredBytes: total,
-            isOutgoing: false,
-            state: FileTransferState.completed,
-            message: '已保存',
-            savedPath: saved.displayPath,
-          );
-          activeFileTransfer = null;
-          _recordTransferHistory(doneItem);
-          _sendFileJson({
-            't': 'file:ack',
-            'id': id,
-            'ok': true,
-            'savedName': saved.savedName,
-            'savedPath': saved.displayPath,
-          });
-          _emitToast('已保存文件到 ${saved.displayPath}');
-        } else {
-          final failItem = FileTransferProgress(
-            id: id,
-            name: fileName,
-            totalBytes: total,
-            transferredBytes: 0,
-            isOutgoing: false,
-            state: FileTransferState.failed,
-            message: saved.error ?? '保存失败',
-          );
-          activeFileTransfer = null;
-          _recordTransferHistory(failItem);
-          _sendFileJson({
-            't': 'file:ack',
-            'id': id,
-            'ok': false,
-            'message': saved.error ?? '保存失败',
-          });
-          _emitToast('保存文件失败：${saved.error}');
-        }
-        notifyListeners();
-      }
-      return;
-    }
-
-    if (_incomingFileId == null || _incomingSink == null) return;
-    final bytes = message.binary;
-    if (_incomingFileReceived + bytes.length > _maxFileBytes) {
-      final badId = _incomingFileId!;
-      await _closeIncomingTemp(deleteFile: true);
-      activeFileTransfer = null;
-      _sendFileJson({'t': 'file:cancel', 'id': badId, 'reason': '超出大小限制'});
-      notifyListeners();
-      return;
-    }
-    _incomingSink!.add(bytes);
-    _incomingFileReceived += bytes.length;
-    final now = DateTime.now();
-    if (now.difference(_lastFileUiNotifyAt).inMilliseconds >= 90 ||
-        _incomingFileReceived >= _incomingFileTotal) {
-      _lastFileUiNotifyAt = now;
-      activeFileTransfer = activeFileTransfer?.copyWith(
-        transferredBytes: _incomingFileReceived,
-        message: '接收中...',
-      );
-      notifyListeners();
-    }
-  }
+  Future<void> sendLocalFile(PickedLocalFile file) => _fileTransfer.sendLocalFile(file);
 
   Future<void> _cleanupRtc() async {
     _iceRestartTimer?.cancel();
     _iceRestartTimer = null;
     _iceRestartWatchdogTimer?.cancel();
     _iceRestartWatchdogTimer = null;
+    _pendingIceRestartTimer?.cancel();
+    _pendingIceRestartTimer = null;
+    _pendingIceRestartAfterWs = false;
+    _lastIceConnectionState = null;
     _iceRestartAttempts = 0;
     _iceRestartInFlight = false;
     _clearPendingPointer();
@@ -1947,9 +1592,7 @@ class WebRtcSessionService extends ChangeNotifier {
     hostElevatedConnected = false;
     telemetry = const TelemetrySnapshot();
     _pendingRemoteIce.clear();
-    _abortFileTransferWaiters('WebRTC 连接已重置');
-    await _closeIncomingTemp(deleteFile: true);
-    activeFileTransfer = null;
+    await _fileTransfer.cleanup();
     try {
       await _reliableDc?.close();
     } catch (_) {}
@@ -1958,10 +1601,6 @@ class WebRtcSessionService extends ChangeNotifier {
       await _unreliableDc?.close();
     } catch (_) {}
     _unreliableDc = null;
-    try {
-      await _fileDc?.close();
-    } catch (_) {}
-    _fileDc = null;
     try {
       await _pc?.close();
     } catch (_) {}
@@ -1978,9 +1617,19 @@ class WebRtcSessionService extends ChangeNotifier {
     }
   }
 
-  Future<void> disconnect({bool silent = false}) async {
+  Future<void> disconnect({bool silent = false, bool resetOfflineRetry = true}) async {
     _manualDisconnect = true;
     _pendingAuthPassword = null;
+    _activeSessionToken = null;
+    _wsSilentReconnecting = false;
+    _wsSilentReconnectAttempt = 0;
+    _wsSilentReconnectTimer?.cancel();
+    _wsSilentReconnectTimer = null;
+    if (resetOfflineRetry) {
+      _hostOfflineRetryCount = 0;
+    }
+    _hostOfflineRetryTimer?.cancel();
+    _hostOfflineRetryTimer = null;
     _wsGen++;
     _rtcGen++;
     _clearPendingPointer();

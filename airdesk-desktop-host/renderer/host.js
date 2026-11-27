@@ -14,6 +14,7 @@ import {
 import { createAbrController } from './modules/abr-controller.mjs';
 import { createMediaCaptureManager } from './modules/media-capture.mjs';
 import { createFileTransferManager, formatFileBytes } from './modules/file-transfer.mjs';
+import { createSignalingClient } from './modules/signaling-client.mjs';
 
 const signalingModeSelect = document.getElementById('signalingMode');
 const serverInput = document.getElementById('serverUrl');
@@ -149,10 +150,7 @@ let prevOutboundSnap = null;
 let lastClientDiag = null;
 let lastClientDiagAt = 0;
 let remoteIceServers = [];
-let wsHeartbeatTimer = null;
-let wsPongTimeoutTimer = null;
-let wsReconnectTimer = null;
-let wsReconnectAttempt = 0;
+let activeSignalingUrl = '';
 let isManualStop = false;
 const WS_RECONNECT_DELAYS_MS = [2000, 5000, 10000, 30000];
 let hostIdentity = null;
@@ -1038,25 +1036,110 @@ function cleanupPeerConnection(scheduleIdleRelease = true) {
   }
 }
 
-function clearWsReconnectTimer() {
-  if (wsReconnectTimer) {
-    clearTimeout(wsReconnectTimer);
-    wsReconnectTimer = null;
-  }
-}
-
-function clearWsPongTimeout() {
-  if (wsPongTimeoutTimer) {
-    clearTimeout(wsPongTimeoutTimer);
-    wsPongTimeoutTimer = null;
-  }
-}
+const signalingClient = createSignalingClient({
+  reconnectDelaysMs: WS_RECONNECT_DELAYS_MS,
+  heartbeatIntervalMs: 25000,
+  pongTimeoutMs: 10000,
+  onOpen: (sock) => {
+    if (!isHosting || isManualStop) {
+      try {
+        sock.close();
+      } catch {}
+      return;
+    }
+    ws = sock;
+    const isRemote = signalingModeSelect.value === 'remote';
+    const hasLivePc = Boolean(pc && pc.connectionState !== 'closed');
+    const createPayload = {
+      type: 'host:create',
+      protoVersion: 2,
+      hostLabel: cachedHostname || 'AirDesk Desktop',
+      audioEnabled: Boolean(enableAudioCheckbox && enableAudioCheckbox.checked),
+    };
+    if (isRemote && hasLivePc) {
+      createPayload.resumeIfActive = true;
+    }
+    if (hostIdentity && hostIdentity.hostId && hostIdentity.hostSecret) {
+      createPayload.hostId = hostIdentity.hostId;
+      createPayload.hostSecret = hostIdentity.hostSecret;
+    }
+    if (signalingModeSelect.value === 'local' && localSignalingInfo && localSignalingInfo.localHostToken) {
+      createPayload.localHostToken = localSignalingInfo.localHostToken;
+    }
+    const rk = relayAccessKeyInput ? relayAccessKeyInput.value.trim() : '';
+    if (rk) createPayload.accessKey = rk;
+    sock.send(JSON.stringify(createPayload));
+  },
+  onError: (err, attempt, syncFailure) => {
+    if (syncFailure) {
+      if (signalingModeSelect.value === 'remote' && isHosting && !isManualStop) {
+        signalingClient.scheduleReconnect(activeSignalingUrl, { enableHeartbeat: true });
+      } else {
+        stopHost('信令连接创建失败：' + (err && err.message ? err.message : err));
+      }
+      return;
+    }
+    if (attempt === 0) {
+      showNotice('信令连接出现异常，请检查服务器地址或网络连通性');
+    }
+  },
+  onReconnectScheduled: (delayMs, attempt) => {
+    const hasLivePc = Boolean(pc && pc.connectionState !== 'closed');
+    if (!hasLivePc) {
+      setLivePill('waiting', '重连中');
+      statusEl.textContent =
+        '公网信令连接断开，' +
+        Math.round(delayMs / 1000) +
+        ' 秒后自动重连 (第 ' +
+        attempt +
+        ' 次)...';
+    } else {
+      statusEl.textContent =
+        '信令通道闪断，画面保持中，正在后台重连信令 (第 ' + attempt + ' 次)...';
+    }
+  },
+  onClose: (ev) => {
+    ws = null;
+    if (isManualStop || !isHosting) return;
+    if (ev && ev.code === 4003) {
+      stopHost('中继密钥或主机身份校验失败，已停止共享');
+      return;
+    }
+    if (signalingModeSelect.value === 'remote') {
+      const hasLivePc = Boolean(pc && pc.connectionState !== 'closed');
+      if (hasLivePc) {
+        hasPendingApproval = false;
+        pendingApprovalClient = null;
+        approvalCard.style.display = 'none';
+        statusEl.textContent = '信令通道闪断，画面保持中，正在后台重连信令...';
+        signalingClient.scheduleReconnect(activeSignalingUrl, { enableHeartbeat: true });
+        return;
+      }
+      hasPendingApproval = false;
+      pendingApprovalClient = null;
+      approvalCard.style.display = 'none';
+      hasActivePeer = false;
+      currentControlEnabled = false;
+      activePeerIsOverlay = false;
+      activeRelaySessionToken = '';
+      cleanupPeerConnection(false);
+      mediaCapture.releaseLocalCaptureMedia();
+      window.airdeskAPI.setSessionActive(false).catch(() => {});
+      pairCodeEl.textContent = '------';
+      renderPairQr('').catch(() => {});
+      updateControlButtonUi();
+      signalingClient.scheduleReconnect(activeSignalingUrl, { enableHeartbeat: true });
+      return;
+    }
+    stopHost('信令连接已断开，已自动释放采集并切回只读');
+  },
+  onMessage: async (msg, sock) => {
+    await handleSignalingMessage(msg, sock);
+  },
+});
 
 async function stopHost(reason) {
   isManualStop = true;
-  clearWsReconnectTimer();
-  clearWsPongTimeout();
-  wsReconnectAttempt = 0;
   mediaCapture.bumpSessionGen();
   isHosting = false;
   if (window.airdeskAPI.setHostingActive) {
@@ -1075,21 +1158,12 @@ async function stopHost(reason) {
     secureDesktopRecoverTimer = null;
   }
   mediaCapture.clearRecoverTimer();
-  if (wsHeartbeatTimer) {
-    clearInterval(wsHeartbeatTimer);
-    wsHeartbeatTimer = null;
-  }
   await window.airdeskAPI.setSessionActive(false);
   cleanupPeerConnection(false);
-  if (ws) {
-    if (ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ type: 'session:close', reason: reason || '电脑端已停止共享' }));
-    }
-    ws.onclose = null;
-    ws.onerror = null;
-    ws.close();
-    ws = null;
-  }
+  ws = null;
+  signalingClient.stop({
+    closePayload: { type: 'session:close', reason: reason || '电脑端已停止共享' },
+  });
   mediaCapture.releaseLocalCaptureMedia();
   approvalCard.style.display = 'none';
   pairCodeEl.textContent = '------';
@@ -1125,14 +1199,10 @@ function buildIceServers() {
 async function startHost() {
   if (isHosting) return;
   isManualStop = false;
-  clearWsReconnectTimer();
-  wsReconnectAttempt = 0;
+  signalingClient.resetReconnectAttempts();
+  signalingClient.clearReconnectTimer();
   mediaCapture.bumpSessionGen();
   remoteIceServers = [];
-  if (wsHeartbeatTimer) {
-    clearInterval(wsHeartbeatTimer);
-    wsHeartbeatTimer = null;
-  }
   localStorage.setItem(STORAGE_MODE_KEY, signalingModeSelect.value);
   if (signalingModeSelect.value === 'local') {
     localSignalingInfo = await window.airdeskAPI.startLocalSignaling(47820);
@@ -1182,307 +1252,204 @@ async function startHost() {
 
 function connectSignalingSocket(wsUrl) {
   if (!isHosting || isManualStop) return;
-  clearWsReconnectTimer();
-  clearWsPongTimeout();
-  if (wsHeartbeatTimer) {
-    clearInterval(wsHeartbeatTimer);
-    wsHeartbeatTimer = null;
-  }
-  if (ws) {
-    ws.onopen = null;
-    ws.onerror = null;
-    ws.onclose = null;
-    ws.onmessage = null;
-    try {
-      ws.close();
-    } catch {}
-    ws = null;
-  }
-
-  let sock;
-  try {
-    sock = new WebSocket(wsUrl);
-  } catch (err) {
-    if (signalingModeSelect.value === 'remote' && isHosting && !isManualStop) {
-      scheduleRelayWsReconnect(wsUrl);
-    } else {
-      stopHost('信令连接创建失败：' + err.message);
-    }
-    return;
-  }
-
-  ws = sock;
+  activeSignalingUrl = wsUrl;
+  ws = null;
+  const attempt = signalingClient.getReconnectAttempt();
   statusEl.textContent =
-    wsReconnectAttempt > 0
-      ? '正在尝试重新连接公网信令服务器 (第 ' + wsReconnectAttempt + ' 次)...'
+    attempt > 0
+      ? '正在尝试重新连接公网信令服务器 (第 ' + attempt + ' 次)...'
       : '正在连接信令服务器...';
+  signalingClient.connect(wsUrl, {
+    enableHeartbeat: signalingModeSelect.value === 'remote',
+  });
+}
 
-  sock.onopen = () => {
-    if (ws !== sock || !isHosting || isManualStop) {
-      try {
-        sock.close();
-      } catch {}
-      return;
+async function handleSignalingMessage(msg, sock) {
+  if (msg.type === 'ws:pong') {
+    return;
+  } else if (msg.type === 'error') {
+    showNotice(msg.message || '信令服务器返回错误');
+    statusEl.textContent = msg.message || '信令服务错误';
+    return;
+  } else if (msg.type === 'host:created' || msg.type === 'host:code_rotated') {
+    if (Array.isArray(msg.iceServers)) {
+      remoteIceServers = msg.iceServers;
     }
-    wsReconnectAttempt = 0;
-    clearWsReconnectTimer();
-    const createPayload = {
-      type: 'host:create',
-      protoVersion: 2,
-      hostLabel: cachedHostname || 'AirDesk Desktop',
-      audioEnabled: Boolean(enableAudioCheckbox && enableAudioCheckbox.checked),
-    };
-    if (hostIdentity && hostIdentity.hostId && hostIdentity.hostSecret) {
-      createPayload.hostId = hostIdentity.hostId;
-      createPayload.hostSecret = hostIdentity.hostSecret;
-    }
-    if (signalingModeSelect.value === 'local' && localSignalingInfo && localSignalingInfo.localHostToken) {
-      createPayload.localHostToken = localSignalingInfo.localHostToken;
-    }
-    const rk = relayAccessKeyInput ? relayAccessKeyInput.value.trim() : '';
-    if (rk) createPayload.accessKey = rk;
-    sock.send(JSON.stringify(createPayload));
-    if (signalingModeSelect.value === 'remote') {
-      wsHeartbeatTimer = setInterval(() => {
-        if (ws === sock && sock.readyState === WebSocket.OPEN) {
-          sock.send(JSON.stringify({ type: 'ws:ping', ts: Date.now() }));
-          clearWsPongTimeout();
-          wsPongTimeoutTimer = setTimeout(() => {
-            wsPongTimeoutTimer = null;
-            if (ws === sock && sock.readyState === WebSocket.OPEN) {
-              try {
-                sock.close(4008, 'pong timeout');
-              } catch {}
-            }
-          }, 10000);
-        }
-      }, 25000);
-    }
-  };
-
-  sock.onerror = () => {
-    if (ws !== sock) return;
-    if (wsReconnectAttempt === 0) {
-      showNotice('信令连接出现异常，请检查服务器地址或网络连通性');
-    }
-  };
-
-  sock.onclose = (ev) => {
-    if (ws !== sock) return;
-    clearWsPongTimeout();
-    if (wsHeartbeatTimer) {
-      clearInterval(wsHeartbeatTimer);
-      wsHeartbeatTimer = null;
-    }
-    if (isManualStop || !isHosting) return;
-    if (ev && ev.code === 4003) {
-      stopHost('中继密钥或主机身份校验失败，已停止共享');
-      return;
-    }
-    if (signalingModeSelect.value === 'remote') {
-      hasPendingApproval = false;
-      pendingApprovalClient = null;
-      approvalCard.style.display = 'none';
-      hasActivePeer = false;
-      currentControlEnabled = false;
-      activePeerIsOverlay = false;
-      activeRelaySessionToken = '';
-      cleanupPeerConnection(false);
-      mediaCapture.releaseLocalCaptureMedia();
-      window.airdeskAPI.setSessionActive(false).catch(() => {});
-      pairCodeEl.textContent = '------';
-      renderPairQr('').catch(() => {});
-      updateControlButtonUi();
-      scheduleRelayWsReconnect(wsUrl);
-      return;
-    }
-    stopHost('信令连接已断开，已自动释放采集并切回只读');
-  };
-
-  sock.onmessage = async (ev) => {
-    if (ws !== sock) return;
-    let msg;
-    try {
-      msg = JSON.parse(ev.data);
-    } catch {
-      return;
-    }
-    clearWsPongTimeout();
-
-    if (msg.type === 'ws:pong') {
-      return;
-    } else if (msg.type === 'error') {
-      showNotice(msg.message || '信令服务器返回错误');
-      statusEl.textContent = msg.message || '信令服务错误';
-      return;
-    } else if (msg.type === 'host:created' || msg.type === 'host:code_rotated') {
-      if (Array.isArray(msg.iceServers)) {
-        remoteIceServers = msg.iceServers;
-      }
+    const streamingNow = Boolean(pc && pc.connectionState === 'connected');
+    if (streamingNow) {
+      setLivePill('live', '串流中');
+    } else {
       setLivePill('waiting', '待连接');
-      pairCodeEl.textContent = msg.code;
-      await renderPairQr(msg.code);
-      const hasTurn = remoteIceServers.some((s) => {
-        const u = Array.isArray(s.urls) ? s.urls.join(',') : String(s.urls || '');
-        return /^turns?:/i.test(u);
-      });
-      const hostIdNote =
-        signalingModeSelect.value === 'remote' && hostIdentity && hostIdentity.hostId
-          ? ' · 主机 ID: ' + hostIdentity.hostId
-          : '';
+    }
+    pairCodeEl.textContent = msg.code;
+    await renderPairQr(msg.code);
+    const hasTurn = remoteIceServers.some((s) => {
+      const u = Array.isArray(s.urls) ? s.urls.join(',') : String(s.urls || '');
+      return /^turns?:/i.test(u);
+    });
+    const hostIdNote =
+      signalingModeSelect.value === 'remote' && hostIdentity && hostIdentity.hostId
+        ? ' · 主机 ID: ' + hostIdentity.hostId
+        : '';
+    if (streamingNow && msg.resumedActiveClient) {
+      statusEl.textContent = '公网信令已静默重连，WebRTC 串流保持中';
+    } else {
       statusEl.textContent =
         signalingModeSelect.value === 'local'
           ? '内置本地信令已就绪：手机连接同一热点/Wi-Fi 扫码即可 0 流量直连'
           : (hasTurn
               ? '公网信令已就绪（已配 TURN 中继兜底' + hostIdNote + '）：等待手机接入...'
               : '公网信令已就绪（STUN P2P 穿透' + hostIdNote + '）：等待手机接入...');
-    } else if (msg.type === 'host:password_challenge_request') {
-      const chalRes = await window.airdeskAPI.createPasswordChallenge({
-        challengeId: msg.challengeId,
-      });
-      if (ws === sock && sock.readyState === WebSocket.OPEN) {
-        sock.send(
-          JSON.stringify({
-            type: 'host:password_challenge_reply',
-            challengeId: msg.challengeId,
-            ok: Boolean(chalRes && chalRes.ok),
-            nonce: (chalRes && chalRes.nonce) || '',
-            salt: (chalRes && chalRes.salt) || '',
-            kdf: (chalRes && chalRes.kdf) || 'scrypt',
-            n: (chalRes && chalRes.n) || 16384,
-            r: (chalRes && chalRes.r) || 8,
-            p: (chalRes && chalRes.p) || 1,
-            dkLen: (chalRes && chalRes.dkLen) || 32,
-            code: (chalRes && chalRes.code) || '',
-            message: (chalRes && chalRes.message) || '',
-          })
-        );
-      }
-    } else if (msg.type === 'host:password_verify') {
-      const clientMeta = msg.client || {};
-      const verifyRes = await window.airdeskAPI.verifyPasswordChallenge({
-        challengeId: msg.challengeId,
-        proof: msg.proof,
-        deviceLabel: clientMeta.deviceLabel,
-        platformHint: clientMeta.platformHint,
-        ipMasked: clientMeta.ipMasked,
-      });
-      if (verifyRes && verifyRes.ok) {
-        activeRelaySessionToken = verifyRes.sessionToken;
-      }
-      if (window.airdeskAPI.getUnattendedPasswordStatus) {
-        updateUnattendedPasswordUi(await window.airdeskAPI.getUnattendedPasswordStatus());
-      }
-      if (ws === sock && sock.readyState === WebSocket.OPEN) {
-        sock.send(
-          JSON.stringify({
-            type: 'host:password_verified',
-            challengeId: msg.challengeId,
-            approved: Boolean(verifyRes && verifyRes.ok),
-            sessionToken: (verifyRes && verifyRes.sessionToken) || '',
-            mode: (verifyRes && verifyRes.mode) || 'full_control',
-            code: (verifyRes && verifyRes.code) || '',
-            message: (verifyRes && verifyRes.message) || '',
-          })
-        );
-      }
-    } else if (msg.type === 'host:verify_token') {
-      const clientMeta = msg.client || {};
-      const verifyRes = await window.airdeskAPI.verifyRelayTrustedToken({
-        sessionToken: msg.sessionToken,
-        ipMasked: clientMeta.ipMasked,
-        deviceLabel: clientMeta.deviceLabel,
-        platformHint: clientMeta.platformHint,
-      });
-      if (verifyRes && verifyRes.ok) {
-        activeRelaySessionToken = msg.sessionToken;
-      }
-      if (ws === sock && sock.readyState === WebSocket.OPEN) {
-        sock.send(
-          JSON.stringify({
-            type: 'host:token_verified',
-            verifyId: msg.verifyId,
-            approved: Boolean(verifyRes && verifyRes.ok),
-            mode: (verifyRes && verifyRes.mode) || 'view_only',
-            reason: (verifyRes && verifyRes.reason) || '',
-          })
-        );
-      }
-    } else if (msg.type === 'host:approval_request') {
-      hasPendingApproval = true;
-      pendingApprovalClient = msg.client || null;
-      activePeerIsOverlay = Boolean(msg.client && msg.client.isOverlayPeer);
-      const netBadge = activePeerIsOverlay ? ' [异地组网]' : '';
-      approvalDesc.textContent =
-        msg.client.deviceLabel +
-        ' (' +
-        msg.client.platformHint +
-        ' · ' +
-        msg.client.ipMasked +
-        ')' +
-        netBadge +
-        ' 请求连接';
-      approvalCard.style.display = 'block';
-    } else if (msg.type === 'rtc:offer') {
-      if (msg.iceRestart === true && pc && pc.signalingState !== 'closed') {
-        await handleIceRestartOffer(msg.sdp);
-      } else {
-        await handleOffer(msg.sdp);
-      }
-    } else if (msg.type === 'rtc:ice') {
-      if (pc && pc.remoteDescription) {
-        await pc.addIceCandidate(msg.candidate).catch(() => {});
-      } else {
-        pendingIceCandidates.push(msg.candidate);
-      }
-    } else if (msg.type === 'host:client_reconnected') {
-      hasActivePeer = true;
-      activePeerIsOverlay = Boolean(msg.isOverlayPeer);
-      currentControlEnabled = msg.mode === 'full_control';
-      await window.airdeskAPI.setSessionActive(true);
-      await window.airdeskAPI.setControlPermission(currentControlEnabled);
-      updateControlButtonUi();
-      statusEl.textContent = activePeerIsOverlay
-        ? '已信任设备通过异地组网切回前台，正在自动免审批重连...'
-        : '已信任设备切回前台，正在自动免审批重连...';
-      showNotice(
-        activePeerIsOverlay
-          ? '已信任手机端通过 Tailscale 异地自动重连（免二次审批）'
-          : '已信任手机端自动重连（免二次审批）'
-      );
-    } else if (msg.type === 'host:pending_cancelled') {
-      hasPendingApproval = false;
-      pendingApprovalClient = null;
-      approvalCard.style.display = 'none';
-      showNotice(msg.reason || '连接请求已取消');
-    } else if (msg.type === 'host:client_disconnected') {
-      statusEl.textContent = '客户端已断开：' + msg.reason;
-      currentControlEnabled = false;
-      activePeerIsOverlay = false;
-      activeRelaySessionToken = '';
-      if (isHosting) setLivePill('waiting', '待连接');
-      cleanupPeerConnection();
-      await window.airdeskAPI.setSessionActive(false);
     }
-  };
-}
-
-function scheduleRelayWsReconnect(wsUrl) {
-  if (!isHosting || isManualStop) return;
-  const delayMs = WS_RECONNECT_DELAYS_MS[Math.min(wsReconnectAttempt, WS_RECONNECT_DELAYS_MS.length - 1)];
-  wsReconnectAttempt += 1;
-  setLivePill('waiting', '重连中');
-  statusEl.textContent =
-    '公网信令连接断开，' +
-    Math.round(delayMs / 1000) +
-    ' 秒后自动重连 (第 ' +
-    wsReconnectAttempt +
-    ' 次)...';
-  clearWsReconnectTimer();
-  wsReconnectTimer = setTimeout(() => {
-    wsReconnectTimer = null;
-    connectSignalingSocket(wsUrl);
-  }, delayMs);
+  } else if (msg.type === 'host:password_challenge_request') {
+    const chalRes = await window.airdeskAPI.createPasswordChallenge({
+      challengeId: msg.challengeId,
+    });
+    if (ws === sock && sock.readyState === WebSocket.OPEN) {
+      sock.send(
+        JSON.stringify({
+          type: 'host:password_challenge_reply',
+          challengeId: msg.challengeId,
+          ok: Boolean(chalRes && chalRes.ok),
+          nonce: (chalRes && chalRes.nonce) || '',
+          salt: (chalRes && chalRes.salt) || '',
+          kdf: (chalRes && chalRes.kdf) || 'scrypt',
+          n: (chalRes && chalRes.n) || 16384,
+          r: (chalRes && chalRes.r) || 8,
+          p: (chalRes && chalRes.p) || 1,
+          dkLen: (chalRes && chalRes.dkLen) || 32,
+          code: (chalRes && chalRes.code) || '',
+          message: (chalRes && chalRes.message) || '',
+        })
+      );
+    }
+  } else if (msg.type === 'host:password_verify') {
+    const clientMeta = msg.client || {};
+    const verifyRes = await window.airdeskAPI.verifyPasswordChallenge({
+      challengeId: msg.challengeId,
+      proof: msg.proof,
+      deviceLabel: clientMeta.deviceLabel,
+      platformHint: clientMeta.platformHint,
+      ipMasked: clientMeta.ipMasked,
+    });
+    if (verifyRes && verifyRes.ok) {
+      activeRelaySessionToken = verifyRes.sessionToken;
+    }
+    if (window.airdeskAPI.getUnattendedPasswordStatus) {
+      updateUnattendedPasswordUi(await window.airdeskAPI.getUnattendedPasswordStatus());
+    }
+    if (ws === sock && sock.readyState === WebSocket.OPEN) {
+      sock.send(
+        JSON.stringify({
+          type: 'host:password_verified',
+          challengeId: msg.challengeId,
+          approved: Boolean(verifyRes && verifyRes.ok),
+          sessionToken: (verifyRes && verifyRes.sessionToken) || '',
+          mode: (verifyRes && verifyRes.mode) || 'full_control',
+          code: (verifyRes && verifyRes.code) || '',
+          message: (verifyRes && verifyRes.message) || '',
+        })
+      );
+    }
+  } else if (msg.type === 'host:verify_token') {
+    const clientMeta = msg.client || {};
+    const verifyRes = await window.airdeskAPI.verifyRelayTrustedToken({
+      sessionToken: msg.sessionToken,
+      ipMasked: clientMeta.ipMasked,
+      deviceLabel: clientMeta.deviceLabel,
+      platformHint: clientMeta.platformHint,
+    });
+    const approved = Boolean(verifyRes && verifyRes.ok);
+    const canReattach = Boolean(
+      msg.attachExisting === true &&
+        approved &&
+        pc &&
+        pc.signalingState !== 'closed' &&
+        activeRelaySessionToken &&
+        activeRelaySessionToken === msg.sessionToken
+    );
+    if (approved) {
+      activeRelaySessionToken = msg.sessionToken;
+    }
+    if (ws === sock && sock.readyState === WebSocket.OPEN) {
+      sock.send(
+        JSON.stringify({
+          type: 'host:token_verified',
+          verifyId: msg.verifyId,
+          approved,
+          reattached: canReattach,
+          mode: (verifyRes && verifyRes.mode) || 'view_only',
+          reason: (verifyRes && verifyRes.reason) || '',
+        })
+      );
+    }
+  } else if (msg.type === 'host:approval_request') {
+    hasPendingApproval = true;
+    pendingApprovalClient = msg.client || null;
+    activePeerIsOverlay = Boolean(msg.client && msg.client.isOverlayPeer);
+    const netBadge = activePeerIsOverlay ? ' [异地组网]' : '';
+    approvalDesc.textContent =
+      msg.client.deviceLabel +
+      ' (' +
+      msg.client.platformHint +
+      ' · ' +
+      msg.client.ipMasked +
+      ')' +
+      netBadge +
+      ' 请求连接';
+    approvalCard.style.display = 'block';
+  } else if (msg.type === 'rtc:offer') {
+    if (msg.iceRestart === true && pc && pc.signalingState !== 'closed') {
+      await handleIceRestartOffer(msg.sdp);
+    } else {
+      await handleOffer(msg.sdp);
+    }
+  } else if (msg.type === 'rtc:ice') {
+    if (pc && pc.remoteDescription) {
+      await pc.addIceCandidate(msg.candidate).catch(() => {});
+    } else {
+      pendingIceCandidates.push(msg.candidate);
+    }
+  } else if (msg.type === 'host:client_reattached') {
+    hasActivePeer = true;
+    activePeerIsOverlay = Boolean(msg.isOverlayPeer);
+    currentControlEnabled = msg.mode === 'full_control';
+    await window.airdeskAPI.setSessionActive(true);
+    await window.airdeskAPI.setControlPermission(currentControlEnabled);
+    updateControlButtonUi();
+    if (pc && pc.connectionState === 'connected') {
+      setLivePill('live', '串流中');
+    }
+    statusEl.textContent = '手机端信令已静默重连，画面保持中';
+  } else if (msg.type === 'host:client_reconnected') {
+    hasActivePeer = true;
+    activePeerIsOverlay = Boolean(msg.isOverlayPeer);
+    currentControlEnabled = msg.mode === 'full_control';
+    await window.airdeskAPI.setSessionActive(true);
+    await window.airdeskAPI.setControlPermission(currentControlEnabled);
+    updateControlButtonUi();
+    statusEl.textContent = activePeerIsOverlay
+      ? '已信任设备通过异地组网切回前台，正在自动免审批重连...'
+      : '已信任设备切回前台，正在自动免审批重连...';
+    showNotice(
+      activePeerIsOverlay
+        ? '已信任手机端通过 Tailscale 异地自动重连（免二次审批）'
+        : '已信任手机端自动重连（免二次审批）'
+    );
+  } else if (msg.type === 'host:pending_cancelled') {
+    hasPendingApproval = false;
+    pendingApprovalClient = null;
+    approvalCard.style.display = 'none';
+    showNotice(msg.reason || '连接请求已取消');
+  } else if (msg.type === 'host:client_disconnected') {
+    statusEl.textContent = '客户端已断开：' + msg.reason;
+    currentControlEnabled = false;
+    activePeerIsOverlay = false;
+    activeRelaySessionToken = '';
+    if (isHosting) setLivePill('waiting', '待连接');
+    cleanupPeerConnection();
+    await window.airdeskAPI.setSessionActive(false);
+  }
 }
 
 async function handleIceRestartOffer(remoteSdp) {
@@ -1620,18 +1587,20 @@ async function handleOffer(remoteSdp) {
           if (pc === currentPc && currentPc.connectionState !== 'connected') {
             resetOnConnectionLost(currentPc.connectionState).catch(() => {});
           }
-        }, 8000);
+        }, 12000);
       }
     } else if (state === 'failed') {
-      if (ws && ws.readyState === WebSocket.OPEN) {
+      const wsReadyOrReconnecting =
+        signalingModeSelect.value === 'remote' || (ws && ws.readyState === WebSocket.OPEN);
+      if (wsReadyOrReconnecting) {
         if (!disconnectGraceTimer) {
-          statusEl.textContent = 'WebRTC 链路中断 (failed)，等待手机端发起 iceRestart...';
+          statusEl.textContent = 'WebRTC 链路中断 (failed)，等待手机端信令重连 / iceRestart...';
           disconnectGraceTimer = setTimeout(() => {
             disconnectGraceTimer = null;
             if (pc === currentPc && currentPc.connectionState !== 'connected') {
               resetOnConnectionLost(currentPc.connectionState).catch(() => {});
             }
-          }, 3000);
+          }, 12000);
         }
       } else {
         if (disconnectGraceTimer) {
