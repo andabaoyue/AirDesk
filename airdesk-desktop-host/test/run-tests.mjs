@@ -1064,7 +1064,44 @@ execFileSync(process.execPath, ['--input-type=module', '--check'], {
       assert.equal(approved.hostId, identity.hostId);
       assert.equal('hostSecret' in approved, false);
 
-      clientWs.close();
+      // Host session:close must clear active/pending client slots & close old client so a new LAN client can join immediately
+      const clientClosedMsgP = new Promise((resolve) => {
+        const handler = (raw) => {
+          const msg = JSON.parse(raw.toString('utf8'));
+          if (msg.type === 'session:closed') {
+            clientWs.off('message', handler);
+            resolve(msg);
+          }
+        };
+        clientWs.on('message', handler);
+      });
+      const clientWsClosedP = new Promise((resolve) => clientWs.once('close', resolve));
+      hostWs.send(JSON.stringify({ type: 'session:close', reason: 'evicted_by_relay' }));
+      const closedMsg = await clientClosedMsgP;
+      assert.equal(closedMsg.reason, 'evicted_by_relay');
+      await clientWsClosedP;
+
+      const clientWs2 = new WebSocket(`ws://127.0.0.1:${freePort}/ws/signaling`);
+      await new Promise((resolve) => clientWs2.once('open', resolve));
+      const waiting2P = new Promise((resolve) => {
+        clientWs2.on('message', (raw) => {
+          const msg = JSON.parse(raw.toString('utf8'));
+          if (msg.type === 'client:waiting_approval' || msg.type === 'error') resolve(msg);
+        });
+      });
+      const approvalReq2P = new Promise((resolve) => {
+        hostWs.on('message', (raw) => {
+          const msg = JSON.parse(raw.toString('utf8'));
+          if (msg.type === 'host:approval_request') resolve(msg);
+        });
+      });
+      clientWs2.send(JSON.stringify({ type: 'client:join', code: created.code, deviceLabel: 'Pixel-2' }));
+      const waiting2 = await waiting2P;
+      assert.equal(waiting2.type, 'client:waiting_approval');
+      const approvalReq2 = await approvalReq2P;
+      assert.equal(approvalReq2.client.deviceLabel, 'Pixel-2');
+
+      clientWs2.close();
       hostWs.close();
     } finally {
       lanMgr.stopLocalSignalingServer();
