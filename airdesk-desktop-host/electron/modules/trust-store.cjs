@@ -130,6 +130,10 @@ function createTrustStore({ userDataDir, onTrustedDevicesChanged } = {}) {
       trustTtlOption: ttlOpt,
       autoStartOnBoot: Boolean(raw && raw.autoStartOnBoot),
       autoHostOnStartup: Boolean(raw && raw.autoHostOnStartup),
+      enableLocalLanAlongsideRelay:
+        raw && typeof raw.enableLocalLanAlongsideRelay === 'boolean'
+          ? raw.enableLocalLanAlongsideRelay
+          : true,
     };
   }
 
@@ -148,6 +152,10 @@ function createTrustStore({ userDataDir, onTrustedDevicesChanged } = {}) {
         patch.autoStartOnBoot !== undefined ? patch.autoStartOnBoot : cur.autoStartOnBoot,
       autoHostOnStartup:
         patch.autoHostOnStartup !== undefined ? patch.autoHostOnStartup : cur.autoHostOnStartup,
+      enableLocalLanAlongsideRelay:
+        patch.enableLocalLanAlongsideRelay !== undefined
+          ? patch.enableLocalLanAlongsideRelay
+          : cur.enableLocalLanAlongsideRelay,
     });
     cachedSettings = next;
     atomicWriteJson(settingsPath, next);

@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:io';
 import '../models/airdesk_models.dart';
 import 'storage_service.dart';
+import 'webrtc_session_service.dart';
 
 class DiscoveryService {
   static const int defaultPort = 47820;
@@ -36,17 +37,22 @@ class DiscoveryService {
     return results;
   }
 
-  Future<AirDeskHostInfo?> probeSingleHttpHost(String ip, {int port = defaultPort}) async {
-    final client = HttpClient()..connectionTimeout = const Duration(milliseconds: 900);
+  Future<AirDeskHostInfo?> probeSingleHttpHost(
+    String ip, {
+    int port = defaultPort,
+    Duration timeout = const Duration(milliseconds: 900),
+  }) async {
+    final client = HttpClient()..connectionTimeout = timeout;
     try {
       final req = await client.getUrl(Uri.parse('http://$ip:$port/api/discover'));
-      final res = await req.close().timeout(const Duration(milliseconds: 900));
+      final res = await req.close().timeout(timeout);
       if (res.statusCode != 200) return null;
       final body = await utf8.decoder.bind(res).join();
       final json = jsonDecode(body) as Map<String, dynamic>;
       if (json['ok'] != true) return null;
       final tok = await _storage.getTokenForHost(ip, port);
       return AirDeskHostInfo(
+        hostId: (json['hostId'] ?? '').toString().trim(),
         hostname: (json['hostname'] ?? ip).toString(),
         ip: ip,
         port: (json['port'] as num?)?.toInt() ?? port,
@@ -107,6 +113,7 @@ class DiscoveryService {
           final port = (json['port'] as num?)?.toInt() ?? defaultPort;
           final tok = await _storage.getTokenForHost(ip, port);
           found['$ip:$port'] = AirDeskHostInfo(
+            hostId: (json['hostId'] ?? '').toString().trim(),
             hostname: (json['hostname'] ?? ip).toString(),
             ip: ip,
             port: port,
@@ -154,8 +161,21 @@ class DiscoveryService {
 
   Future<void> _probeRecentHostsHttp(Map<String, AirDeskHostInfo> found) async {
     final recent = await _storage.getRecentHosts();
-    if (recent.isEmpty) return;
-    await Future.wait(recent.take(4).map((entry) async {
+    final profiles = await _storage.getSavedHostProfiles();
+    final targets = <({String ip, int port})>[];
+    final seen = <String>{};
+    for (final entry in recent.take(4)) {
+      final k = '${entry.ip}:${entry.port}';
+      if (seen.add(k)) targets.add((ip: entry.ip, port: entry.port));
+    }
+    for (final profile in profiles) {
+      if (profile.lastLanIp.isEmpty) continue;
+      final k = '${profile.lastLanIp}:${profile.lastLanPort}';
+      if (seen.add(k)) targets.add((ip: profile.lastLanIp, port: profile.lastLanPort));
+      if (targets.length >= 8) break;
+    }
+    if (targets.isEmpty) return;
+    await Future.wait(targets.map((entry) async {
       final info = await probeSingleHttpHost(entry.ip, port: entry.port);
       if (info != null) {
         found['${info.ip}:${info.port}'] = info;
@@ -187,21 +207,25 @@ class DiscoveryService {
       if (matchedIp != null && matchedIp.isNotEmpty) {
         final tok = await _storage.getTokenForHost(matchedIp, loopbackInfo.port);
         return AirDeskHostInfo(
+          hostId: loopbackInfo.hostId,
           hostname: '${loopbackInfo.hostname} (USB)',
           ip: matchedIp,
           port: loopbackInfo.port,
           version: loopbackInfo.version,
           allAddresses: loopbackInfo.allAddresses,
           hasTrustedToken: tok != null && tok.isNotEmpty,
+          isUsb: true,
         );
       }
       return AirDeskHostInfo(
+        hostId: loopbackInfo.hostId,
         hostname: '${loopbackInfo.hostname} (USB ADB)',
         ip: '127.0.0.1',
         port: loopbackInfo.port,
         version: loopbackInfo.version,
         allAddresses: loopbackInfo.allAddresses,
         hasTrustedToken: loopbackInfo.hasTrustedToken,
+        isUsb: true,
       );
     }
 
@@ -215,18 +239,89 @@ class DiscoveryService {
           final info = await probeSingleHttpHost(gw, port: port);
           if (info != null) {
             return AirDeskHostInfo(
+              hostId: info.hostId,
               hostname: '${info.hostname} (USB)',
               ip: gw,
               port: info.port,
               version: info.version,
               allAddresses: info.allAddresses,
               hasTrustedToken: info.hasTrustedToken,
+              isUsb: true,
             );
           }
         }
       }
     }
     return null;
+  }
+
+  Future<Map<String, RelayHostProbeStatus>> probeRelayHosts(
+    String relayUrl,
+    List<String> hostIds, {
+    Duration timeout = const Duration(milliseconds: 3000),
+  }) async {
+    final cleanUrl = relayUrl.trim();
+    if (cleanUrl.isEmpty) return {};
+    final uniqueIds = <String>[];
+    final seen = <String>{};
+    for (final rawId in hostIds) {
+      final id = rawId.trim();
+      if (id.isNotEmpty && seen.add(id)) {
+        uniqueIds.add(id);
+        if (uniqueIds.length >= 16) break;
+      }
+    }
+    if (uniqueIds.isEmpty) return {};
+
+    WebSocket? sock;
+    try {
+      final wsUrl = WebRtcSessionService.normalizeRelayWsUrl(cleanUrl);
+      sock = await WebSocket.connect(wsUrl).timeout(timeout);
+      final completer = Completer<Map<String, RelayHostProbeStatus>>();
+      final timer = Timer(timeout, () {
+        if (!completer.isCompleted) completer.complete({});
+      });
+      final sub = sock.listen(
+        (raw) {
+          try {
+            final msg = jsonDecode(raw.toString()) as Map<String, dynamic>;
+            if (msg['type'] == 'client:hosts_status' && msg['hosts'] is Map) {
+              final rawHosts = msg['hosts'] as Map;
+              final parsed = <String, RelayHostProbeStatus>{};
+              rawHosts.forEach((key, value) {
+                if (value is Map) {
+                  parsed[key.toString()] =
+                      RelayHostProbeStatus.fromJson(Map<String, dynamic>.from(value));
+                }
+              });
+              if (!completer.isCompleted) completer.complete(parsed);
+            } else if (msg['type'] == 'error') {
+              if (!completer.isCompleted) completer.complete({});
+            }
+          } catch (_) {}
+        },
+        onError: (_) {
+          if (!completer.isCompleted) completer.complete({});
+        },
+        onDone: () {
+          if (!completer.isCompleted) completer.complete({});
+        },
+      );
+      sock.add(jsonEncode({
+        'type': 'client:probe_hosts',
+        'hostIds': uniqueIds,
+      }));
+      final result = await completer.future;
+      timer.cancel();
+      await sub.cancel();
+      return result;
+    } catch (_) {
+      return {};
+    } finally {
+      try {
+        await sock?.close();
+      } catch (_) {}
+    }
   }
 
   Future<void> _probeUsbAndLocalbackHttp(

@@ -40,6 +40,18 @@ function createLanServerManager({
   let revokeOneTrustedTokenCallback = null;
   let updateActiveTrustedTokenModeCallback = null;
 
+  function getPublicHostId() {
+    try {
+      const identity =
+        trustStore && typeof trustStore.getOrCreateHostIdentity === 'function'
+          ? trustStore.getOrCreateHostIdentity()
+          : null;
+      return identity && typeof identity.hostId === 'string' ? identity.hostId : '';
+    } catch {
+      return '';
+    }
+  }
+
   function notifyTrustedDevicesUpdated() {
     const win = getMainWindow();
     if (win && !win.isDestroyed()) {
@@ -471,6 +483,7 @@ function createLanServerManager({
               service: 'airdesk',
               version: appVersion,
               lanFileTransfer: true,
+              hostId: getPublicHostId(),
               hostname: os.hostname(),
               port: localSignalingPort,
               preferredHttpUrl: info.preferredHttpUrl,
@@ -750,7 +763,7 @@ function createLanServerManager({
             };
             roomsByCode.set(code, room);
             socketRoom.set(ws, { room, role: 'host' });
-            sendWs(ws, { type: 'host:created', code, expiresAt: room.expiresAt });
+            sendWs(ws, { type: 'host:created', code, expiresAt: room.expiresAt, hostId: getPublicHostId() });
             return;
           }
           if (msg.type === 'client:join') {
@@ -782,6 +795,7 @@ function createLanServerManager({
               sendWs(ws, {
                 type: 'client:approved',
                 mode: tokenRecord.mode,
+                hostId: getPublicHostId(),
                 hostLabel: matchedRoom.hostLabel,
                 audioEnabled: Boolean(matchedRoom.audioEnabled),
                 sessionToken: msg.sessionToken,
@@ -862,7 +876,10 @@ function createLanServerManager({
             room.pendingClientMeta = null;
             if (!pending) return;
             if (!msg.approved) {
-              sendWs(pending, { type: 'client:rejected', reason: '电脑端已拒绝本次连接请求' });
+              sendWs(pending, {
+                type: 'client:rejected',
+                reason: msg.reason || '电脑端已拒绝本次连接请求',
+              });
               socketRoom.delete(pending);
               return;
             }
@@ -880,6 +897,7 @@ function createLanServerManager({
             sendWs(pending, {
               type: 'client:approved',
               mode: approvedMode,
+              hostId: getPublicHostId(),
               hostLabel: room.hostLabel,
               audioEnabled: Boolean(room.audioEnabled),
               sessionToken,
@@ -995,6 +1013,7 @@ function createLanServerManager({
                 t: 'airdesk:here',
                 service: 'airdesk',
                 version: appVersion,
+                hostId: getPublicHostId(),
                 hostname: os.hostname(),
                 port: localSignalingPort,
                 addresses: getLocalNetworkInterfaces()

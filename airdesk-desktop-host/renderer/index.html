@@ -240,6 +240,10 @@
             <button id="btnCopyTailscale" type="button" class="secondary sm">复制异地地址</button>
             <button id="btnToggleQrMode" type="button" class="secondary sm">切换异地二维码</button>
           </div>
+          <div id="dualLanRow" class="row" style="display:none;">
+            <span id="dualLanInfoText" class="mono" style="color:#60A5FA; word-break:break-all;"></span>
+            <button id="btnCopyDualLanCode" type="button" class="secondary sm">复制本地码</button>
+          </div>
           <div class="quick-toggles">
             <label class="toggle-chip" title="Windows 上同步采集桌面音频至手机端；手机端也可在连接后远程一键开关">
               <input id="enableAudio" type="checkbox" />
@@ -385,6 +389,10 @@
             <input id="relayAccessKey" type="text" style="display: none;" placeholder="可选中继访问密钥 (RELAY_ACCESS_KEY)" />
           </div>
           <div class="quick-toggles">
+            <label id="dualLanToggleWrap" class="toggle-chip" title="公网中继模式下同时在本地 47820 端口保持局域网/USB 直连通道，回家自动免流量直连">
+              <input id="enableLocalLanAlongsideRelay" type="checkbox" checked />
+              <span>公网模式同时开启局域网直连（双模常驻）</span>
+            </label>
             <label class="toggle-chip">
               <input id="lanNoStun" type="checkbox" checked />
               <span>纯局域网 / 手机热点免 STUN 极速直连</span>

@@ -1,5 +1,64 @@
 export const PLAYOUT_DELAY_EXT_URI = 'http://www.webrtc.org/experiments/rtp-hdrext/playout-delay';
 
+export function resolveEffectiveChannel({ activeSignalingChannel, signalingMode } = {}) {
+  if (activeSignalingChannel === 'lan' || activeSignalingChannel === 'relay') {
+    return activeSignalingChannel;
+  }
+  return signalingMode === 'remote' ? 'relay' : 'lan';
+}
+
+export function resolvePolicyBitrateCapKbps({ activeSignalingChannel, signalingMode } = {}) {
+  const effectiveChannel = resolveEffectiveChannel({ activeSignalingChannel, signalingMode });
+  return effectiveChannel === 'relay' ? 8000 : 35000;
+}
+
+export function resolveEffectiveLanNoStun({
+  activeSignalingChannel,
+  signalingMode,
+  lanNoStun = true,
+  activePeerIsOverlay = false,
+} = {}) {
+  const effectiveChannel = resolveEffectiveChannel({ activeSignalingChannel, signalingMode });
+  if (effectiveChannel === 'lan' && signalingMode === 'remote') {
+    return !activePeerIsOverlay;
+  }
+  return Boolean(lanNoStun);
+}
+
+export function resolveChannelIceServers({
+  activeSignalingChannel,
+  signalingMode,
+  lanNoStun = true,
+  activePeerIsOverlay = false,
+  remoteIceServers = [],
+  customIceServers = [],
+} = {}) {
+  const effectiveChannel = resolveEffectiveChannel({ activeSignalingChannel, signalingMode });
+  const effectiveLanNoStun = resolveEffectiveLanNoStun({
+    activeSignalingChannel: effectiveChannel,
+    signalingMode,
+    lanNoStun,
+    activePeerIsOverlay,
+  });
+  if (effectiveChannel === 'lan' && effectiveLanNoStun) {
+    return [];
+  }
+  const merged = [];
+  if (effectiveChannel === 'relay' && Array.isArray(remoteIceServers) && remoteIceServers.length > 0) {
+    merged.push(...remoteIceServers);
+  }
+  if (Array.isArray(customIceServers) && customIceServers.length > 0) {
+    merged.push(...customIceServers);
+  }
+  if (merged.length > 0) {
+    return merged;
+  }
+  if (effectiveLanNoStun) {
+    return [];
+  }
+  return [{ urls: 'stun:stun.miwifi.com:3478' }, { urls: 'stun:stun.l.google.com:19302' }];
+}
+
 export function isLanLikeConnection({ isRelay, lanNoStun, activePeerIsOverlay }) {
   return Boolean(lanNoStun) && !activePeerIsOverlay && !isRelay;
 }

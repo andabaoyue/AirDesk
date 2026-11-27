@@ -16,6 +16,10 @@ const { createLanServerManager } = require('../electron/modules/lan-server.cjs')
 import {
   isLanLikeConnection,
   computeTieredVideoBitrates,
+  resolveEffectiveChannel,
+  resolvePolicyBitrateCapKbps,
+  resolveEffectiveLanNoStun,
+  resolveChannelIceServers,
   scoreH264Fmtp,
   sortPreferredVideoCodecs,
   boostVideoSdpBitrate,
@@ -447,6 +451,7 @@ execFileSync(process.execPath, ['--input-type=module', '--check'], {
       trustTtlOption: 'never',
       autoStartOnBoot: true,
       autoHostOnStartup: true,
+      enableLocalLanAlongsideRelay: true,
     });
     const verifiedNever = store1.verifyAndTouchToken(issued7d.sessionToken, { ipMasked: '5.6.7.8' });
     assert.equal(verifiedNever.ok, true);
@@ -983,6 +988,154 @@ execFileSync(process.execPath, ['--input-type=module', '--check'], {
   assert.ok(hostSrc.includes('12000'));
 }
 
+// 9. PR 3: Dual signaling policy helpers, lan-server hostId exposure & trust-store dual setting
+{
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'airdesk-pr3-test-'));
+  try {
+    const store = createTrustStore({ userDataDir: tmpDir });
+    const identity = store.getOrCreateHostIdentity();
+    assert.equal(store.getHostSettings().enableLocalLanAlongsideRelay, true);
+    const updated = store.updateHostSettings({ enableLocalLanAlongsideRelay: false });
+    assert.equal(updated.enableLocalLanAlongsideRelay, false);
+
+    // 9a. lan-server /api/discover and local client:approved include hostId and never leak hostSecret
+    const lanMgr = createLanServerManager({
+      appVersion: '0.9.0-test',
+      trustStore: store,
+      getMainWindow: () => null,
+      getHasActiveSession: () => false,
+      getAuthoritativeControl: () => false,
+      getAirDeskDownloadsDir: () => tmpDir,
+      sanitizeFileName: (n) => n,
+      allocateUniqueFilePath: (d, n) => ({ finalName: n, finalPath: path.join(d, n) }),
+      maxFileTransferBytes: 1024 * 1024,
+      buildEmbeddedMobileClientHtml: () => '<html></html>',
+    });
+
+    const freePort = await new Promise((resolve, reject) => {
+      const srv = net.createServer();
+      srv.listen(0, '127.0.0.1', () => {
+        const addr = srv.address();
+        srv.close((err) => (err ? reject(err) : resolve(addr.port)));
+      });
+    });
+
+    await lanMgr.startLocalSignalingServer(freePort);
+    try {
+      const discoverRes = await fetch(`http://127.0.0.1:${freePort}/api/discover`);
+      assert.equal(discoverRes.status, 200);
+      const discoverJson = await discoverRes.json();
+      assert.equal(discoverJson.ok, true);
+      assert.equal(discoverJson.hostId, identity.hostId);
+      assert.equal('hostSecret' in discoverJson, false);
+      assert.ok(!JSON.stringify(discoverJson).includes(identity.hostSecret));
+
+      const hostWs = new WebSocket(`ws://127.0.0.1:${freePort}/ws/signaling`);
+      await new Promise((resolve) => hostWs.once('open', resolve));
+      const createdP = new Promise((resolve) => {
+        hostWs.on('message', (raw) => {
+          const msg = JSON.parse(raw.toString('utf8'));
+          if (msg.type === 'host:created') resolve(msg);
+        });
+      });
+      hostWs.send(JSON.stringify({ type: 'host:create', hostLabel: 'DualHost' }));
+      const created = await createdP;
+      assert.equal(created.hostId, identity.hostId);
+
+      const clientWs = new WebSocket(`ws://127.0.0.1:${freePort}/ws/signaling`);
+      await new Promise((resolve) => clientWs.once('open', resolve));
+      const approvalReqP = new Promise((resolve) => {
+        hostWs.on('message', (raw) => {
+          const msg = JSON.parse(raw.toString('utf8'));
+          if (msg.type === 'host:approval_request') resolve(msg);
+        });
+      });
+      clientWs.send(JSON.stringify({ type: 'client:join', code: created.code, deviceLabel: 'Pixel' }));
+      await approvalReqP;
+
+      const approvedP = new Promise((resolve) => {
+        clientWs.on('message', (raw) => {
+          const msg = JSON.parse(raw.toString('utf8'));
+          if (msg.type === 'client:approved') resolve(msg);
+        });
+      });
+      hostWs.send(JSON.stringify({ type: 'host:approval_decision', approved: true, mode: 'full_control' }));
+      const approved = await approvedP;
+      assert.equal(approved.hostId, identity.hostId);
+      assert.equal('hostSecret' in approved, false);
+
+      clientWs.close();
+      hostWs.close();
+    } finally {
+      lanMgr.stopLocalSignalingServer();
+    }
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+
+  // 9b. Dual-mode channel policy ensures LAN traffic in remote mode is NOT capped at 8 Mbps or forced to use STUN/TURN
+  assert.equal(resolveEffectiveChannel({ activeSignalingChannel: 'lan', signalingMode: 'remote' }), 'lan');
+  assert.equal(resolvePolicyBitrateCapKbps({ activeSignalingChannel: 'lan', signalingMode: 'remote' }), 35000);
+  assert.equal(resolvePolicyBitrateCapKbps({ activeSignalingChannel: 'relay', signalingMode: 'remote' }), 8000);
+
+  const dualLanNoStun = resolveEffectiveLanNoStun({
+    activeSignalingChannel: 'lan',
+    signalingMode: 'remote',
+    lanNoStun: false,
+    activePeerIsOverlay: false,
+  });
+  assert.equal(dualLanNoStun, true);
+  assert.equal(
+    isLanLikeConnection({
+      isRelay: resolveEffectiveChannel({ activeSignalingChannel: 'lan', signalingMode: 'remote' }) === 'relay',
+      lanNoStun: dualLanNoStun,
+      activePeerIsOverlay: false,
+    }),
+    true
+  );
+  assert.deepEqual(
+    resolveChannelIceServers({
+      activeSignalingChannel: 'lan',
+      signalingMode: 'remote',
+      lanNoStun: false,
+      activePeerIsOverlay: false,
+      remoteIceServers: [{ urls: 'turn:relay.example.com:3478' }],
+      customIceServers: [{ urls: 'stun:stun.example.com:3478' }],
+    }),
+    []
+  );
+  assert.equal(
+    computeTieredVideoBitrates({
+      isRelay: false,
+      lanNoStun: dualLanNoStun,
+      activePeerIsOverlay: false,
+      fps: 60,
+      resolution: '1080p',
+    }).maxKbps,
+    22000
+  );
+
+  const dualRelayIce = resolveChannelIceServers({
+    activeSignalingChannel: 'relay',
+    signalingMode: 'remote',
+    lanNoStun: false,
+    activePeerIsOverlay: false,
+    remoteIceServers: [{ urls: 'turn:relay.example.com:3478' }],
+    customIceServers: [],
+  });
+  assert.equal(dualRelayIce.length, 1);
+  assert.equal(dualRelayIce[0].urls, 'turn:relay.example.com:3478');
+
+  // 9c. Structural guards in host.js for PR 3 dual signaling
+  const hostSrc = fs.readFileSync(hostJsPath, 'utf8');
+  assert.ok(hostSrc.includes('relaySignalingClient'));
+  assert.ok(hostSrc.includes('localSignalingClient'));
+  assert.ok(hostSrc.includes('ws://127.0.0.1:'));
+  assert.ok(hostSrc.includes('resolvePolicyBitrateCapKbps'));
+  assert.ok(hostSrc.includes('resolveChannelIceServers'));
+  assert.ok(hostSrc.includes('enableLocalLanAlongsideRelay'));
+}
+
 console.log(
-  `[AirDesk Tests] Passed syntax checks (${cjsFiles.length} CJS, ${mjsFiles.length} MJS, host.js) + sdp-codec, abr-controller, trust-store, PR 0, PR 1 & PR 2 tests.`
+  `[AirDesk Tests] Passed syntax checks (${cjsFiles.length} CJS, ${mjsFiles.length} MJS, host.js) + sdp-codec, abr-controller, trust-store, PR 0, PR 1, PR 2 & PR 3 tests.`
 );

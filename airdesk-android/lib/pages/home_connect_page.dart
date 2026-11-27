@@ -7,6 +7,7 @@ import '../services/lan_file_service.dart';
 import '../services/native_bridge.dart';
 import '../services/storage_service.dart';
 import '../services/webrtc_session_service.dart';
+import '../widgets/home/device_book_section.dart';
 import 'remote_stage_page.dart';
 
 class HomeConnectPage extends StatefulWidget {
@@ -37,8 +38,12 @@ class _HomeConnectPageState extends State<HomeConnectPage> {
   List<AirDeskHostInfo> _discovered = [];
   List<RecentHostEntry> _recent = [];
   List<SavedRemoteHost> _remoteHosts = [];
+  List<SavedHostProfile> _hostProfiles = [];
+  Map<String, RelayHostProbeStatus> _relayProbeStatus = {};
+  Map<String, bool> _profileHasToken = {};
   Map<String, bool> _remoteHasToken = {};
   bool _scanning = false;
+  bool _probingRelay = false;
   bool _batteryExempt = true;
   bool _navigatedToStage = false;
   bool _allowOverlayTun = false;
@@ -76,6 +81,7 @@ class _HomeConnectPageState extends State<HomeConnectPage> {
   Future<void> _initData() async {
     final recent = await widget.storage.getRecentHosts();
     final remotes = await widget.storage.getRemoteHosts();
+    final hostProfiles = await widget.storage.getSavedHostProfiles();
     final allowOverlay = await widget.storage.getAllowOverlayTun();
     await NativeBridge.setAllowOverlayTun(allowOverlay);
     final overlayInfo = await NativeBridge.getOverlayNetworkInfo();
@@ -90,6 +96,20 @@ class _HomeConnectPageState extends State<HomeConnectPage> {
       final t = await widget.storage.getTokenForHost(r.ip, r.port);
       tokMap['${r.ip}:${r.port}'] = t != null && t.isNotEmpty;
     }
+    final profileTokMap = <String, bool>{};
+    for (final p in hostProfiles) {
+      var hasTok = false;
+      if (p.lastLanIp.isNotEmpty) {
+        final lt = await widget.storage.getTokenForHost(p.lastLanIp, p.lastLanPort);
+        if (lt != null && lt.isNotEmpty) hasTok = true;
+      }
+      if (!hasTok && p.relayUrl.isNotEmpty) {
+        final rk = WebRtcSessionService.tokenKeyForEndpoint(signalingUrl: p.relayUrl);
+        final rt = await widget.storage.getTokenForRelay(rk, hostId: p.hostId);
+        if (rt != null && rt.isNotEmpty) hasTok = true;
+      }
+      profileTokMap[p.hostId] = hasTok;
+    }
     var relayTok = false;
     String? savedRelayHostId;
     if (savedRelay.isNotEmpty) {
@@ -102,6 +122,8 @@ class _HomeConnectPageState extends State<HomeConnectPage> {
     setState(() {
       _recent = recent;
       _remoteHosts = remotes;
+      _hostProfiles = hostProfiles;
+      _profileHasToken = profileTokMap;
       _remoteHasToken = tokMap;
       _allowOverlayTun = allowOverlay;
       _localTailscaleIp = overlayInfo.tailscaleIp;
@@ -124,7 +146,7 @@ class _HomeConnectPageState extends State<HomeConnectPage> {
         _ipCtrl.text = recent.first.ip;
       }
     });
-    _scanLan();
+    await _refreshAll();
   }
 
   Future<void> _refreshOverlayStatus() async {
@@ -173,6 +195,132 @@ class _HomeConnectPageState extends State<HomeConnectPage> {
         _ipCtrl.text = hosts.first.ip;
       }
     });
+  }
+
+  Future<void> _probeSavedRelayHosts() async {
+    if (_probingRelay || _hostProfiles.isEmpty) return;
+    final byRelayUrl = <String, List<String>>{};
+    final defaultRelayUrl = _relayUrlCtrl.text.trim();
+    for (final profile in _hostProfiles) {
+      final rUrl = profile.relayUrl.isNotEmpty ? profile.relayUrl : defaultRelayUrl;
+      if (rUrl.isEmpty) continue;
+      byRelayUrl.putIfAbsent(rUrl, () => []).add(profile.hostId);
+    }
+    if (byRelayUrl.isEmpty) return;
+    if (mounted) setState(() => _probingRelay = true);
+    final nextStatus = <String, RelayHostProbeStatus>{};
+    await Future.wait(
+      byRelayUrl.entries.map((entry) async {
+        final res = await widget.discovery.probeRelayHosts(entry.key, entry.value);
+        nextStatus.addAll(res);
+      }),
+    );
+    if (!mounted) return;
+    setState(() {
+      _relayProbeStatus = nextStatus;
+      _probingRelay = false;
+    });
+  }
+
+  Future<void> _refreshAll() async {
+    await Future.wait([
+      _scanLan(),
+      _probeSavedRelayHosts(),
+    ]);
+  }
+
+  AirDeskHostInfo? _findDiscoveredByHostId(String hostId, {required bool isUsb}) {
+    for (final h in _discovered) {
+      if (h.isUsb == isUsb && h.hostId == hostId) return h;
+    }
+    return null;
+  }
+
+  Future<void> _smartConnectProfile(SavedHostProfile profile) async {
+    if (profile.preferLanFirst) {
+      final usbMatch = _findDiscoveredByHostId(profile.hostId, isUsb: true);
+      if (usbMatch != null) {
+        String? tok = await widget.storage.getTokenForHost(usbMatch.ip, usbMatch.port);
+        if ((tok == null || tok.isEmpty) && profile.relayUrl.isNotEmpty) {
+          final rk = WebRtcSessionService.tokenKeyForEndpoint(signalingUrl: profile.relayUrl);
+          tok = await widget.storage.getTokenForRelay(rk, hostId: profile.hostId);
+        }
+        if (tok != null && tok.isNotEmpty) {
+          _showSnack('Smart Route: 命中 USB 有线直连 (${usbMatch.ip})');
+          await widget.session.connect(
+            hostIp: usbMatch.ip,
+            port: usbMatch.port,
+            hostId: profile.hostId,
+            sessionToken: tok,
+          );
+          return;
+        }
+      }
+
+      final lanDiscovered = _findDiscoveredByHostId(profile.hostId, isUsb: false);
+      final candidateIp = lanDiscovered?.ip ?? profile.lastLanIp;
+      final candidatePort = lanDiscovered?.port ?? profile.lastLanPort;
+      if (candidateIp.isNotEmpty) {
+        final probed = await widget.discovery.probeSingleHttpHost(
+          candidateIp,
+          port: candidatePort,
+          timeout: const Duration(milliseconds: 500),
+        );
+        if (!mounted) return;
+        if (probed != null && probed.hostId.isNotEmpty && probed.hostId == profile.hostId) {
+          String? tok = await widget.storage.getTokenForHost(probed.ip, probed.port);
+          if ((tok == null || tok.isEmpty) && profile.relayUrl.isNotEmpty) {
+            final rk = WebRtcSessionService.tokenKeyForEndpoint(signalingUrl: profile.relayUrl);
+            tok = await widget.storage.getTokenForRelay(rk, hostId: profile.hostId);
+          }
+          if (tok != null && tok.isNotEmpty) {
+            _showSnack('Smart Route: 命中局域网 0 流量直连 (${probed.ip})');
+            await widget.session.connect(
+              hostIp: probed.ip,
+              port: probed.port,
+              hostId: profile.hostId,
+              sessionToken: tok,
+            );
+            return;
+          }
+          _showPinDialog(probed.ip, probed.port);
+          return;
+        }
+      }
+    }
+
+    if (profile.relayUrl.isNotEmpty) {
+      final rk = WebRtcSessionService.tokenKeyForEndpoint(signalingUrl: profile.relayUrl);
+      String? tok = await widget.storage.getTokenForRelay(rk, hostId: profile.hostId);
+      if ((tok == null || tok.isEmpty) && profile.lastLanIp.isNotEmpty) {
+        tok = await widget.storage.getTokenForHost(profile.lastLanIp, profile.lastLanPort);
+      }
+      final customIce = profile.customIceRaw.trim();
+      if (tok != null && tok.isNotEmpty) {
+        _showSnack('Smart Route: 回落至公网中继直连');
+        await widget.session.connect(
+          signalingUrl: profile.relayUrl,
+          customIceRaw: customIce.isEmpty ? null : customIce,
+          sessionToken: tok,
+          hostId: profile.hostId,
+        );
+        return;
+      }
+      setState(() {
+        _homeTab = 2;
+        _relayUrlCtrl.text = profile.relayUrl;
+        _relayHostIdCtrl.text = profile.hostId;
+        if (customIce.isNotEmpty) _customIceCtrl.text = customIce;
+      });
+      _showRelayPinDialog();
+      return;
+    }
+
+    if (profile.lastLanIp.isNotEmpty) {
+      _showPinDialog(profile.lastLanIp, profile.lastLanPort);
+      return;
+    }
+    _showSnack('未检测到该主机的局域网或中继可用路径');
   }
 
   void _showSnack(String text) {
@@ -1875,7 +2023,7 @@ class _HomeConnectPageState extends State<HomeConnectPage> {
       backgroundColor: const Color(0xFF05070A),
       body: SafeArea(
         child: RefreshIndicator(
-          onRefresh: _scanLan,
+          onRefresh: _refreshAll,
           child: ListView(
             padding: const EdgeInsets.fromLTRB(16, 14, 16, 20),
             children: [
@@ -1918,6 +2066,22 @@ class _HomeConnectPageState extends State<HomeConnectPage> {
               if (widget.session.statusMessage.isNotEmpty && phase != SessionPhase.idle)
                 _buildStatusBanner(phase, busy),
               const SizedBox(height: 12),
+              if (_hostProfiles.isNotEmpty)
+                DeviceBookSection(
+                  profiles: _hostProfiles,
+                  discoveredHosts: _discovered,
+                  relayProbeStatus: _relayProbeStatus,
+                  profileHasToken: _profileHasToken,
+                  busy: busy,
+                  scanning: _scanning || _probingRelay,
+                  onRefresh: _refreshAll,
+                  onConnect: _smartConnectProfile,
+                  onQuickFile: (h) => _showLanFileTransferSheet(h.ip, h.port, h.hostname),
+                  onDelete: (p) async {
+                    await widget.storage.removeHostProfile(p.hostId);
+                    await _initData();
+                  },
+                ),
               _buildSegmentedTabs(),
               const SizedBox(height: 12),
               switch (_homeTab) {

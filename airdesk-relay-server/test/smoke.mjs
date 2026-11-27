@@ -833,7 +833,108 @@ async function run() {
       }
     }
 
-    console.log('RELAY_SMOKE_TEST_ALL_9_CHECKS_PASSED');
+    // 10. PR 3 client:probe_hosts (online/busy/offline, 16-ID cap, zero metadata leak, independent rate-limit bucket)
+    {
+      const pRelay = createRelayServer({ probeRateLimitMax: 3, gracePeriodMs: 250 });
+      await new Promise((resolve) => pRelay.server.listen(0, '127.0.0.1', resolve));
+      const pAddr = pRelay.server.address();
+      const pWsUrl = `ws://127.0.0.1:${pAddr.port}/ws/signaling`;
+      try {
+        const ph1 = await openWs(pWsUrl);
+        const pc1P = nextMsg(ph1, (m) => m.type === 'host:created');
+        ph1.send(
+          JSON.stringify({
+            type: 'host:create',
+            protoVersion: 2,
+            hostId: 'probehost01',
+            hostSecret: 'secret_probe_host_01_abcdef123456',
+            hostLabel: 'SecretIdleMachine',
+          })
+        );
+        const pc1 = await pc1P;
+
+        const ph2 = await openWs(pWsUrl);
+        const pc2P = nextMsg(ph2, (m) => m.type === 'host:created');
+        ph2.send(
+          JSON.stringify({
+            type: 'host:create',
+            protoVersion: 2,
+            hostId: 'probehost02',
+            hostSecret: 'secret_probe_host_02_abcdef123456',
+            hostLabel: 'SecretBusyMachine',
+          })
+        );
+        await pc2P;
+
+        const pClient = await openWs(pWsUrl);
+        const vBusyP = nextMsg(ph2, (m) => m.type === 'host:verify_token');
+        pClient.send(
+          JSON.stringify({
+            type: 'client:join',
+            protoVersion: 2,
+            hostId: 'probehost02',
+            sessionToken: crypto.randomBytes(16).toString('hex'),
+          })
+        );
+        const vBusy = await vBusyP;
+        const appBusyP = nextMsg(pClient, (m) => m.type === 'client:approved');
+        ph2.send(
+          JSON.stringify({
+            type: 'host:token_verified',
+            verifyId: vBusy.verifyId,
+            approved: true,
+            mode: 'full_control',
+          })
+        );
+        await appBusyP;
+
+        // 10a. Probe 19 IDs (with duplicate) -> truncated to 16, accurate online/busy, zero hostLabel/secret/code leak
+        const prober = await openWs(pWsUrl);
+        const status1P = nextMsg(prober, (m) => m.type === 'client:hosts_status');
+        const manyIds = ['probehost01', 'probehost02', 'probehost02', 'offlinehost03'];
+        for (let i = 0; i < 16; i += 1) manyIds.push(`extrahost_${i}`);
+        prober.send(JSON.stringify({ type: 'client:probe_hosts', hostIds: manyIds }));
+        const status1 = await status1P;
+        const keys = Object.keys(status1.hosts || {});
+        assert.equal(keys.length, 16);
+        assert.deepEqual(status1.hosts.probehost01, { online: true, busy: false });
+        assert.deepEqual(status1.hosts.probehost02, { online: true, busy: true });
+        assert.deepEqual(status1.hosts.offlinehost03, { online: false, busy: false });
+        const serialized = JSON.stringify(status1);
+        assert.ok(!serialized.includes('SecretIdleMachine'));
+        assert.ok(!serialized.includes('SecretBusyMachine'));
+        assert.ok(!serialized.includes('secret_probe_host'));
+        assert.ok(!serialized.includes(pc1.code));
+
+        // 10b. Exhaust probeRateLimitMax (3 allowed -> 4th returns PROBE_RATE_LIMITED) without blocking client:join
+        const status2P = nextMsg(prober, (m) => m.type === 'client:hosts_status');
+        prober.send(JSON.stringify({ type: 'client:probe_hosts', hostIds: ['probehost01'] }));
+        await status2P;
+        const status3P = nextMsg(prober, (m) => m.type === 'client:hosts_status');
+        prober.send(JSON.stringify({ type: 'client:probe_hosts', hostIds: ['probehost01'] }));
+        await status3P;
+        const probeErrP = nextMsg(prober, (m) => m.type === 'error');
+        prober.send(JSON.stringify({ type: 'client:probe_hosts', hostIds: ['probehost01'] }));
+        const probeErr = await probeErrP;
+        assert.equal(probeErr.code, 'PROBE_RATE_LIMITED');
+
+        const joiner = await openWs(pWsUrl);
+        const waitP = nextMsg(joiner, (m) => m.type === 'client:waiting_approval');
+        joiner.send(JSON.stringify({ type: 'client:join', code: pc1.code, deviceLabel: 'PostProbeJoiner' }));
+        const waitMsg = await waitP;
+        assert.equal(waitMsg.type, 'client:waiting_approval');
+
+        joiner.close();
+        prober.close();
+        pClient.close();
+        ph1.close();
+        ph2.close();
+      } finally {
+        await pRelay.close();
+      }
+    }
+
+    console.log('RELAY_SMOKE_TEST_ALL_10_CHECKS_PASSED');
   } finally {
     await relay.close();
   }

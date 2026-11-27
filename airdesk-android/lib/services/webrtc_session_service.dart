@@ -858,6 +858,20 @@ class WebRtcSessionService extends ChangeNotifier {
       if (!isRelayMode && hostIp.isNotEmpty) {
         await storage.saveRecentHost(hostIp, port, hostLabel);
       }
+      final profileHostId = approvedHostId.isNotEmpty ? approvedHostId : (_activeHostId ?? '').trim();
+      if (profileHostId.isNotEmpty) {
+        await storage.upsertHostProfile(
+          SavedHostProfile(
+            hostId: profileHostId,
+            hostLabel: hostLabel.isNotEmpty ? hostLabel : profileHostId,
+            relayUrl: isRelayMode ? (_activeSignalingUrl ?? '') : '',
+            lastLanIp: !isRelayMode ? hostIp : '',
+            lastLanPort: !isRelayMode ? port : 47820,
+            customIceRaw: isRelayMode ? (_activeCustomIceRaw ?? '') : '',
+            lastUsedMs: DateTime.now().millisecondsSinceEpoch,
+          ),
+        );
+      }
       if (shouldSkipRtcRebuildOnApproved(msg, hasLivePc: _pc != null && !_manualDisconnect)) {
         _remoteAudioTrack?.enabled = !audioMuted;
         _emitToast('信令通道已静默重连，画面保持中');
