@@ -142,15 +142,20 @@ namespace AirDeskWinHelper
         );
 
         private static readonly object _stdoutLock = new object();
+        private static readonly object _monitorLock = new object();
+        private static bool _sessionActive = false;
         private static LowLevelMouseProc _mouseProc;
         private static IntPtr _mouseHookHandle = IntPtr.Zero;
         private static uint _hookThreadId = 0;
+        private static Thread _hookThread = null;
+        private static Thread _notifyThread = null;
+        private static Thread _secureDesktopThread = null;
         private static long _lastPhysicalNotifyMs = 0;
         private static int _physicalMousePending = 0;
         private static readonly AutoResetEvent _physicalMouseSignal = new AutoResetEvent(false);
         private static volatile bool _hookStopping = false;
         private static volatile bool _secureDesktopStopping = false;
-        private static readonly AutoResetEvent _secureDesktopStopEvent = new AutoResetEvent(false);
+        private static readonly ManualResetEvent _secureDesktopStopEvent = new ManualResetEvent(false);
         private static long _lastSendErrorLogMs = 0;
 
         private static int _cachedVx = 0;
@@ -268,42 +273,55 @@ namespace AirDeskWinHelper
             return Encoding.Unicode.GetString(buf).TrimEnd('\0');
         }
 
+        static bool? SampleSecureDesktop()
+        {
+            bool? sampleSecure = null;
+            IntPtr hDesk = OpenInputDesktop(0, false, DESKTOP_READOBJECTS);
+            if (hDesk == IntPtr.Zero)
+            {
+                int err = Marshal.GetLastWin32Error();
+                if (err == ERROR_ACCESS_DENIED)
+                {
+                    sampleSecure = true;
+                }
+            }
+            else
+            {
+                try
+                {
+                    string name = GetDesktopName(hDesk);
+                    if (!string.IsNullOrEmpty(name))
+                    {
+                        sampleSecure = !string.Equals(name, "Default", StringComparison.OrdinalIgnoreCase);
+                    }
+                }
+                finally
+                {
+                    CloseDesktop(hDesk);
+                }
+            }
+            return sampleSecure;
+        }
+
         static void StartSecureDesktopMonitor()
         {
             _secureDesktopStopping = false;
             Thread monitorThread = new Thread(() =>
             {
                 bool reportedSecure = false;
+                bool? initSecure = SampleSecureDesktop();
+                if (initSecure.HasValue)
+                {
+                    reportedSecure = initSecure.Value;
+                    EmitJsonLine("{\"event\":\"secure_desktop\",\"active\":" + (reportedSecure ? "true" : "false") + "}");
+                }
+
                 bool? pendingSecure = null;
                 int pendingCount = 0;
                 while (!_secureDesktopStopping)
                 {
                     if (_secureDesktopStopEvent.WaitOne(400) || _secureDesktopStopping) break;
-                    bool? sampleSecure = null;
-                    IntPtr hDesk = OpenInputDesktop(0, false, DESKTOP_READOBJECTS);
-                    if (hDesk == IntPtr.Zero)
-                    {
-                        int err = Marshal.GetLastWin32Error();
-                        if (err == ERROR_ACCESS_DENIED)
-                        {
-                            sampleSecure = true;
-                        }
-                    }
-                    else
-                    {
-                        try
-                        {
-                            string name = GetDesktopName(hDesk);
-                            if (!string.IsNullOrEmpty(name))
-                            {
-                                sampleSecure = !string.Equals(name, "Default", StringComparison.OrdinalIgnoreCase);
-                            }
-                        }
-                        finally
-                        {
-                            CloseDesktop(hDesk);
-                        }
-                    }
+                    bool? sampleSecure = SampleSecureDesktop();
 
                     if (!sampleSecure.HasValue) continue;
                     bool nowSecure = sampleSecure.Value;
@@ -332,6 +350,7 @@ namespace AirDeskWinHelper
                 }
             });
             monitorThread.IsBackground = true;
+            _secureDesktopThread = monitorThread;
             monitorThread.Start();
         }
 
@@ -339,6 +358,12 @@ namespace AirDeskWinHelper
         {
             _secureDesktopStopping = true;
             _secureDesktopStopEvent.Set();
+            Thread t = _secureDesktopThread;
+            _secureDesktopThread = null;
+            if (t != null && t.IsAlive && Thread.CurrentThread != t)
+            {
+                try { t.Join(400); } catch { }
+            }
         }
 
         static void StartPhysicalMouseMonitor()
@@ -348,7 +373,7 @@ namespace AirDeskWinHelper
             {
                 while (!_hookStopping)
                 {
-                    _physicalMouseSignal.WaitOne(500);
+                    _physicalMouseSignal.WaitOne();
                     if (_hookStopping) break;
                     if (Interlocked.Exchange(ref _physicalMousePending, 0) == 1)
                     {
@@ -357,6 +382,7 @@ namespace AirDeskWinHelper
                 }
             });
             notifyThread.IsBackground = true;
+            _notifyThread = notifyThread;
             notifyThread.Start();
 
             Thread hookThread = new Thread(() =>
@@ -370,6 +396,7 @@ namespace AirDeskWinHelper
                 if (h != IntPtr.Zero) UnhookWindowsHookEx(h);
             });
             hookThread.IsBackground = true;
+            _hookThread = hookThread;
             hookThread.Start();
         }
 
@@ -385,6 +412,45 @@ namespace AirDeskWinHelper
             if (_hookThreadId != 0)
             {
                 try { PostThreadMessage(_hookThreadId, WM_QUIT, IntPtr.Zero, IntPtr.Zero); } catch { }
+            }
+            Thread ht = _hookThread;
+            _hookThread = null;
+            if (ht != null && ht.IsAlive && Thread.CurrentThread != ht)
+            {
+                try { ht.Join(400); } catch { }
+            }
+            Thread nt = _notifyThread;
+            _notifyThread = null;
+            if (nt != null && nt.IsAlive && Thread.CurrentThread != nt)
+            {
+                try { nt.Join(400); } catch { }
+            }
+            _hookThreadId = 0;
+        }
+
+        static void SetSessionActive(bool active)
+        {
+            lock (_monitorLock)
+            {
+                if (active == _sessionActive) return;
+                if (active)
+                {
+                    _sessionActive = true;
+                    _hookStopping = false;
+                    _secureDesktopStopping = false;
+                    Interlocked.Exchange(ref _physicalMousePending, 0);
+                    Interlocked.Exchange(ref _lastPhysicalNotifyMs, 0);
+                    _physicalMouseSignal.Reset();
+                    _secureDesktopStopEvent.Reset();
+                    StartPhysicalMouseMonitor();
+                    StartSecureDesktopMonitor();
+                }
+                else
+                {
+                    _sessionActive = false;
+                    StopSecureDesktopMonitor();
+                    StopPhysicalMouseMonitor();
+                }
             }
         }
 
@@ -652,8 +718,6 @@ namespace AirDeskWinHelper
                 try { SetProcessDPIAware(); } catch { }
             }
             RefreshVirtualScreenBounds(true);
-            StartPhysicalMouseMonitor();
-            StartSecureDesktopMonitor();
 
             JavaScriptSerializer serializer = new JavaScriptSerializer { MaxJsonLength = 2000000 };
 
@@ -744,6 +808,12 @@ namespace AirDeskWinHelper
                             bool en = obj.TryGetValue("enabled", out enVal) && enVal is bool && (bool)enVal;
                             SetWindowAnimationSuppressed(en);
                         }
+                        else if (t == "sys:session_state")
+                        {
+                            object actVal;
+                            bool act = obj.TryGetValue("active", out actVal) && actVal is bool && (bool)actVal;
+                            SetSessionActive(act);
+                        }
                     }
                     catch
                     {
@@ -753,8 +823,7 @@ namespace AirDeskWinHelper
             }
             finally
             {
-                StopSecureDesktopMonitor();
-                StopPhysicalMouseMonitor();
+                SetSessionActive(false);
                 SetWindowAnimationSuppressed(false);
                 ReleaseAllKeysAndMouse();
             }

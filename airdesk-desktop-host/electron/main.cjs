@@ -65,6 +65,8 @@ let registeredShortcuts = [];
 // Authoritative security & anti-stuck-key state owned strictly by Main Process
 let authoritativeControlEnabled = false;
 let hasActiveSession = false;
+let isHostingActive = false;
+let heartbeatWatchdogTimer = null;
 let physicalMouseSilencedUntil = 0;
 let lastHeartbeatAt = 0;
 let activeDisplayId = '';
@@ -367,7 +369,7 @@ function createWindow(startHidden = false) {
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true,
-      backgroundThrottling: false,
+      backgroundThrottling: true,
     },
   });
   mainWindow.setMenuBarVisibility(false);
@@ -386,6 +388,34 @@ function createWindow(startHidden = false) {
   });
 
   mainWindow.loadFile(path.join(APP_ROOT_DIR, 'renderer', 'index.html'));
+}
+
+function syncBackgroundThrottling() {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    const keepAwake = Boolean(hasActiveSession || isHostingActive);
+    mainWindow.webContents.setBackgroundThrottling(!keepAwake);
+  }
+}
+
+function startHeartbeatWatchdog() {
+  if (heartbeatWatchdogTimer) return;
+  heartbeatWatchdogTimer = setInterval(() => {
+    if (
+      authoritativeControlEnabled &&
+      lastHeartbeatAt > 0 &&
+      Date.now() - lastHeartbeatAt > 3000 &&
+      (activePressedKeys.size > 0 || activePressedMouseButtons.size > 0)
+    ) {
+      helperManager.releaseAllInputs('heartbeat_timeout');
+    }
+  }, 1000);
+}
+
+function stopHeartbeatWatchdog() {
+  if (heartbeatWatchdogTimer) {
+    clearInterval(heartbeatWatchdogTimer);
+    heartbeatWatchdogTimer = null;
+  }
 }
 
 function startPowerSaveBlockerIfNeeded() {
@@ -438,17 +468,6 @@ app.whenReady().then(async () => {
   screen.on('display-added', notifyDisplaysChanged);
   screen.on('display-removed', notifyDisplaysChanged);
   screen.on('display-metrics-changed', notifyDisplaysChanged);
-
-  setInterval(() => {
-    if (
-      authoritativeControlEnabled &&
-      lastHeartbeatAt > 0 &&
-      Date.now() - lastHeartbeatAt > 3000 &&
-      (activePressedKeys.size > 0 || activePressedMouseButtons.size > 0)
-    ) {
-      helperManager.releaseAllInputs('heartbeat_timeout');
-    }
-  }, 1000);
 });
 
 app.on('activate', () => {
@@ -471,7 +490,9 @@ app.on('before-quit', () => {
 });
 
 app.on('will-quit', () => {
+  stopHeartbeatWatchdog();
   inputRouter.clearCursorSyncTimer();
+  helperManager.sendToHelper({ t: 'sys:session_state', active: false });
   helperManager.sendToHelper({ t: 'sys:fast_win_anim', enabled: false });
   virtualAudioManager.restoreVirtualAudioOutput();
   abortAllActiveFileReceives();
@@ -724,10 +745,20 @@ ipcMain.handle('airdesk:set-active-display', (event, displayId) => {
   return { ok: true, displayId: activeDisplayId };
 });
 
+ipcMain.handle('airdesk:set-hosting-active', (event, active) => {
+  validateIpcSender(event);
+  isHostingActive = Boolean(active);
+  syncBackgroundThrottling();
+  return { isHostingActive };
+});
+
 ipcMain.handle('airdesk:set-session-active', (event, active) => {
   validateIpcSender(event);
   hasActiveSession = Boolean(active);
+  syncBackgroundThrottling();
+  helperManager.sendToHelper({ t: 'sys:session_state', active: hasActiveSession });
   if (!hasActiveSession) {
+    stopHeartbeatWatchdog();
     stopPowerSaveBlockerIfActive();
     inputRouter.clearCursorSyncTimer();
     authoritativeControlEnabled = false;
@@ -736,6 +767,7 @@ ipcMain.handle('airdesk:set-session-active', (event, active) => {
     helperManager.releaseAllInputs('session_inactive');
     helperManager.sendToHelper({ t: 'sys:fast_win_anim', enabled: false });
   } else {
+    startHeartbeatWatchdog();
     startPowerSaveBlockerIfNeeded();
     helperManager.sendToHelper({ t: 'sys:fast_win_anim', enabled: true });
   }
