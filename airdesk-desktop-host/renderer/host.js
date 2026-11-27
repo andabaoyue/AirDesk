@@ -150,11 +150,13 @@ let lastClientDiag = null;
 let lastClientDiagAt = 0;
 let remoteIceServers = [];
 let wsHeartbeatTimer = null;
+let wsPongTimeoutTimer = null;
 let wsReconnectTimer = null;
 let wsReconnectAttempt = 0;
 let isManualStop = false;
 const WS_RECONNECT_DELAYS_MS = [2000, 5000, 10000, 30000];
 let hostIdentity = null;
+let cachedHostname = '';
 let pendingApprovalClient = null;
 let activeRelaySessionToken = '';
 let lastRemoteInputAt = Date.now();
@@ -1043,9 +1045,17 @@ function clearWsReconnectTimer() {
   }
 }
 
+function clearWsPongTimeout() {
+  if (wsPongTimeoutTimer) {
+    clearTimeout(wsPongTimeoutTimer);
+    wsPongTimeoutTimer = null;
+  }
+}
+
 async function stopHost(reason) {
   isManualStop = true;
   clearWsReconnectTimer();
+  clearWsPongTimeout();
   wsReconnectAttempt = 0;
   mediaCapture.bumpSessionGen();
   isHosting = false;
@@ -1173,6 +1183,7 @@ async function startHost() {
 function connectSignalingSocket(wsUrl) {
   if (!isHosting || isManualStop) return;
   clearWsReconnectTimer();
+  clearWsPongTimeout();
   if (wsHeartbeatTimer) {
     clearInterval(wsHeartbeatTimer);
     wsHeartbeatTimer = null;
@@ -1218,7 +1229,7 @@ function connectSignalingSocket(wsUrl) {
     const createPayload = {
       type: 'host:create',
       protoVersion: 2,
-      hostLabel: 'AirDesk Electron Desktop',
+      hostLabel: cachedHostname || 'AirDesk Desktop',
       audioEnabled: Boolean(enableAudioCheckbox && enableAudioCheckbox.checked),
     };
     if (hostIdentity && hostIdentity.hostId && hostIdentity.hostSecret) {
@@ -1235,6 +1246,15 @@ function connectSignalingSocket(wsUrl) {
       wsHeartbeatTimer = setInterval(() => {
         if (ws === sock && sock.readyState === WebSocket.OPEN) {
           sock.send(JSON.stringify({ type: 'ws:ping', ts: Date.now() }));
+          clearWsPongTimeout();
+          wsPongTimeoutTimer = setTimeout(() => {
+            wsPongTimeoutTimer = null;
+            if (ws === sock && sock.readyState === WebSocket.OPEN) {
+              try {
+                sock.close(4008, 'pong timeout');
+              } catch {}
+            }
+          }, 10000);
         }
       }, 25000);
     }
@@ -1249,6 +1269,7 @@ function connectSignalingSocket(wsUrl) {
 
   sock.onclose = (ev) => {
     if (ws !== sock) return;
+    clearWsPongTimeout();
     if (wsHeartbeatTimer) {
       clearInterval(wsHeartbeatTimer);
       wsHeartbeatTimer = null;
@@ -1286,6 +1307,7 @@ function connectSignalingSocket(wsUrl) {
     } catch {
       return;
     }
+    clearWsPongTimeout();
 
     if (msg.type === 'ws:pong') {
       return;
@@ -1510,8 +1532,10 @@ async function handleOffer(remoteSdp) {
   mediaCapture.cancelIdleCaptureRelease();
   cleanupPeerConnection(false);
 
+  const resolvedIceServers = buildIceServers();
   const currentPc = new RTCPeerConnection({
-    iceServers: buildIceServers(),
+    iceServers: resolvedIceServers,
+    iceCandidatePoolSize: resolvedIceServers.length > 0 ? 2 : 0,
     bundlePolicy: 'max-bundle',
     rtcpMuxPolicy: 'require',
   });
@@ -1765,28 +1789,51 @@ async function handleOffer(remoteSdp) {
     }
     lastAppliedVideoParams = null;
     videoSender = pc.addTrack(vTrack, localStream);
-    if (enableAudioCheckbox && enableAudioCheckbox.checked) {
+
+    const audioTransceiver = pc
+      .getTransceivers()
+      .find(
+        (t) =>
+          (t.receiver && t.receiver.track && t.receiver.track.kind === 'audio') ||
+          (t.sender && t.sender.track && t.sender.track.kind === 'audio')
+      );
+    const wantAudio = Boolean(enableAudioCheckbox && enableAudioCheckbox.checked);
+    if (wantAudio) {
       await mediaCapture.maybeRouteVirtualAudioForStream();
       const curAudioTrack = mediaCapture.getLocalAudioTrack();
       if (!curAudioTrack || curAudioTrack.readyState !== 'live') {
         await mediaCapture.ensureDesktopAudioTrack();
       }
     }
-    const aTrack = mediaCapture.getLocalAudioTrack() || localStream.getAudioTracks()[0];
-    audioSender = aTrack ? pc.addTrack(aTrack, localStream) : null;
+    const aTrack = wantAudio ? mediaCapture.getLocalAudioTrack() || localStream.getAudioTracks()[0] || null : null;
+    if (audioTransceiver) {
+      // Prevent Unified Plan from negotiating a=inactive when audio is initially muted
+      audioTransceiver.direction = 'sendonly';
+      audioSender = audioTransceiver.sender;
+      if (audioSender) {
+        await audioSender.replaceTrack(aTrack).catch(() => {});
+      }
+    } else {
+      // Legacy / embedded Web PWA fallback when offer lacks an audio transceiver
+      audioSender = aTrack ? pc.addTrack(aTrack, localStream) : null;
+    }
 
     const videoTransceiver = pc.getTransceivers().find((t) => t.sender === videoSender);
-    if (videoTransceiver && RTCRtpReceiver.getCapabilities) {
-      const recvCaps = RTCRtpReceiver.getCapabilities('video');
-      if (recvCaps && recvCaps.codecs) {
-        const preferHevc = Boolean(codecSelect && codecSelect.value === 'hevc') || sdpPrefersHevc(remoteSdp);
-        const preferredCodecs = sortPreferredVideoCodecs(recvCaps.codecs, preferHevc);
-        if (preferredCodecs.length) {
-          try {
-            videoTransceiver.setCodecPreferences(preferredCodecs);
-          } catch (err) {
-            console.warn('[AirDesk] Codec preference rejected, keeping default codecs:', err.name, err.message);
-          }
+    const videoCapabilities =
+      (typeof RTCRtpSender !== 'undefined' &&
+        RTCRtpSender.getCapabilities &&
+        RTCRtpSender.getCapabilities('video')) ||
+      (typeof RTCRtpReceiver !== 'undefined' &&
+        RTCRtpReceiver.getCapabilities &&
+        RTCRtpReceiver.getCapabilities('video'));
+    if (videoTransceiver && videoCapabilities && videoCapabilities.codecs) {
+      const preferHevc = Boolean(codecSelect && codecSelect.value === 'hevc') || sdpPrefersHevc(remoteSdp);
+      const preferredCodecs = sortPreferredVideoCodecs(videoCapabilities.codecs, preferHevc);
+      if (preferredCodecs.length) {
+        try {
+          videoTransceiver.setCodecPreferences(preferredCodecs);
+        } catch (err) {
+          console.warn('[AirDesk] Codec preference rejected, keeping default codecs:', err.name, err.message);
         }
       }
     }
@@ -1875,6 +1922,7 @@ function rejectRequest() {
 
 async function init() {
   const info = await window.airdeskAPI.getSystemInfo();
+  cachedHostname = typeof info.hostname === 'string' ? info.hostname.trim() : '';
   hostIdentity = info.hostIdentity || null;
   if (hostIdTextEl) {
     hostIdTextEl.textContent = (hostIdentity && hostIdentity.hostId) || '------------';

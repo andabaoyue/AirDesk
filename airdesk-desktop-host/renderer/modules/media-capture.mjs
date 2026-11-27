@@ -486,21 +486,29 @@ export function createMediaCaptureManager({
         if (ws && ws.readyState === WebSocket.OPEN) {
           ws.send(JSON.stringify({ type: 'host:update_config', audioEnabled: actualAudio }));
         }
-        if (hasActivePeer && (actualAudio || !next)) {
+        if (hasActivePeer && (actualAudio || !next) && !audioSender) {
           onAudioRenegotiatePreserveCtrl();
         }
         pushUiConfigToClient();
         if (hasActivePeer && actualAudio) {
           showNotice(
-            fromRemote
-              ? '手机端已远程开启桌面声音同步，正在自动重连传输...'
-              : '已开启桌面声音采集：正在通知控制端自动重连同步声音...'
+            audioSender
+              ? (fromRemote
+                  ? '手机端已远程开启桌面声音（无黑屏热切换）'
+                  : '已开启桌面声音同步（无黑屏热切换）')
+              : (fromRemote
+                  ? '手机端已远程开启桌面声音同步，正在自动重连传输...'
+                  : '已开启桌面声音采集：正在通知控制端自动重连同步声音...')
           );
         } else if (hasActivePeer && !actualAudio) {
           showNotice(
-            fromRemote
-              ? '手机端已远程关闭桌面声音，已切回纯画面模式'
-              : '已关闭桌面声音采集：正在通知控制端切回纯画面...'
+            audioSender
+              ? (fromRemote
+                  ? '手机端已远程关闭桌面声音，已切回纯画面模式'
+                  : '已关闭桌面声音采集，已切回纯画面模式')
+              : (fromRemote
+                  ? '手机端已远程关闭桌面声音，已切回纯画面模式'
+                  : '已关闭桌面声音采集：正在通知控制端切回纯画面...')
           );
         }
       } catch (err) {

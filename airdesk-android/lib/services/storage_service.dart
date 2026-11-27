@@ -38,6 +38,7 @@ class StorageService {
   static const _kAllowOverlayTun = 'airdesk_allow_overlay_tun_v1';
   static const _kRemoteRelayUrl = 'airdesk_remote_relay_url_v1';
   static const _kCustomIceUrl = 'airdesk_custom_ice_url_v1';
+  static const _kForceTurnRelay = 'airdesk_force_turn_relay_v1';
   static const _kPreset = 'airdesk_scene_preset_v1';
   static const _kScaleMode = 'airdesk_scale_mode_v1';
   static const _kFillRatio = 'airdesk_fill_ratio_v1';
@@ -78,6 +79,48 @@ class StorageService {
     final map = await _getTokensMap();
     map.remove(key);
     await prefs.setString(_kTokensMap, jsonEncode(map));
+  }
+
+  Future<String?> getTokenForRelay(String baseKey, {String? hostId}) async {
+    final cleanHostId = hostId?.trim() ?? '';
+    final tokensMap = await _getTokensMap();
+    if (cleanHostId.isNotEmpty) {
+      final scoped = tokensMap['$baseKey:$cleanHostId'];
+      if (scoped != null && scoped.isNotEmpty) return scoped;
+    }
+    final legacy = tokensMap[baseKey];
+    if (legacy == null || legacy.isEmpty) return null;
+    if (cleanHostId.isEmpty) return legacy;
+    final savedLegacyHostId = await getHostIdForKey(baseKey);
+    if (savedLegacyHostId != null &&
+        savedLegacyHostId.isNotEmpty &&
+        savedLegacyHostId == cleanHostId) {
+      return legacy;
+    }
+    return null;
+  }
+
+  Future<void> removeTokenForRelay(String baseKey, {String? hostId}) async {
+    final cleanHostId = hostId?.trim() ?? '';
+    final prefs = await SharedPreferences.getInstance();
+    final tokensMap = await _getTokensMap();
+    var changed = false;
+    if (cleanHostId.isNotEmpty && tokensMap.remove('$baseKey:$cleanHostId') != null) {
+      changed = true;
+    }
+    if (cleanHostId.isEmpty) {
+      if (tokensMap.remove(baseKey) != null) changed = true;
+    } else {
+      final savedLegacyHostId = await getHostIdForKey(baseKey);
+      if (savedLegacyHostId != null &&
+          savedLegacyHostId.isNotEmpty &&
+          savedLegacyHostId == cleanHostId) {
+        if (tokensMap.remove(baseKey) != null) changed = true;
+      }
+    }
+    if (changed) {
+      await prefs.setString(_kTokensMap, jsonEncode(tokensMap));
+    }
   }
 
   Future<String?> getTokenForHost(String ip, int port) =>
@@ -300,6 +343,16 @@ class StorageService {
   Future<void> setCustomIceUrl(String url) async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString(_kCustomIceUrl, url.trim());
+  }
+
+  Future<bool> getForceTurnRelay() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getBool(_kForceTurnRelay) ?? false;
+  }
+
+  Future<void> setForceTurnRelay(bool force) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_kForceTurnRelay, force);
   }
 
   Future<bool> getPreferHevc() async {

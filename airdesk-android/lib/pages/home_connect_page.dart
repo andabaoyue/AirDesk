@@ -46,6 +46,7 @@ class _HomeConnectPageState extends State<HomeConnectPage> {
   bool _relayHasToken = false;
   bool _relayUsePasswordAuth = false;
   bool _showRelayIceAdvanced = false;
+  bool _forceTurnRelay = false;
   String? _localTailscaleIp;
   List<String> _overlayIps = [];
   int _manualPort = DiscoveryService.defaultPort;
@@ -83,6 +84,7 @@ class _HomeConnectPageState extends State<HomeConnectPage> {
     final exempt = await NativeBridge.isIgnoringBatteryOptimizations();
     final savedRelay = await widget.storage.getRemoteRelayUrl();
     final savedCustomIce = await widget.storage.getCustomIceUrl();
+    final forceTurnRelay = await widget.storage.getForceTurnRelay();
     final tokMap = <String, bool>{};
     for (final r in remotes) {
       final t = await widget.storage.getTokenForHost(r.ip, r.port);
@@ -92,8 +94,8 @@ class _HomeConnectPageState extends State<HomeConnectPage> {
     String? savedRelayHostId;
     if (savedRelay.isNotEmpty) {
       final rk = WebRtcSessionService.tokenKeyForEndpoint(signalingUrl: savedRelay);
-      final rt = await widget.storage.getTokenForKey(rk);
       savedRelayHostId = await widget.storage.getHostIdForKey(rk);
+      final rt = await widget.storage.getTokenForRelay(rk, hostId: savedRelayHostId);
       relayTok = rt != null && rt.isNotEmpty;
     }
     if (!mounted) return;
@@ -108,6 +110,7 @@ class _HomeConnectPageState extends State<HomeConnectPage> {
       _preferHevc = preferHevc;
       _batteryExempt = exempt;
       _relayHasToken = relayTok;
+      _forceTurnRelay = forceTurnRelay;
       if (savedRelay.isNotEmpty && _relayUrlCtrl.text.isEmpty) {
         _relayUrlCtrl.text = savedRelay;
       }
@@ -637,8 +640,11 @@ class _HomeConnectPageState extends State<HomeConnectPage> {
       return;
     }
     final rk = WebRtcSessionService.tokenKeyForEndpoint(signalingUrl: clean);
-    final tok = await widget.storage.getTokenForKey(rk);
-    final hid = await widget.storage.getHostIdForKey(rk);
+    final typedHostId = _relayHostIdCtrl.text.trim();
+    final hid = typedHostId.isNotEmpty
+        ? typedHostId
+        : await widget.storage.getHostIdForKey(rk);
+    final tok = await widget.storage.getTokenForRelay(rk, hostId: hid);
     if (mounted) {
       setState(() {
         _relayHasToken = tok != null && tok.isNotEmpty;
@@ -707,8 +713,11 @@ class _HomeConnectPageState extends State<HomeConnectPage> {
     String? hostId;
     if (tryToken) {
       final rk = WebRtcSessionService.tokenKeyForEndpoint(signalingUrl: relayUrl);
-      token = await widget.storage.getTokenForKey(rk);
-      hostId = await widget.storage.getHostIdForKey(rk);
+      final typedHostId = _relayHostIdCtrl.text.trim();
+      hostId = typedHostId.isNotEmpty
+          ? typedHostId
+          : await widget.storage.getHostIdForKey(rk);
+      token = await widget.storage.getTokenForRelay(rk, hostId: hostId);
     }
     final pin = (pinOverride ?? _relayPinCtrl.text).replaceAll(RegExp(r'\D'), '');
     if ((token == null || token.isEmpty) && pin.length != 6) {
@@ -1765,6 +1774,7 @@ class _HomeConnectPageState extends State<HomeConnectPage> {
                       border: OutlineInputBorder(),
                       isDense: true,
                     ),
+                    onChanged: (_) => _refreshRelayTokenFlag(_relayUrlCtrl.text),
                   ),
                 ),
                 const SizedBox(width: 8),
@@ -1790,6 +1800,26 @@ class _HomeConnectPageState extends State<HomeConnectPage> {
                 border: OutlineInputBorder(),
                 isDense: true,
               ),
+            ),
+            const SizedBox(height: 6),
+            SwitchListTile(
+              contentPadding: EdgeInsets.zero,
+              dense: true,
+              title: const Text(
+                '强制走 TURN 中继兜底',
+                style: TextStyle(fontSize: 12.5, color: Color(0xFFE2E8F0)),
+              ),
+              subtitle: const Text(
+                '对称 NAT / 企业防火墙下直连超时时启用（需已配置 turn:/turns:）',
+                style: TextStyle(fontSize: 11, color: Color(0xFF94A3B8)),
+              ),
+              value: _forceTurnRelay,
+              onChanged: busy
+                  ? null
+                  : (v) async {
+                      setState(() => _forceTurnRelay = v);
+                      await widget.storage.setForceTurnRelay(v);
+                    },
             ),
           ],
           const SizedBox(height: 12),

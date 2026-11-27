@@ -74,6 +74,7 @@ class WebRtcSessionService extends ChangeNotifier {
   Timer? _pingTimer;
   Timer? _diagTimer;
   Timer? _wsHeartbeatTimer;
+  Timer? _wsPongTimeoutTimer;
   static const int _pointerCoalesceMs = 8;
   Timer? _pointerFlushTimer;
   int _lastPointerSentAtMs = 0;
@@ -111,7 +112,6 @@ class WebRtcSessionService extends ChangeNotifier {
   static const int _maxIceRestartAttempts = 2;
   static const Duration _iceDisconnectRestartDelay = Duration(milliseconds: 2000);
   static const Duration _iceRestartWatchdogDelay = Duration(milliseconds: 6000);
-  List<Map<String, dynamic>> _activeIceServers = const [];
 
   SessionPhase phase = SessionPhase.idle;
   String statusMessage = '未连接';
@@ -162,19 +162,53 @@ class WebRtcSessionService extends ChangeNotifier {
     String hostIp = '',
     int port = 47820,
     String? signalingUrl,
+    String? hostId,
   }) {
     final s = signalingUrl?.trim() ?? '';
     if (s.isNotEmpty) {
+      String base;
       try {
         final wsUrl = normalizeRelayWsUrl(s);
         final uri = Uri.parse(wsUrl);
         final effectivePort = uri.hasPort ? uri.port : (uri.scheme == 'wss' ? 443 : 80);
-        return 'relay:${uri.host}:$effectivePort';
+        base = 'relay:${uri.host}:$effectivePort';
       } catch (_) {
-        return 'relay:$s';
+        base = 'relay:$s';
       }
+      final cleanHostId = hostId?.trim() ?? '';
+      return cleanHostId.isNotEmpty ? '$base:$cleanHostId' : base;
     }
     return '$hostIp:$port';
+  }
+
+  @visibleForTesting
+  static Map<String, dynamic> buildRtcConfig(
+    List<Map<String, dynamic>> iceServers, {
+    bool forceTurnRelay = false,
+  }) {
+    final hasTurn = iceServers.any((s) {
+      final u = s['urls'];
+      if (u is String) {
+        return RegExp(r'^turns?:', caseSensitive: false).hasMatch(u.trim());
+      }
+      if (u is List) {
+        return u.any(
+          (item) => RegExp(r'^turns?:', caseSensitive: false).hasMatch(item.toString().trim()),
+        );
+      }
+      return false;
+    });
+    final config = <String, dynamic>{
+      'iceServers': iceServers,
+      'iceCandidatePoolSize': iceServers.isNotEmpty ? 2 : 0,
+      'sdpSemantics': 'unified-plan',
+      'bundlePolicy': 'max-bundle',
+      'rtcpMuxPolicy': 'require',
+    };
+    if (forceTurnRelay && hasTurn) {
+      config['iceTransportPolicy'] = 'relay';
+    }
+    return config;
   }
 
   static List<Map<String, dynamic>> parseIceServers(String? raw) {
@@ -317,10 +351,14 @@ class WebRtcSessionService extends ChangeNotifier {
     final relayUrl = signalingUrl?.trim() ?? '';
     final isRelayMode = relayUrl.isNotEmpty;
     final cleanHostIp = hostIp.trim();
+    final baseRelayKey = isRelayMode
+        ? tokenKeyForEndpoint(signalingUrl: relayUrl)
+        : '$cleanHostIp:$port';
     final tokenKey = tokenKeyForEndpoint(
       hostIp: cleanHostIp,
       port: port,
       signalingUrl: isRelayMode ? relayUrl : null,
+      hostId: isRelayMode ? hostId : null,
     );
 
     _manualDisconnect = false;
@@ -380,7 +418,17 @@ class WebRtcSessionService extends ChangeNotifier {
 
     if (isRelayMode) {
       _wsHeartbeatTimer = Timer.periodic(const Duration(seconds: 25), (_) {
+        if (_ws != sock || _wsGen != myWsGen) return;
         _sendWs({'type': 'ws:ping', 'ts': DateTime.now().millisecondsSinceEpoch});
+        _clearWsPongTimeout();
+        _wsPongTimeoutTimer = Timer(const Duration(seconds: 10), () {
+          _wsPongTimeoutTimer = null;
+          if (_ws == sock && _wsGen == myWsGen) {
+            try {
+              sock.close(4008, 'pong timeout');
+            } catch (_) {}
+          }
+        });
       });
     }
 
@@ -399,6 +447,7 @@ class WebRtcSessionService extends ChangeNotifier {
           port,
           iceStunUrls,
           tokenKey: tokenKey,
+          baseRelayKey: baseRelayKey,
           isRelayMode: isRelayMode,
           customIceRaw: customIceRaw,
           hadToken: sessionToken != null,
@@ -408,6 +457,7 @@ class WebRtcSessionService extends ChangeNotifier {
       },
       onError: (err) {
         if (_ws != sock || _wsGen != myWsGen) return;
+        _clearWsPongTimeout();
         _wsHeartbeatTimer?.cancel();
         _wsHeartbeatTimer = null;
         _pendingAuthPassword = null;
@@ -417,6 +467,7 @@ class WebRtcSessionService extends ChangeNotifier {
       },
       onDone: () {
         if (_ws != sock || _wsGen != myWsGen) return;
+        _clearWsPongTimeout();
         _wsHeartbeatTimer?.cancel();
         _wsHeartbeatTimer = null;
         _pendingAuthPassword = null;
@@ -435,6 +486,11 @@ class WebRtcSessionService extends ChangeNotifier {
       authMode: usePasswordAuth ? 'password' : null,
     );
     _sendWs(joinPayload);
+  }
+
+  void _clearWsPongTimeout() {
+    _wsPongTimeoutTimer?.cancel();
+    _wsPongTimeoutTimer = null;
   }
 
   void _sendWs(Map<String, dynamic> obj) {
@@ -476,6 +532,7 @@ class WebRtcSessionService extends ChangeNotifier {
     int port,
     List<String> iceStunUrls, {
     required String tokenKey,
+    required String baseRelayKey,
     required bool isRelayMode,
     String? customIceRaw,
     required bool hadToken,
@@ -488,6 +545,7 @@ class WebRtcSessionService extends ChangeNotifier {
     } catch (_) {
       return;
     }
+    _clearWsPongTimeout();
 
     final type = (msg['type'] ?? '').toString();
     if (type == 'ws:pong') {
@@ -545,8 +603,17 @@ class WebRtcSessionService extends ChangeNotifier {
     } else if (type == 'client:rejected' || type == 'error') {
       _pendingAuthPassword = null;
       if (shouldClearSavedTokenOnError(type, msg, hadToken: hadToken)) {
-        await storage.removeTokenForKey(tokenKey);
-        await storage.removeHostIdForKey(tokenKey);
+        if (isRelayMode) {
+          await storage.removeTokenForRelay(baseRelayKey, hostId: _activeHostId);
+          final legacyHostId = await storage.getHostIdForKey(baseRelayKey);
+          if (_activeHostId == null || _activeHostId!.isEmpty || legacyHostId == _activeHostId) {
+            await storage.removeHostIdForKey(baseRelayKey);
+          }
+          await storage.removeHostIdForKey(tokenKey);
+        } else {
+          await storage.removeTokenForKey(tokenKey);
+          await storage.removeHostIdForKey(tokenKey);
+        }
       }
       final reason = (msg['reason'] ?? msg['message'] ?? '连接被拒绝').toString();
       _setPhase(SessionPhase.error, reason);
@@ -557,13 +624,20 @@ class WebRtcSessionService extends ChangeNotifier {
       hostAudioEnabled = msg['audioEnabled'] == true;
       audioMuted = !hostAudioEnabled;
       final newToken = (msg['sessionToken'] ?? '').toString();
-      if (newToken.isNotEmpty) {
-        await storage.saveTokenForKey(tokenKey, newToken);
-      }
       final approvedHostId = (msg['hostId'] ?? '').toString().trim();
       if (isRelayMode && approvedHostId.isNotEmpty) {
         _activeHostId = approvedHostId;
-        await storage.saveHostIdForKey(tokenKey, approvedHostId);
+        final scopedKey = tokenKeyForEndpoint(
+          signalingUrl: _activeSignalingUrl,
+          hostId: approvedHostId,
+        );
+        if (newToken.isNotEmpty) {
+          await storage.saveTokenForKey(scopedKey, newToken);
+        }
+        await storage.saveHostIdForKey(baseRelayKey, approvedHostId);
+        await storage.saveHostIdForKey(scopedKey, approvedHostId);
+      } else if (newToken.isNotEmpty) {
+        await storage.saveTokenForKey(tokenKey, newToken);
       }
       if (!isRelayMode && hostIp.isNotEmpty) {
         await storage.saveRecentHost(hostIp, port, hostLabel);
@@ -574,8 +648,7 @@ class WebRtcSessionService extends ChangeNotifier {
         serverIceRaw: msg['iceServers'],
         customIceRaw: customIceRaw,
       );
-      _activeIceServers = iceServers;
-      await _startRtc(iceServers, wantAudio: hostAudioEnabled);
+      await _startRtc(iceServers);
     } else if (type == 'rtc:answer' && _pc != null) {
       final sdp = (msg['sdp'] ?? '').toString();
       await _pc!.setRemoteDescription(RTCSessionDescription(sdp, 'answer'));
@@ -614,9 +687,8 @@ class WebRtcSessionService extends ChangeNotifier {
   }
 
   Future<void> _startRtc(
-    List<Map<String, dynamic>> iceServers, {
-    bool wantAudio = false,
-  }) async {
+    List<Map<String, dynamic>> iceServers,
+  ) async {
     final myRtcGen = ++_rtcGen;
     await _cleanupRtc();
     if (_manualDisconnect || _rtcGen != myRtcGen) return;
@@ -625,12 +697,10 @@ class WebRtcSessionService extends ChangeNotifier {
     await _applyAndroidMediaAudioMode();
     if (_manualDisconnect || _rtcGen != myRtcGen) return;
 
-    final config = <String, dynamic>{
-      'iceServers': iceServers,
-      'sdpSemantics': 'unified-plan',
-      'bundlePolicy': 'max-bundle',
-      'rtcpMuxPolicy': 'require',
-    };
+    final forceTurn = await storage.getForceTurnRelay();
+    if (_manualDisconnect || _rtcGen != myRtcGen) return;
+
+    final config = buildRtcConfig(iceServers, forceTurnRelay: forceTurn);
     final pc = await createPeerConnection(config);
     if (_manualDisconnect || _rtcGen != myRtcGen) {
       try {
@@ -739,13 +809,12 @@ class WebRtcSessionService extends ChangeNotifier {
       init: RTCRtpTransceiverInit(direction: TransceiverDirection.RecvOnly),
     );
     if (isStale()) return;
-    if (wantAudio) {
-      await pc.addTransceiver(
-        kind: RTCRtpMediaType.RTCRtpMediaTypeAudio,
-        init: RTCRtpTransceiverInit(direction: TransceiverDirection.RecvOnly),
-      );
-      if (isStale()) return;
-    }
+    // Always pre-allocate RecvOnly audio transceiver so audio toggles never recreate RTCPeerConnection
+    await pc.addTransceiver(
+      kind: RTCRtpMediaType.RTCRtpMediaTypeAudio,
+      init: RTCRtpTransceiverInit(direction: TransceiverDirection.RecvOnly),
+    );
+    if (isStale()) return;
 
     final reliableDc = await pc.createDataChannel(
       'ctrl-reliable',
@@ -907,16 +976,16 @@ class WebRtcSessionService extends ChangeNotifier {
         if (nextAudio != hostAudioEnabled) {
           hostAudioEnabled = nextAudio;
           audioMuted = !nextAudio;
+          _remoteAudioTrack?.enabled = !audioMuted;
+          if (hostAudioEnabled) {
+            unawaited(_applyAndroidMediaAudioMode());
+          }
           _emitToast(
             hostAudioEnabled
-                ? '电脑已开启声音，正在无感重连同步...'
-                : '电脑已关闭声音，正在切回纯画面...',
+                ? '电脑已开启桌面声音'
+                : '电脑已关闭桌面声音，已切回纯画面',
           );
-          if (_ws != null) {
-            unawaited(_startRtc(_activeIceServers, wantAudio: hostAudioEnabled));
-          } else {
-            unawaited(reconnectSaved());
-          }
+          notifyListeners();
         }
       }
     } else if (t == 'pong' && d['ts'] is num) {
@@ -1915,6 +1984,7 @@ class WebRtcSessionService extends ChangeNotifier {
     _wsGen++;
     _rtcGen++;
     _clearPendingPointer();
+    _clearWsPongTimeout();
     _wsHeartbeatTimer?.cancel();
     _wsHeartbeatTimer = null;
     sendReliable({'t': 'k:release_all', 'reason': 'android_client_disconnect'});
@@ -1950,9 +2020,11 @@ class WebRtcSessionService extends ChangeNotifier {
 
   Future<void> reconnectSaved() async {
     if (_activeSignalingUrl != null && _activeSignalingUrl!.isNotEmpty) {
-      final key = tokenKeyForEndpoint(signalingUrl: _activeSignalingUrl);
-      final tok = await storage.getTokenForKey(key);
-      final hostId = await storage.getHostIdForKey(key) ?? _activeHostId;
+      final baseKey = tokenKeyForEndpoint(signalingUrl: _activeSignalingUrl);
+      final hostId = (_activeHostId != null && _activeHostId!.trim().isNotEmpty)
+          ? _activeHostId!.trim()
+          : await storage.getHostIdForKey(baseKey);
+      final tok = await storage.getTokenForRelay(baseKey, hostId: hostId);
       if (tok != null && tok.isNotEmpty) {
         await connect(
           signalingUrl: _activeSignalingUrl,
