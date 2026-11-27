@@ -234,8 +234,9 @@ async function run() {
     assert.equal(v2App1.hostId, hostId);
     assert.equal(v2App1.sessionToken, hostIssuedToken);
 
-    // 7b. Host disconnects -> client joining with hostId + sessionToken gets HOST_OFFLINE (retryable)
+    // 7b. Explicit host session:close + disconnect -> client joining with hostId + sessionToken gets HOST_OFFLINE (retryable)
     const v2ClosedP = nextMsg(v2Client1, (m) => m.type === 'session:closed');
+    v2Host1.send(JSON.stringify({ type: 'session:close', reason: 'host_stop' }));
     v2Host1.close();
     await v2ClosedP;
     await new Promise((r) => setTimeout(r, 40));
@@ -578,7 +579,261 @@ async function run() {
     goodPwClient.close();
     activeClient.close();
     p2HostWs.close();
-    console.log('RELAY_SMOKE_TEST_ALL_8_CHECKS_PASSED');
+
+    // 9. PR 2 Signaling/Media decoupling: grace periods, resumeIfActive, attachExisting, relay restart & cross-device takeover
+    {
+      const gRelay = createRelayServer({
+        accessKey: 'secret-room-key',
+        gracePeriodMs: 250,
+      });
+      await new Promise((resolve) => gRelay.server.listen(0, '127.0.0.1', resolve));
+      const gAddr = gRelay.server.address();
+      const gWsUrl = `ws://127.0.0.1:${gAddr.port}/ws/signaling`;
+
+      try {
+        const gHostId = 'decouplehost1';
+        const gHostSecret = crypto.randomBytes(24).toString('hex');
+        const gTokA = crypto.randomBytes(16).toString('hex');
+        const gTokB = crypto.randomBytes(16).toString('hex');
+
+        const gh1 = await openWs(gWsUrl);
+        const gc1P = nextMsg(gh1, (m) => m.type === 'host:created');
+        gh1.send(
+          JSON.stringify({
+            type: 'host:create',
+            protoVersion: 2,
+            hostId: gHostId,
+            hostSecret: gHostSecret,
+            accessKey: 'secret-room-key',
+            hostLabel: 'Decouple-PC',
+          })
+        );
+        const gc1 = await gc1P;
+
+        const gcl1 = await openWs(gWsUrl);
+        const gReqP = nextMsg(gh1, (m) => m.type === 'host:approval_request');
+        gcl1.send(
+          JSON.stringify({
+            type: 'client:join',
+            protoVersion: 2,
+            code: gc1.code,
+            deviceLabel: 'Phone-A',
+          })
+        );
+        await gReqP;
+        const gAppP = nextMsg(gcl1, (m) => m.type === 'client:approved');
+        gh1.send(
+          JSON.stringify({
+            type: 'host:approval_decision',
+            approved: true,
+            mode: 'full_control',
+            sessionToken: gTokA,
+          })
+        );
+        await gAppP;
+
+        // 9a. Unplanned host WS drop within grace period keeps client alive, resumeIfActive resumes room
+        let clientSawClosedDuringGrace = false;
+        const onClientMsg9a = (raw) => {
+          const m = JSON.parse(raw.toString('utf8'));
+          if (m.type === 'session:closed') clientSawClosedDuringGrace = true;
+        };
+        gcl1.on('message', onClientMsg9a);
+        gh1.close();
+        await new Promise((r) => setTimeout(r, 80));
+        assert.equal(clientSawClosedDuringGrace, false);
+        gcl1.off('message', onClientMsg9a);
+
+        const gh2 = await openWs(gWsUrl);
+        const gResumedP = nextMsg(gcl1, (m) => m.type === 'session:signaling_resumed');
+        const gh2CreatedP = nextMsg(gh2, (m) => m.type === 'host:created');
+        gh2.send(
+          JSON.stringify({
+            type: 'host:create',
+            protoVersion: 2,
+            hostId: gHostId,
+            hostSecret: gHostSecret,
+            accessKey: 'secret-room-key',
+            resumeIfActive: true,
+          })
+        );
+        assert.equal((await gResumedP).role, 'host');
+        assert.equal((await gh2CreatedP).resumedActiveClient, true);
+
+        const offerRelayP = nextMsg(gh2, (m) => m.type === 'rtc:offer');
+        gcl1.send(JSON.stringify({ type: 'rtc:offer', sdp: 'after-host-resume' }));
+        assert.equal((await offerRelayP).sdp, 'after-host-resume');
+
+        // 9b. Unplanned client WS drop within grace period -> attachExisting: true + Desktop reattached: true
+        let hostSawDisconnectDuringGrace = false;
+        const onHostMsg9b = (raw) => {
+          const m = JSON.parse(raw.toString('utf8'));
+          if (m.type === 'host:client_disconnected') hostSawDisconnectDuringGrace = true;
+        };
+        gh2.on('message', onHostMsg9b);
+        gcl1.close();
+        await new Promise((r) => setTimeout(r, 80));
+        assert.equal(hostSawDisconnectDuringGrace, false);
+        gh2.off('message', onHostMsg9b);
+
+        const gcl2 = await openWs(gWsUrl);
+        const verifyAttachP = nextMsg(gh2, (m) => m.type === 'host:verify_token');
+        gcl2.send(
+          JSON.stringify({
+            type: 'client:join',
+            protoVersion: 2,
+            hostId: gHostId,
+            sessionToken: gTokA,
+            attachExisting: true,
+            deviceLabel: 'Phone-A',
+          })
+        );
+        const verifyAttach = await verifyAttachP;
+        assert.equal(verifyAttach.attachExisting, true);
+
+        const gcl2AppP = nextMsg(gcl2, (m) => m.type === 'client:approved');
+        const hostReattP = nextMsg(gh2, (m) => m.type === 'host:client_reattached');
+        gh2.send(
+          JSON.stringify({
+            type: 'host:token_verified',
+            verifyId: verifyAttach.verifyId,
+            approved: true,
+            reattached: true,
+            mode: 'full_control',
+          })
+        );
+        const gcl2App = await gcl2AppP;
+        assert.equal(gcl2App.reattached, true);
+        assert.equal((await hostReattP).mode, 'full_control');
+
+        const iceOfferP = nextMsg(gh2, (m) => m.type === 'rtc:offer');
+        gcl2.send(JSON.stringify({ type: 'rtc:offer', sdp: 'ice-restart-sdp', iceRestart: true }));
+        const iceOffer = await iceOfferP;
+        assert.equal(iceOffer.iceRestart, true);
+        assert.equal(iceOffer.sdp, 'ice-restart-sdp');
+
+        // 9c. Cross-device takeover with DIFFERENT token -> Desktop replies reattached: false -> kicks gcl2
+        const gcl3 = await openWs(gWsUrl);
+        const verifyTakeoverP = nextMsg(gh2, (m) => m.type === 'host:verify_token');
+        gcl3.send(
+          JSON.stringify({
+            type: 'client:join',
+            protoVersion: 2,
+            hostId: gHostId,
+            sessionToken: gTokB,
+            attachExisting: true,
+            deviceLabel: 'Phone-B',
+          })
+        );
+        const verifyTakeover = await verifyTakeoverP;
+        const gcl2KickedP = nextMsg(gcl2, (m) => m.type === 'session:closed');
+        const gcl3AppP = nextMsg(gcl3, (m) => m.type === 'client:approved');
+        const hostReconnTakeoverP = nextMsg(gh2, (m) => m.type === 'host:client_reconnected');
+        gh2.send(
+          JSON.stringify({
+            type: 'host:token_verified',
+            verifyId: verifyTakeover.verifyId,
+            approved: true,
+            reattached: false,
+            mode: 'view_only',
+          })
+        );
+        await gcl2KickedP;
+        assert.equal((await gcl3AppP).reattached, false);
+        assert.equal((await hostReconnTakeoverP).deviceLabel, 'Phone-B');
+
+        // 9d. Explicit session:close cleans up immediately (no grace wait)
+        const immediateClosedP = nextMsg(gcl3, (m) => m.type === 'session:closed');
+        gh2.send(JSON.stringify({ type: 'session:close', reason: 'manual_stop' }));
+        assert.equal((await immediateClosedP).reason, 'manual_stop');
+
+        // 9e. Unplanned disconnect past gracePeriodMs fires timeout cleanup
+        const gcl4 = await openWs(gWsUrl);
+        const v4P = nextMsg(gh2, (m) => m.type === 'host:verify_token');
+        gcl4.send(
+          JSON.stringify({
+            type: 'client:join',
+            protoVersion: 2,
+            hostId: gHostId,
+            sessionToken: gTokB,
+          })
+        );
+        const v4 = await v4P;
+        const app4P = nextMsg(gcl4, (m) => m.type === 'client:approved');
+        gh2.send(
+          JSON.stringify({
+            type: 'host:token_verified',
+            verifyId: v4.verifyId,
+            approved: true,
+            mode: 'full_control',
+          })
+        );
+        await app4P;
+        const hostTimeoutP = nextMsg(gh2, (m) => m.type === 'host:client_disconnected');
+        gcl4.close();
+        const hostTimeout = await hostTimeoutP;
+        assert.match(hostTimeout.reason, /超时/);
+
+        gcl2.close();
+        gcl3.close();
+        gh2.close();
+      } finally {
+        await gRelay.close();
+      }
+
+      // 9f. Simulated relay restart (empty in-memory roomsByHostId) still allows authoritative reattach
+      const gRelayRestarted = createRelayServer({ accessKey: 'secret-room-key', gracePeriodMs: 250 });
+      await new Promise((resolve) => gRelayRestarted.server.listen(0, '127.0.0.1', resolve));
+      const rAddr = gRelayRestarted.server.address();
+      const rWsUrl = `ws://127.0.0.1:${rAddr.port}/ws/signaling`;
+      try {
+        const rh = await openWs(rWsUrl);
+        const rcP = nextMsg(rh, (m) => m.type === 'host:created');
+        rh.send(
+          JSON.stringify({
+            type: 'host:create',
+            protoVersion: 2,
+            hostId: 'restartedhost1',
+            hostSecret: crypto.randomBytes(24).toString('hex'),
+            accessKey: 'secret-room-key',
+            resumeIfActive: true,
+          })
+        );
+        await rcP;
+
+        const rcl = await openWs(rWsUrl);
+        const rvP = nextMsg(rh, (m) => m.type === 'host:verify_token');
+        rcl.send(
+          JSON.stringify({
+            type: 'client:join',
+            protoVersion: 2,
+            hostId: 'restartedhost1',
+            sessionToken: crypto.randomBytes(16).toString('hex'),
+            attachExisting: true,
+          })
+        );
+        const rv = await rvP;
+        const rclAppP = nextMsg(rcl, (m) => m.type === 'client:approved');
+        const rhReattP = nextMsg(rh, (m) => m.type === 'host:client_reattached');
+        rh.send(
+          JSON.stringify({
+            type: 'host:token_verified',
+            verifyId: rv.verifyId,
+            approved: true,
+            reattached: true,
+            mode: 'full_control',
+          })
+        );
+        assert.equal((await rclAppP).reattached, true);
+        assert.equal((await rhReattP).mode, 'full_control');
+        rcl.close();
+        rh.close();
+      } finally {
+        await gRelayRestarted.close();
+      }
+    }
+
+    console.log('RELAY_SMOKE_TEST_ALL_9_CHECKS_PASSED');
   } finally {
     await relay.close();
   }

@@ -30,6 +30,7 @@ import {
   createAbrController,
 } from '../renderer/modules/abr-controller.mjs';
 import { createMediaCaptureManager } from '../renderer/modules/media-capture.mjs';
+import { createSignalingClient } from '../renderer/modules/signaling-client.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -897,15 +898,91 @@ execFileSync(process.execPath, ['--input-type=module', '--check'], {
     else delete globalThis.navigator;
   }
 
-  // 7c. Structural assertions for PR 1 in host.js
+  // 7c. Structural assertions for PR 1 in host.js & signaling-client.mjs
   const hostSrc = fs.readFileSync(hostJsPath, 'utf8');
   assert.ok(hostSrc.includes("audioTransceiver.direction = 'sendonly'"));
   assert.ok(hostSrc.includes("RTCRtpSender.getCapabilities('video')"));
   assert.ok(hostSrc.includes('iceCandidatePoolSize: resolvedIceServers.length > 0 ? 2 : 0'));
-  assert.ok(hostSrc.includes('wsPongTimeoutTimer'));
   assert.ok(hostSrc.includes('cachedHostname'));
 }
 
+// 8. Unit tests: PR 2 signaling-client.mjs & host.js decoupling checks
+{
+  class MockWebSocket {
+    static OPEN = 1;
+    static CLOSED = 3;
+    static instances = [];
+    constructor(url) {
+      this.url = url;
+      this.readyState = 0;
+      this.sent = [];
+      this.closedWith = null;
+      MockWebSocket.instances.push(this);
+    }
+    send(data) {
+      this.sent.push(JSON.parse(data));
+    }
+    close(code, reason) {
+      this.closedWith = { code, reason };
+      this.readyState = MockWebSocket.CLOSED;
+      if (this.onclose) this.onclose({ code, reason });
+    }
+    emitOpen() {
+      this.readyState = MockWebSocket.OPEN;
+      if (this.onopen) this.onopen();
+    }
+    emitMessage(obj) {
+      if (this.onmessage) this.onmessage({ data: JSON.stringify(obj) });
+    }
+  }
+
+  let closedCount = 0;
+  let scheduledInfo = null;
+  const sc = createSignalingClient({
+    WebSocketCtor: MockWebSocket,
+    reconnectDelaysMs: [20, 40],
+    heartbeatIntervalMs: 25,
+    pongTimeoutMs: 45,
+    onClose: () => {
+      closedCount += 1;
+    },
+    onReconnectScheduled: (delayMs, attempt) => {
+      scheduledInfo = { delayMs, attempt };
+    },
+  });
+
+  const sock1 = sc.connect('wss://relay.example.com/ws/signaling', { enableHeartbeat: true });
+  sock1.emitOpen();
+  // First ping receives ws:pong -> socket must stay open
+  await new Promise((r) => setTimeout(r, 35));
+  assert.ok(sock1.sent.some((m) => m.type === 'ws:ping'));
+  sock1.emitMessage({ type: 'ws:pong' });
+  await new Promise((r) => setTimeout(r, 25));
+  // Wait without replying to second ping -> pong timeout must close socket with 4008
+  await new Promise((r) => setTimeout(r, 70));
+  assert.equal(closedCount, 1);
+  assert.equal(sock1.closedWith.code, 4008);
+
+  // Backoff reconnect scheduling + clean stop()
+  const beforeCount = MockWebSocket.instances.length;
+  sc.scheduleReconnect('wss://relay.example.com/ws/signaling', { enableHeartbeat: true });
+  assert.deepEqual(scheduledInfo, { delayMs: 20, attempt: 1 });
+  await new Promise((r) => setTimeout(r, 40));
+  assert.equal(MockWebSocket.instances.length, beforeCount + 1);
+  const sock2 = MockWebSocket.instances[MockWebSocket.instances.length - 1];
+  sock2.emitOpen();
+  sc.stop({ closePayload: { type: 'session:close', reason: 'test_stop' } });
+  assert.ok(sock2.sent.some((m) => m.type === 'session:close'));
+
+  // Structural guards in host.js for PR 2 decoupling
+  const hostSrc = fs.readFileSync(hostJsPath, 'utf8');
+  assert.ok(hostSrc.includes("from './modules/signaling-client.mjs'"));
+  assert.ok(hostSrc.includes('createPayload.resumeIfActive = true'));
+  assert.ok(hostSrc.includes("msg.type === 'host:client_reattached'"));
+  assert.ok(hostSrc.includes('activeRelaySessionToken === msg.sessionToken'));
+  assert.ok(hostSrc.includes('12000'));
+}
+
 console.log(
-  `[AirDesk Tests] Passed syntax checks (${cjsFiles.length} CJS, ${mjsFiles.length} MJS, host.js) + sdp-codec, abr-controller, trust-store, PR 0 idle-guard & PR 1 stability/hot-audio tests.`
+  `[AirDesk Tests] Passed syntax checks (${cjsFiles.length} CJS, ${mjsFiles.length} MJS, host.js) + sdp-codec, abr-controller, trust-store, PR 0, PR 1 & PR 2 tests.`
 );

@@ -2,6 +2,7 @@ import 'dart:convert';
 import 'dart:typed_data';
 import 'package:airdesk_app/main.dart';
 import 'package:airdesk_app/services/scrypt_helper.dart';
+import 'package:airdesk_app/services/sdp_helper.dart';
 import 'package:airdesk_app/services/storage_service.dart';
 import 'package:airdesk_app/services/webrtc_session_service.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -335,5 +336,54 @@ void main() {
     );
     expect(turnCfgOn['iceCandidatePoolSize'], 2);
     expect(turnCfgOn['iceTransportPolicy'], 'relay');
+  });
+
+  test('PR 2 SdpHelper, attachExisting payload & shouldSkipRtcRebuildOnApproved', () {
+    expect(SdpHelper.isVirtualCandidate('candidate:1 1 UDP 2122 198.18.0.1 5000 typ host'), isTrue);
+    expect(SdpHelper.isVirtualCandidate('candidate:1 1 UDP 2122 172.19.0.1 5000 typ host'), isTrue);
+    expect(SdpHelper.isVirtualCandidate('candidate:1 1 UDP 2122 192.168.1.5 5000 typ host'), isFalse);
+
+    const rawOffer = [
+      'v=0',
+      'm=video 9 UDP/TLS/RTP/SAVPF 96 97 98 99 100',
+      'a=rtpmap:96 VP8/90000',
+      'a=rtpmap:97 H264/90000',
+      'a=fmtp:97 profile-level-id=42001f',
+      'a=rtpmap:98 H264/90000',
+      'a=fmtp:98 profile-level-id=42e01f',
+      'a=rtpmap:99 rtx/90000',
+      'a=fmtp:99 apt=98',
+      'a=rtpmap:100 H265/90000',
+    ].join('\r\n');
+
+    final h264Sdp = SdpHelper.prioritizeVideoCodecs(rawOffer, preferHevc: false);
+    final h264MLine = h264Sdp.split('\r\n').firstWhere((l) => l.startsWith('m=video '));
+    expect(h264MLine, 'm=video 9 UDP/TLS/RTP/SAVPF 98 99 97 96 100');
+    expect(h264Sdp.contains(SdpHelper.playoutDelayExtUri), isTrue);
+
+    final hevcSdp = SdpHelper.prioritizeVideoCodecs(rawOffer, preferHevc: true);
+    final hevcMLine = hevcSdp.split('\r\n').firstWhere((l) => l.startsWith('m=video '));
+    expect(hevcMLine, 'm=video 9 UDP/TLS/RTP/SAVPF 100 98 99 97 96');
+
+    final attachPayload = WebRtcSessionService.buildClientJoinPayload(
+      deviceLabel: 'Xiaomi 13',
+      sessionToken: '0123456789abcdef',
+      hostId: 'host12345678',
+      attachExisting: true,
+    );
+    expect(attachPayload['attachExisting'], isTrue);
+
+    expect(
+      WebRtcSessionService.shouldSkipRtcRebuildOnApproved({'reattached': true}, hasLivePc: true),
+      isTrue,
+    );
+    expect(
+      WebRtcSessionService.shouldSkipRtcRebuildOnApproved({'reattached': false}, hasLivePc: true),
+      isFalse,
+    );
+    expect(
+      WebRtcSessionService.shouldSkipRtcRebuildOnApproved({'reattached': true}, hasLivePc: false),
+      isFalse,
+    );
   });
 }
