@@ -14,6 +14,8 @@ const airdeskAPI = Object.freeze({
   },
   setSessionActive: (active) =>
     ipcRenderer.invoke('airdesk:set-session-active', Boolean(active)),
+  setHostingActive: (active) =>
+    ipcRenderer.invoke('airdesk:set-hosting-active', Boolean(active)),
   setControlPermission: (enabled) =>
     ipcRenderer.invoke('airdesk:set-control-permission', Boolean(enabled)),
   sendHeartbeat: () => ipcRenderer.invoke('airdesk:heartbeat'),

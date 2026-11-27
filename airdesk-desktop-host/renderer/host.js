@@ -898,8 +898,10 @@ function startRtcStatsMonitor() {
           freezes;
       }
 
-      rtcStatsEl.style.color = color;
-      rtcStatsEl.textContent = line1 + '\n' + line2;
+      if (!document.hidden && rtcStatsEl) {
+        rtcStatsEl.style.color = color;
+        rtcStatsEl.textContent = line1 + '\n' + line2;
+      }
 
       const abrAdjustment = abr.evaluate({
         hasActivePeer,
@@ -1047,6 +1049,9 @@ async function stopHost(reason) {
   wsReconnectAttempt = 0;
   mediaCapture.bumpSessionGen();
   isHosting = false;
+  if (window.airdeskAPI.setHostingActive) {
+    window.airdeskAPI.setHostingActive(false).catch(() => {});
+  }
   hasPendingApproval = false;
   pendingApprovalClient = null;
   hasActivePeer = false;
@@ -1155,6 +1160,9 @@ async function startHost() {
   }
 
   isHosting = true;
+  if (window.airdeskAPI.setHostingActive) {
+    window.airdeskAPI.setHostingActive(true).catch(() => {});
+  }
   setLivePill('waiting', '待连接');
   btnStart.disabled = true;
   btnStop.disabled = false;
@@ -1520,6 +1528,9 @@ async function handleOffer(remoteSdp) {
   }
   const localStream = mediaCapture.getLocalStream();
   if (pc !== currentPc || !isHosting || !localStream) {
+    if (!isHosting) {
+      mediaCapture.releaseLocalCaptureMedia();
+    }
     return;
   }
 
@@ -1724,81 +1735,89 @@ async function handleOffer(remoteSdp) {
     };
   };
 
-  const tier = computeTieredVideoBitrates();
-  const boostedOfferSdp = boostVideoSdpBitrate(remoteSdp, tier.minKbps, tier.startKbps, tier.maxKbps);
-  const offerExt = ensurePlayoutDelayExtInSdp(boostedOfferSdp);
-  const tunedOfferSdp = enhanceAudioOpusSdp(offerExt.sdp);
   try {
-    await pc.setRemoteDescription({ type: 'offer', sdp: tunedOfferSdp });
-  } catch (err) {
-    console.warn('[AirDesk] Boosted remote SDP rejected, falling back to raw SDP:', err.message);
-    await pc.setRemoteDescription({ type: 'offer', sdp: remoteSdp });
-  }
-
-  const vTrack = localStream.getVideoTracks()[0];
-  if (vTrack && 'contentHint' in vTrack) {
-    vTrack.contentHint = mediaCapture.initialTrackContentHint();
-  }
-  lastAppliedVideoParams = null;
-  videoSender = pc.addTrack(vTrack, localStream);
-  if (enableAudioCheckbox && enableAudioCheckbox.checked) {
-    await mediaCapture.maybeRouteVirtualAudioForStream();
-    const curAudioTrack = mediaCapture.getLocalAudioTrack();
-    if (!curAudioTrack || curAudioTrack.readyState !== 'live') {
-      await mediaCapture.ensureDesktopAudioTrack();
+    const tier = computeTieredVideoBitrates();
+    const boostedOfferSdp = boostVideoSdpBitrate(remoteSdp, tier.minKbps, tier.startKbps, tier.maxKbps);
+    const offerExt = ensurePlayoutDelayExtInSdp(boostedOfferSdp);
+    const tunedOfferSdp = enhanceAudioOpusSdp(offerExt.sdp);
+    try {
+      await pc.setRemoteDescription({ type: 'offer', sdp: tunedOfferSdp });
+    } catch (err) {
+      console.warn('[AirDesk] Boosted remote SDP rejected, falling back to raw SDP:', err.message);
+      await pc.setRemoteDescription({ type: 'offer', sdp: remoteSdp });
     }
-  }
-  const aTrack = mediaCapture.getLocalAudioTrack() || localStream.getAudioTracks()[0];
-  audioSender = aTrack ? pc.addTrack(aTrack, localStream) : null;
 
-  const videoTransceiver = pc.getTransceivers().find((t) => t.sender === videoSender);
-  if (videoTransceiver && RTCRtpReceiver.getCapabilities) {
-    const recvCaps = RTCRtpReceiver.getCapabilities('video');
-    if (recvCaps && recvCaps.codecs) {
-      const preferHevc = Boolean(codecSelect && codecSelect.value === 'hevc') || sdpPrefersHevc(remoteSdp);
-      const preferredCodecs = sortPreferredVideoCodecs(recvCaps.codecs, preferHevc);
-      if (preferredCodecs.length) {
-        try {
-          videoTransceiver.setCodecPreferences(preferredCodecs);
-        } catch (err) {
-          console.warn('[AirDesk] Codec preference rejected, keeping default codecs:', err.name, err.message);
+    const vTrack = localStream.getVideoTracks()[0];
+    if (vTrack && 'contentHint' in vTrack) {
+      vTrack.contentHint = mediaCapture.initialTrackContentHint();
+    }
+    lastAppliedVideoParams = null;
+    videoSender = pc.addTrack(vTrack, localStream);
+    if (enableAudioCheckbox && enableAudioCheckbox.checked) {
+      await mediaCapture.maybeRouteVirtualAudioForStream();
+      const curAudioTrack = mediaCapture.getLocalAudioTrack();
+      if (!curAudioTrack || curAudioTrack.readyState !== 'live') {
+        await mediaCapture.ensureDesktopAudioTrack();
+      }
+    }
+    const aTrack = mediaCapture.getLocalAudioTrack() || localStream.getAudioTracks()[0];
+    audioSender = aTrack ? pc.addTrack(aTrack, localStream) : null;
+
+    const videoTransceiver = pc.getTransceivers().find((t) => t.sender === videoSender);
+    if (videoTransceiver && RTCRtpReceiver.getCapabilities) {
+      const recvCaps = RTCRtpReceiver.getCapabilities('video');
+      if (recvCaps && recvCaps.codecs) {
+        const preferHevc = Boolean(codecSelect && codecSelect.value === 'hevc') || sdpPrefersHevc(remoteSdp);
+        const preferredCodecs = sortPreferredVideoCodecs(recvCaps.codecs, preferHevc);
+        if (preferredCodecs.length) {
+          try {
+            videoTransceiver.setCodecPreferences(preferredCodecs);
+          } catch (err) {
+            console.warn('[AirDesk] Codec preference rejected, keeping default codecs:', err.name, err.message);
+          }
         }
       }
     }
-  }
-  for (const cand of pendingIceCandidates) {
-    await pc.addIceCandidate(cand).catch(() => {});
-  }
-  pendingIceCandidates = [];
+    for (const cand of pendingIceCandidates) {
+      await pc.addIceCandidate(cand).catch(() => {});
+    }
+    pendingIceCandidates = [];
 
-  const answer = await pc.createAnswer();
-  const ansExt = ensurePlayoutDelayExtInSdp(answer.sdp, offerExt.extId);
-  const tunedAnswerSdp = enhanceAudioOpusSdp(ansExt.sdp);
-  let sentAnswer = answer;
-  try {
-    const tweakedAnswer = { type: answer.type, sdp: tunedAnswerSdp };
-    await pc.setLocalDescription(tweakedAnswer);
-    sentAnswer = tweakedAnswer;
+    const answer = await pc.createAnswer();
+    const ansExt = ensurePlayoutDelayExtInSdp(answer.sdp, offerExt.extId);
+    const tunedAnswerSdp = enhanceAudioOpusSdp(ansExt.sdp);
+    let sentAnswer = answer;
+    try {
+      const tweakedAnswer = { type: answer.type, sdp: tunedAnswerSdp };
+      await pc.setLocalDescription(tweakedAnswer);
+      sentAnswer = tweakedAnswer;
+    } catch (err) {
+      console.warn('[AirDesk] Playout-delay answer SDP rejected, falling back:', err.message);
+      await pc.setLocalDescription(answer);
+    }
+    if (pc !== currentPc || !ws || ws.readyState !== WebSocket.OPEN) return;
+    ws.send(JSON.stringify({ type: 'rtc:answer', sdp: sentAnswer.sdp }));
+    hasActivePeer = true;
+    if (Date.now() < audioRenegotiatePreserveCtrlUntil) {
+      currentControlEnabled = preservedControlEnabled;
+      audioRenegotiatePreserveCtrlUntil = 0;
+    }
+    await window.airdeskAPI.setSessionActive(true);
+    await window.airdeskAPI.setControlPermission(currentControlEnabled);
+    updateControlButtonUi();
+    resetAdaptiveBitrate(tier.maxKbps);
+    await applyVideoParameters(abr.state.currentTargetKbps, captureMaxFps());
+    startRtcStatsMonitor();
+    setLivePill('live', '串流中');
+    statusEl.textContent = activePeerIsOverlay
+      ? 'WebRTC 异地组网串流已建立（支持全局快捷键切屏/切权与系统级操控）'
+      : 'WebRTC 串流已建立（支持全局快捷键切屏/切权与系统级操控）';
   } catch (err) {
-    console.warn('[AirDesk] Playout-delay answer SDP rejected, falling back:', err.message);
-    await pc.setLocalDescription(answer);
+    if (pc === currentPc) {
+      cleanupPeerConnection(true);
+    }
+    showNotice('建立 WebRTC 通道失败：' + (err && err.message ? err.message : err));
   }
-  ws.send(JSON.stringify({ type: 'rtc:answer', sdp: sentAnswer.sdp }));
-  hasActivePeer = true;
-  if (Date.now() < audioRenegotiatePreserveCtrlUntil) {
-    currentControlEnabled = preservedControlEnabled;
-    audioRenegotiatePreserveCtrlUntil = 0;
-  }
-  await window.airdeskAPI.setSessionActive(true);
-  await window.airdeskAPI.setControlPermission(currentControlEnabled);
-  updateControlButtonUi();
-  resetAdaptiveBitrate(tier.maxKbps);
-  await applyVideoParameters(abr.state.currentTargetKbps, captureMaxFps());
-  startRtcStatsMonitor();
-  setLivePill('live', '串流中');
-  statusEl.textContent = activePeerIsOverlay
-    ? 'WebRTC 异地组网串流已建立（支持全局快捷键切屏/切权与系统级操控）'
-    : 'WebRTC 串流已建立（支持全局快捷键切屏/切权与系统级操控）';
 }
 
 async function approveRequest(mode) {

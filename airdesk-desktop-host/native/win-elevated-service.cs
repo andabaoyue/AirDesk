@@ -48,6 +48,7 @@ namespace AirDeskElevatedService
 
         public const uint SPI_GETANIMATION = 0x0048;
         public const uint SPI_SETANIMATION = 0x0049;
+        public const uint WM_QUIT = 0x0012;
 
         [StructLayout(LayoutKind.Sequential)]
         public struct ANIMATIONINFO
@@ -252,6 +253,12 @@ namespace AirDeskElevatedService
 
         [DllImport("user32.dll", SetLastError = true)]
         public static extern bool SystemParametersInfo(uint uiAction, uint uiParam, ref ANIMATIONINFO pvParam, uint fWinIni);
+
+        [DllImport("kernel32.dll")]
+        public static extern uint GetCurrentThreadId();
+
+        [DllImport("user32.dll")]
+        public static extern bool PostThreadMessage(uint idThread, uint Msg, IntPtr wParam, IntPtr lParam);
     }
 
     sealed class AirDeskSessionService : ServiceBase
@@ -449,11 +456,20 @@ namespace AirDeskElevatedService
         private const string PipeName = "AirDeskElevatedInput";
         private const string SecretFilePath = @"C:\ProgramData\AirDesk\pipe.secret";
 
+        private static readonly object _monitorLock = new object();
+        private static bool _sessionActive = false;
         private static NativeApi.LowLevelMouseProc _mouseProc;
         private static IntPtr _mouseHookHandle = IntPtr.Zero;
+        private static uint _hookThreadId = 0;
+        private static Thread _hookThread = null;
+        private static Thread _notifyThread = null;
+        private static Thread _secureDesktopThread = null;
         private static long _lastPhysicalNotifyMs = 0;
         private static int _physicalMousePending = 0;
         private static readonly AutoResetEvent _physicalMouseSignal = new AutoResetEvent(false);
+        private static volatile bool _hookStopping = false;
+        private static volatile bool _secureDesktopStopping = false;
+        private static readonly ManualResetEvent _secureDesktopStopEvent = new ManualResetEvent(false);
         private static readonly Dictionary<ushort, bool> _activeKeys = new Dictionary<ushort, bool>();
         private static bool _leftDown = false;
         private static bool _rightDown = false;
@@ -634,8 +650,6 @@ namespace AirDeskElevatedService
             {
                 try { NativeApi.SetProcessDPIAware(); } catch { }
             }
-            StartPhysicalMouseMonitor();
-            StartSecureDesktopMonitor();
 
             JavaScriptSerializer serializer = new JavaScriptSerializer { MaxJsonLength = 2000000 };
 
@@ -734,6 +748,9 @@ namespace AirDeskElevatedService
                     {
                         _activeWriter = null;
                     }
+                    SetSessionActive(false);
+                    _reportedSecureDesktop = false;
+                    _reportedSecureDesktopName = "Default";
                     SetWindowAnimationSuppressed(false);
                     ReleaseAllKeysAndMouse();
                     if (server != null)
@@ -803,41 +820,64 @@ namespace AirDeskElevatedService
             return s.Replace("\\", "\\\\").Replace("\"", "\\\"");
         }
 
+        private static bool? SampleSecureDesktop(out string sampleName)
+        {
+            bool? sampleSecure = null;
+            sampleName = "";
+            IntPtr hDesk = NativeApi.OpenInputDesktop(0, false, NativeApi.DESKTOP_READOBJECTS);
+            if (hDesk == IntPtr.Zero)
+            {
+                if (Marshal.GetLastWin32Error() == 5)
+                {
+                    sampleSecure = true;
+                    sampleName = "Winlogon";
+                }
+            }
+            else
+            {
+                try
+                {
+                    sampleName = GetDesktopName(hDesk);
+                    if (!string.IsNullOrEmpty(sampleName))
+                    {
+                        sampleSecure = !string.Equals(sampleName, "Default", StringComparison.OrdinalIgnoreCase);
+                    }
+                }
+                finally
+                {
+                    NativeApi.CloseDesktop(hDesk);
+                }
+            }
+            return sampleSecure;
+        }
+
         private static void StartSecureDesktopMonitor()
         {
+            _secureDesktopStopping = false;
             Thread monitorThread = new Thread(() =>
             {
+                string initName;
+                bool? initSecure = SampleSecureDesktop(out initName);
+                if (initSecure.HasValue)
+                {
+                    _reportedSecureDesktop = initSecure.Value;
+                    _reportedSecureDesktopName = string.IsNullOrEmpty(initName) ? (_reportedSecureDesktop ? "Winlogon" : "Default") : initName;
+                    EmitPipeEvent(
+                        "{\"event\":\"secure_desktop\",\"active\":" +
+                        (_reportedSecureDesktop ? "true" : "false") +
+                        ",\"desktop\":\"" +
+                        EscapeJson(_reportedSecureDesktopName) +
+                        "\"}"
+                    );
+                }
+
                 bool? pendingSecure = null;
                 int pendingCount = 0;
-                while (true)
+                while (!_secureDesktopStopping)
                 {
-                    Thread.Sleep(400);
-                    bool? sampleSecure = null;
-                    string sampleName = "";
-                    IntPtr hDesk = NativeApi.OpenInputDesktop(0, false, NativeApi.DESKTOP_READOBJECTS);
-                    if (hDesk == IntPtr.Zero)
-                    {
-                        if (Marshal.GetLastWin32Error() == 5)
-                        {
-                            sampleSecure = true;
-                            sampleName = "Winlogon";
-                        }
-                    }
-                    else
-                    {
-                        try
-                        {
-                            sampleName = GetDesktopName(hDesk);
-                            if (!string.IsNullOrEmpty(sampleName))
-                            {
-                                sampleSecure = !string.Equals(sampleName, "Default", StringComparison.OrdinalIgnoreCase);
-                            }
-                        }
-                        finally
-                        {
-                            NativeApi.CloseDesktop(hDesk);
-                        }
-                    }
+                    if (_secureDesktopStopEvent.WaitOne(400) || _secureDesktopStopping) break;
+                    string sampleName;
+                    bool? sampleSecure = SampleSecureDesktop(out sampleName);
 
                     if (!sampleSecure.HasValue) continue;
                     bool nowSecure = sampleSecure.Value;
@@ -873,7 +913,20 @@ namespace AirDeskElevatedService
                 }
             });
             monitorThread.IsBackground = true;
+            _secureDesktopThread = monitorThread;
             monitorThread.Start();
+        }
+
+        private static void StopSecureDesktopMonitor()
+        {
+            _secureDesktopStopping = true;
+            _secureDesktopStopEvent.Set();
+            Thread t = _secureDesktopThread;
+            _secureDesktopThread = null;
+            if (t != null && t.IsAlive && Thread.CurrentThread != t)
+            {
+                try { t.Join(400); } catch { }
+            }
         }
 
         private static bool TryParseTwoDoubles(string line, out double a, out double b)
@@ -1019,6 +1072,12 @@ namespace AirDeskElevatedService
                     bool en = obj.TryGetValue("enabled", out enVal) && enVal is bool && (bool)enVal;
                     SetWindowAnimationSuppressed(en);
                 }
+                else if (t == "sys:session_state")
+                {
+                    object actVal;
+                    bool act = obj.TryGetValue("active", out actVal) && actVal is bool && (bool)actVal;
+                    SetSessionActive(act);
+                }
             }
             catch
             {
@@ -1066,11 +1125,13 @@ namespace AirDeskElevatedService
 
         private static void StartPhysicalMouseMonitor()
         {
+            _hookStopping = false;
             Thread notifyThread = new Thread(() =>
             {
-                while (true)
+                while (!_hookStopping)
                 {
-                    _physicalMouseSignal.WaitOne(500);
+                    _physicalMouseSignal.WaitOne();
+                    if (_hookStopping) break;
                     if (Interlocked.Exchange(ref _physicalMousePending, 0) == 1)
                     {
                         EmitPipeEvent("{\"event\":\"physical_mouse_override\"}");
@@ -1078,10 +1139,12 @@ namespace AirDeskElevatedService
                 }
             });
             notifyThread.IsBackground = true;
+            _notifyThread = notifyThread;
             notifyThread.Start();
 
             Thread hookThread = new Thread(() =>
             {
+                _hookThreadId = NativeApi.GetCurrentThreadId();
                 _mouseProc = HookCallback;
                 _mouseHookHandle = NativeApi.SetWindowsHookEx(NativeApi.WH_MOUSE_LL, _mouseProc, IntPtr.Zero, 0);
                 NativeApi.MSG msg;
@@ -1090,7 +1153,64 @@ namespace AirDeskElevatedService
                 if (h != IntPtr.Zero) NativeApi.UnhookWindowsHookEx(h);
             });
             hookThread.IsBackground = true;
+            _hookThread = hookThread;
             hookThread.Start();
+        }
+
+        private static void StopPhysicalMouseMonitor()
+        {
+            _hookStopping = true;
+            _physicalMouseSignal.Set();
+            IntPtr h = Interlocked.Exchange(ref _mouseHookHandle, IntPtr.Zero);
+            if (h != IntPtr.Zero)
+            {
+                try { NativeApi.UnhookWindowsHookEx(h); } catch { }
+            }
+            if (_hookThreadId != 0)
+            {
+                try { NativeApi.PostThreadMessage(_hookThreadId, NativeApi.WM_QUIT, IntPtr.Zero, IntPtr.Zero); } catch { }
+            }
+            Thread ht = _hookThread;
+            _hookThread = null;
+            if (ht != null && ht.IsAlive && Thread.CurrentThread != ht)
+            {
+                try { ht.Join(400); } catch { }
+            }
+            Thread nt = _notifyThread;
+            _notifyThread = null;
+            if (nt != null && nt.IsAlive && Thread.CurrentThread != nt)
+            {
+                try { nt.Join(400); } catch { }
+            }
+            _hookThreadId = 0;
+        }
+
+        private static void SetSessionActive(bool active)
+        {
+            lock (_monitorLock)
+            {
+                if (active == _sessionActive) return;
+                if (active)
+                {
+                    _sessionActive = true;
+                    _hookStopping = false;
+                    _secureDesktopStopping = false;
+                    Interlocked.Exchange(ref _physicalMousePending, 0);
+                    Interlocked.Exchange(ref _lastPhysicalNotifyMs, 0);
+                    _physicalMouseSignal.Reset();
+                    _secureDesktopStopEvent.Reset();
+                    StartPhysicalMouseMonitor();
+                    StartSecureDesktopMonitor();
+                }
+                else
+                {
+                    _sessionActive = false;
+                    StopSecureDesktopMonitor();
+                    StopPhysicalMouseMonitor();
+                    _reportedSecureDesktop = false;
+                    _reportedSecureDesktopName = "Default";
+                }
+            }
         }
 
         private static void SendMouse(int dx, int dy, uint flags, uint mouseData = 0)

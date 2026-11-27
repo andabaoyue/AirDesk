@@ -26,6 +26,7 @@ import {
   computeAbrFloorKbps,
   createAbrController,
 } from '../renderer/modules/abr-controller.mjs';
+import { createMediaCaptureManager } from '../renderer/modules/media-capture.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -560,6 +561,170 @@ execFileSync(process.execPath, ['--input-type=module', '--check'], {
   }
 }
 
+// 6. Unit tests: PR 0 idle capture release & power-saving guards
+{
+  const prevNavDesc = Object.getOwnPropertyDescriptor(globalThis, 'navigator');
+  let displayVideoStops = 0;
+  let audioStops = 0;
+  let virtualAudioDisables = 0;
+  let hasActivePeer = false;
+  let hasPc = false;
+  let isHosting = true;
+
+  const makeTrack = (kind, onStop) => ({
+    kind,
+    readyState: 'live',
+    enabled: true,
+    muted: false,
+    contentHint: '',
+    stop() {
+      this.readyState = 'ended';
+      if (onStop) onStop();
+    },
+  });
+
+  const makeStream = (tracks) => ({
+    getTracks: () => tracks,
+    getVideoTracks: () => tracks.filter((t) => t.kind === 'video'),
+    getAudioTracks: () => tracks.filter((t) => t.kind === 'audio'),
+    removeTrack: () => {},
+  });
+
+  Object.defineProperty(globalThis, 'navigator', {
+    configurable: true,
+    value: {
+      mediaDevices: {
+        async getUserMedia(constraints) {
+          if (constraints && constraints.audio) {
+            return makeStream([
+              makeTrack('video'),
+              makeTrack('audio', () => {
+                audioStops += 1;
+              }),
+            ]);
+          }
+          return makeStream([
+            makeTrack('video', () => {
+              displayVideoStops += 1;
+            }),
+          ]);
+        },
+      },
+    },
+  });
+
+  try {
+    let statusText = '';
+    const mgr = createMediaCaptureManager({
+      getScreenSources: () => [{ id: 'screen:0:0', displayId: '1', name: 'Display 1' }],
+      getSelectedDisplayId: () => '1',
+      setSelectedDisplayId: () => {},
+      getSelectedResolution: () => '1080p',
+      getCaptureMaxFps: () => 30,
+      getContentHintPref: () => 'auto',
+      getAudioEnabled: () => true,
+      setAudioEnabledState: () => {},
+      getVirtualAudioInfo: () => null,
+      getMuteHostVirtualAudio: () => false,
+      getIsHosting: () => isHosting,
+      getHasActivePeer: () => hasActivePeer,
+      getHasPc: () => hasPc,
+      getPcStats: async () => new Map(),
+      getHostInSecureDesktop: () => false,
+      getVideoSender: () => null,
+      getAudioSender: () => null,
+      getReliableDc: () => null,
+      getWs: () => null,
+      onAudioRenegotiatePreserveCtrl: () => {},
+      applyVideoParameters: async () => {},
+      getAbrTargetKbps: () => 6000,
+      getAbrFpsCap: () => 30,
+      getIsIdleThrottled: () => false,
+      pushDisplaysListToClient: () => {},
+      pushUiConfigToClient: () => {},
+      showNotice: () => {},
+      setStatusText: (t) => {
+        statusText = t;
+      },
+      airdeskAPI: {
+        setActiveDisplay: async () => ({ ok: true }),
+        setVirtualAudioRoute: async (opts) => {
+          if (opts && opts.enable === false) virtualAudioDisables += 1;
+          return { ok: true };
+        },
+      },
+    });
+
+    await mgr.ensureLocalCaptureReady();
+    assert.ok(mgr.getLocalStream() !== null);
+    assert.ok(mgr.getLocalAudioTrack() !== null);
+
+    // Must NOT release when cancelled before timer fires
+    mgr.scheduleIdleCaptureRelease(20);
+    mgr.cancelIdleCaptureRelease();
+    await new Promise((r) => setTimeout(r, 40));
+    assert.ok(mgr.getLocalStream() !== null);
+    assert.equal(displayVideoStops, 0);
+
+    // Must NOT release if peer is active
+    hasActivePeer = true;
+    mgr.scheduleIdleCaptureRelease(20);
+    await new Promise((r) => setTimeout(r, 40));
+    assert.ok(mgr.getLocalStream() !== null);
+    assert.equal(displayVideoStops, 0);
+
+    // Must release video + audio tracks and restore virtual audio when idle
+    hasActivePeer = false;
+    mgr.scheduleIdleCaptureRelease(20);
+    await new Promise((r) => setTimeout(r, 50));
+    assert.equal(mgr.getLocalStream(), null);
+    assert.equal(mgr.getLocalAudioTrack(), null);
+    assert.equal(displayVideoStops, 1);
+    assert.ok(audioStops >= 1);
+    assert.ok(virtualAudioDisables >= 1);
+    assert.ok(statusText.includes('自动释放'));
+  } finally {
+    if (prevNavDesc) {
+      Object.defineProperty(globalThis, 'navigator', prevNavDesc);
+    } else {
+      delete globalThis.navigator;
+    }
+  }
+
+  // Structural guards: native helpers must gate hooks/polling on sys:session_state & main.cjs must gate throttling/watchdog
+  const winHelperSrc = fs.readFileSync(path.join(rootDir, 'native', 'win-input-helper.cs'), 'utf8');
+  assert.ok(winHelperSrc.includes('"sys:session_state"'));
+  assert.ok(winHelperSrc.includes('SetSessionActive('));
+  assert.ok(winHelperSrc.includes('SampleSecureDesktop()'));
+  const helperStartSec = winHelperSrc.slice(
+    winHelperSrc.indexOf('static void StartSecureDesktopMonitor()'),
+    winHelperSrc.indexOf('while (!_secureDesktopStopping)')
+  );
+  assert.ok(helperStartSec.includes('SampleSecureDesktop()'));
+  const helperMainSection = winHelperSrc.slice(winHelperSrc.indexOf('static void Main('));
+  assert.equal(helperMainSection.includes('StartPhysicalMouseMonitor()'), false);
+  assert.equal(helperMainSection.includes('StartSecureDesktopMonitor()'), false);
+
+  const elevSrc = fs.readFileSync(path.join(rootDir, 'native', 'win-elevated-service.cs'), 'utf8');
+  assert.ok(elevSrc.includes('"sys:session_state"'));
+  assert.ok(elevSrc.includes('SetSessionActive('));
+  assert.ok(elevSrc.includes('SampleSecureDesktop(out '));
+  const elevStartSec = elevSrc.slice(
+    elevSrc.indexOf('private static void StartSecureDesktopMonitor()'),
+    elevSrc.indexOf('while (!_secureDesktopStopping)')
+  );
+  assert.ok(elevStartSec.includes('SampleSecureDesktop(out '));
+  const elevRunSection = elevSrc.slice(elevSrc.indexOf('public static void Run('), elevSrc.indexOf('while (true)'));
+  assert.equal(elevRunSection.includes('StartPhysicalMouseMonitor()'), false);
+  assert.equal(elevRunSection.includes('StartSecureDesktopMonitor()'), false);
+
+  const mainCjsSrc = fs.readFileSync(path.join(rootDir, 'electron', 'main.cjs'), 'utf8');
+  assert.ok(mainCjsSrc.includes('setBackgroundThrottling('));
+  assert.ok(mainCjsSrc.includes('startHeartbeatWatchdog'));
+  assert.ok(mainCjsSrc.includes('stopHeartbeatWatchdog'));
+  assert.ok(mainCjsSrc.includes("'airdesk:set-hosting-active'"));
+}
+
 console.log(
-  `[AirDesk Tests] Passed syntax checks (${cjsFiles.length} CJS, ${mjsFiles.length} MJS, host.js) + sdp-codec, abr-controller & trust-store unit tests.`
+  `[AirDesk Tests] Passed syntax checks (${cjsFiles.length} CJS, ${mjsFiles.length} MJS, host.js) + sdp-codec, abr-controller, trust-store & PR 0 idle-guard unit tests.`
 );

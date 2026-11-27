@@ -307,6 +307,10 @@ function createNativeHelperManager({
         scheduleHelperRespawn();
       }
     });
+
+    if (getHasActiveSession && getHasActiveSession()) {
+      sendToHelper({ t: 'sys:session_state', active: true });
+    }
   }
 
   function getElevatedServiceStatus() {
@@ -412,6 +416,9 @@ function createNativeHelperManager({
               if (nativeHelper && !nativeHelper.killed) {
                 try { nativeHelper.kill(); } catch {}
                 nativeHelper = null;
+              }
+              if (getHasActiveSession && getHasActiveSession()) {
+                sendToHelper({ t: 'sys:session_state', active: true });
               }
               finish(true);
             }
