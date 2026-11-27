@@ -35,6 +35,7 @@ class StorageService {
   static const _kRelayHostIdsMap = 'airdesk_relay_host_ids_v1';
   static const _kRecentHosts = 'airdesk_recent_hosts_v1';
   static const _kRemoteHosts = 'airdesk_remote_hosts_v1';
+  static const _kSavedHostProfiles = 'airdesk_saved_host_profiles_v1';
   static const _kAllowOverlayTun = 'airdesk_allow_overlay_tun_v1';
   static const _kRemoteRelayUrl = 'airdesk_remote_relay_url_v1';
   static const _kCustomIceUrl = 'airdesk_custom_ice_url_v1';
@@ -383,5 +384,53 @@ class StorageService {
   Future<void> setAutoSyncClipboard(bool enabled) async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setBool(_kAutoClipboard, enabled);
+  }
+
+  Future<List<SavedHostProfile>> getSavedHostProfiles() async {
+    final prefs = await SharedPreferences.getInstance();
+    final raw = prefs.getString(_kSavedHostProfiles);
+    if (raw == null || raw.isEmpty) return [];
+    try {
+      final arr = jsonDecode(raw) as List<dynamic>;
+      return arr
+          .whereType<Map<String, dynamic>>()
+          .map(SavedHostProfile.fromJson)
+          .where((e) => e.hostId.isNotEmpty)
+          .toList()
+        ..sort((a, b) => b.lastUsedMs.compareTo(a.lastUsedMs));
+    } catch (_) {
+      return [];
+    }
+  }
+
+  Future<void> upsertHostProfile(SavedHostProfile incoming) async {
+    final cleanId = incoming.hostId.trim();
+    if (cleanId.isEmpty) return;
+    final prefs = await SharedPreferences.getInstance();
+    final current = await getSavedHostProfiles();
+    final idx = current.indexWhere((e) => e.hostId == cleanId);
+    final merged = idx >= 0 ? current[idx].mergeWith(incoming) : incoming;
+    if (idx >= 0) {
+      current.removeAt(idx);
+    }
+    current.insert(0, merged);
+    current.sort((a, b) => b.lastUsedMs.compareTo(a.lastUsedMs));
+    if (current.length > 20) current.removeRange(20, current.length);
+    await prefs.setString(
+      _kSavedHostProfiles,
+      jsonEncode(current.map((e) => e.toJson()).toList()),
+    );
+  }
+
+  Future<void> removeHostProfile(String hostId) async {
+    final cleanId = hostId.trim();
+    if (cleanId.isEmpty) return;
+    final prefs = await SharedPreferences.getInstance();
+    final current = await getSavedHostProfiles();
+    current.removeWhere((e) => e.hostId == cleanId);
+    await prefs.setString(
+      _kSavedHostProfiles,
+      jsonEncode(current.map((e) => e.toJson()).toList()),
+    );
   }
 }

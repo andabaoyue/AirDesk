@@ -4,6 +4,10 @@
 import {
   isLanLikeConnection as checkLanLikeConnection,
   computeTieredVideoBitrates as calcTieredBitrates,
+  resolveEffectiveChannel,
+  resolvePolicyBitrateCapKbps,
+  resolveEffectiveLanNoStun,
+  resolveChannelIceServers,
   sortPreferredVideoCodecs,
   boostVideoSdpBitrate,
   enhanceAudioOpusSdp,
@@ -61,6 +65,11 @@ const tailscaleLinkRow = document.getElementById('tailscaleLinkRow');
 const tailscaleLinkText = document.getElementById('tailscaleLinkText');
 const btnCopyTailscale = document.getElementById('btnCopyTailscale');
 const btnToggleQrMode = document.getElementById('btnToggleQrMode');
+const dualLanRow = document.getElementById('dualLanRow');
+const dualLanInfoText = document.getElementById('dualLanInfoText');
+const btnCopyDualLanCode = document.getElementById('btnCopyDualLanCode');
+const enableLocalLanAlongsideRelayCheckbox = document.getElementById('enableLocalLanAlongsideRelay');
+const dualLanToggleWrap = document.getElementById('dualLanToggleWrap');
 const statusEl = document.getElementById('status');
 const rtcStatsEl = document.getElementById('rtcStats');
 const netInfoEl = document.getElementById('netInfo');
@@ -105,18 +114,34 @@ function captureMaxFps() {
   return framerateSelect && framerateSelect.value === '60' ? 60 : 30;
 }
 
+function getEffectiveChannel() {
+  return resolveEffectiveChannel({
+    activeSignalingChannel,
+    signalingMode: signalingModeSelect ? signalingModeSelect.value : 'local',
+  });
+}
+
+function getEffectiveLanNoStun() {
+  return resolveEffectiveLanNoStun({
+    activeSignalingChannel,
+    signalingMode: signalingModeSelect ? signalingModeSelect.value : 'local',
+    lanNoStun: Boolean(lanNoStunCheckbox && lanNoStunCheckbox.checked),
+    activePeerIsOverlay,
+  });
+}
+
 function isLanLikeConnection() {
   return checkLanLikeConnection({
-    isRelay: Boolean(signalingModeSelect && signalingModeSelect.value === 'remote'),
-    lanNoStun: Boolean(lanNoStunCheckbox && lanNoStunCheckbox.checked),
+    isRelay: getEffectiveChannel() === 'relay',
+    lanNoStun: getEffectiveLanNoStun(),
     activePeerIsOverlay,
   });
 }
 
 function computeTieredVideoBitrates() {
   return calcTieredBitrates({
-    isRelay: Boolean(signalingModeSelect && signalingModeSelect.value === 'remote'),
-    lanNoStun: Boolean(lanNoStunCheckbox && lanNoStunCheckbox.checked),
+    isRelay: getEffectiveChannel() === 'relay',
+    lanNoStun: getEffectiveLanNoStun(),
     activePeerIsOverlay,
     fps: captureMaxFps(),
     resolution: (resolutionSelect && resolutionSelect.value) || '1080p',
@@ -125,7 +150,15 @@ function computeTieredVideoBitrates() {
 
 const defaultBitrateKbps = () => computeTieredVideoBitrates().maxKbps;
 
-let ws = null;
+let relayWs = null;
+let localWs = null;
+let activeSignalingChannel = null; // 'lan' | 'relay' | null
+let activeSignalingWs = null;
+let pendingApprovalChannel = null;
+let relayPairCode = '';
+let localPairCode = '';
+let enableLocalLanAlongsideRelay = true;
+let activeLocalSignalingUrl = '';
 let pc = null;
 let videoSender = null;
 let audioSender = null;
@@ -223,7 +256,7 @@ const mediaCapture = createMediaCaptureManager({
   getVideoSender: () => videoSender,
   getAudioSender: () => audioSender,
   getReliableDc: () => reliableDc,
-  getWs: () => ws,
+  getWs: () => activeSignalingWs || relayWs || localWs,
   onAudioRenegotiatePreserveCtrl: () => {
     preservedControlEnabled = currentControlEnabled;
     audioRenegotiatePreserveCtrlUntil = Date.now() + 8000;
@@ -494,6 +527,10 @@ function syncSignalingInputState() {
   if (relayAccessKeyInput) {
     relayAccessKeyInput.style.display = isLocal ? 'none' : 'block';
   }
+  if (dualLanToggleWrap) {
+    dualLanToggleWrap.style.display = isLocal ? 'none' : 'inline-flex';
+  }
+  updateDualLanUi();
   if (isLocal && localSignalingInfo) {
     serverInput.value = localSignalingInfo.preferredHttpUrl;
     serverInput.readOnly = true;
@@ -571,6 +608,20 @@ if (btnToggleQrMode) {
     qrUseTailscale = !qrUseTailscale;
     if (currentPairCode) {
       renderPairQr(currentPairCode).catch(() => {});
+    }
+  };
+}
+if (btnCopyDualLanCode) {
+  btnCopyDualLanCode.onclick = async () => {
+    if (!/^\d{6}$/.test(localPairCode)) {
+      showNotice('当前尚未生成局域网本地配对码');
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(localPairCode);
+      showNotice('已复制局域网本地配对码：' + localPairCode);
+    } catch {
+      showNotice('当前局域网本地配对码：' + localPairCode);
     }
   };
 }
@@ -1036,7 +1087,81 @@ function cleanupPeerConnection(scheduleIdleRelease = true) {
   }
 }
 
-const signalingClient = createSignalingClient({
+function getChannelWs(channel) {
+  return channel === 'relay' ? relayWs : channel === 'lan' ? localWs : null;
+}
+
+function setChannelWs(channel, sock) {
+  if (channel === 'relay') relayWs = sock;
+  else if (channel === 'lan') localWs = sock;
+  if (activeSignalingChannel === channel) {
+    activeSignalingWs = sock;
+  }
+}
+
+function sendOnChannel(channel, obj) {
+  const sock = getChannelWs(channel);
+  if (sock && sock.readyState === WebSocket.OPEN) {
+    sock.send(JSON.stringify(obj));
+    return true;
+  }
+  return false;
+}
+
+function sendOnActiveSignaling(obj) {
+  const sock = activeSignalingWs || getChannelWs(activeSignalingChannel);
+  if (sock && sock.readyState === WebSocket.OPEN) {
+    sock.send(JSON.stringify(obj));
+    return true;
+  }
+  return false;
+}
+
+function sendOnAllOpenSignaling(obj) {
+  let sent = false;
+  const payload = JSON.stringify(obj);
+  for (const sock of [relayWs, localWs]) {
+    if (sock && sock.readyState === WebSocket.OPEN) {
+      sock.send(payload);
+      sent = true;
+    }
+  }
+  return sent;
+}
+
+function updateDualLanUi() {
+  if (!dualLanRow || !dualLanInfoText) return;
+  const isDualRemote =
+    isHosting &&
+    signalingModeSelect &&
+    signalingModeSelect.value === 'remote' &&
+    enableLocalLanAlongsideRelay &&
+    localSignalingInfo &&
+    /^\d{6}$/.test(localPairCode);
+  if (!isDualRemote) {
+    dualLanRow.style.display = 'none';
+    dualLanInfoText.textContent = '';
+    return;
+  }
+  const lanUrl = localSignalingInfo.preferredHttpUrl || 'http://127.0.0.1:47820';
+  dualLanInfoText.textContent = '局域网直连：' + lanUrl + ' · 本地码: ' + localPairCode;
+  dualLanRow.style.display = 'flex';
+}
+
+function evictExistingSessionIfNeeded(nextChannel, reason) {
+  if (activeSignalingChannel && activeSignalingChannel !== nextChannel) {
+    sendOnChannel(activeSignalingChannel, { type: 'session:close', reason });
+    if (activeSignalingChannel === 'relay') {
+      activeRelaySessionToken = '';
+    }
+    hasActivePeer = false;
+    currentControlEnabled = false;
+    activePeerIsOverlay = false;
+    cleanupPeerConnection(false);
+  }
+}
+
+const relaySignalingClient = createSignalingClient({
   reconnectDelaysMs: WS_RECONNECT_DELAYS_MS,
   heartbeatIntervalMs: 25000,
   pongTimeoutMs: 10000,
@@ -1047,8 +1172,7 @@ const signalingClient = createSignalingClient({
       } catch {}
       return;
     }
-    ws = sock;
-    const isRemote = signalingModeSelect.value === 'remote';
+    setChannelWs('relay', sock);
     const hasLivePc = Boolean(pc && pc.connectionState !== 'closed');
     const createPayload = {
       type: 'host:create',
@@ -1056,35 +1180,33 @@ const signalingClient = createSignalingClient({
       hostLabel: cachedHostname || 'AirDesk Desktop',
       audioEnabled: Boolean(enableAudioCheckbox && enableAudioCheckbox.checked),
     };
-    if (isRemote && hasLivePc) {
+    if (activeSignalingChannel === 'relay' && hasLivePc) {
       createPayload.resumeIfActive = true;
     }
     if (hostIdentity && hostIdentity.hostId && hostIdentity.hostSecret) {
       createPayload.hostId = hostIdentity.hostId;
       createPayload.hostSecret = hostIdentity.hostSecret;
     }
-    if (signalingModeSelect.value === 'local' && localSignalingInfo && localSignalingInfo.localHostToken) {
-      createPayload.localHostToken = localSignalingInfo.localHostToken;
-    }
     const rk = relayAccessKeyInput ? relayAccessKeyInput.value.trim() : '';
     if (rk) createPayload.accessKey = rk;
     sock.send(JSON.stringify(createPayload));
   },
-  onError: (err, attempt, syncFailure) => {
+  onError: (_err, attempt, syncFailure) => {
     if (syncFailure) {
       if (signalingModeSelect.value === 'remote' && isHosting && !isManualStop) {
-        signalingClient.scheduleReconnect(activeSignalingUrl, { enableHeartbeat: true });
-      } else {
-        stopHost('信令连接创建失败：' + (err && err.message ? err.message : err));
+        relaySignalingClient.scheduleReconnect(activeSignalingUrl, { enableHeartbeat: true });
       }
       return;
     }
     if (attempt === 0) {
-      showNotice('信令连接出现异常，请检查服务器地址或网络连通性');
+      showNotice('公网信令连接出现异常，请检查服务器地址或网络连通性');
     }
   },
   onReconnectScheduled: (delayMs, attempt) => {
     const hasLivePc = Boolean(pc && pc.connectionState !== 'closed');
+    if (activeSignalingChannel === 'lan' && hasLivePc) {
+      return;
+    }
     if (!hasLivePc) {
       setLivePill('waiting', '重连中');
       statusEl.textContent =
@@ -1093,48 +1215,135 @@ const signalingClient = createSignalingClient({
         ' 秒后自动重连 (第 ' +
         attempt +
         ' 次)...';
-    } else {
+    } else if (activeSignalingChannel === 'relay') {
       statusEl.textContent =
-        '信令通道闪断，画面保持中，正在后台重连信令 (第 ' + attempt + ' 次)...';
+        '公网信令通道闪断，画面保持中，正在后台重连信令 (第 ' + attempt + ' 次)...';
     }
   },
   onClose: (ev) => {
-    ws = null;
+    setChannelWs('relay', null);
     if (isManualStop || !isHosting) return;
     if (ev && ev.code === 4003) {
+      if (activeSignalingChannel === 'lan') {
+        showNotice('中继密钥或主机身份校验失败（局域网直连会话保持中）');
+        relaySignalingClient.stop();
+        return;
+      }
       stopHost('中继密钥或主机身份校验失败，已停止共享');
       return;
     }
-    if (signalingModeSelect.value === 'remote') {
-      const hasLivePc = Boolean(pc && pc.connectionState !== 'closed');
-      if (hasLivePc) {
-        hasPendingApproval = false;
-        pendingApprovalClient = null;
-        approvalCard.style.display = 'none';
-        statusEl.textContent = '信令通道闪断，画面保持中，正在后台重连信令...';
-        signalingClient.scheduleReconnect(activeSignalingUrl, { enableHeartbeat: true });
-        return;
-      }
+    if (pendingApprovalChannel === 'relay') {
       hasPendingApproval = false;
       pendingApprovalClient = null;
+      pendingApprovalChannel = null;
       approvalCard.style.display = 'none';
+    }
+    if (activeSignalingChannel === 'relay') {
+      const hasLivePc = Boolean(pc && pc.connectionState !== 'closed');
+      if (hasLivePc) {
+        statusEl.textContent = '公网信令通道闪断，画面保持中，正在后台重连信令...';
+        relaySignalingClient.scheduleReconnect(activeSignalingUrl, { enableHeartbeat: true });
+        return;
+      }
       hasActivePeer = false;
       currentControlEnabled = false;
       activePeerIsOverlay = false;
       activeRelaySessionToken = '';
+      activeSignalingChannel = null;
+      activeSignalingWs = null;
       cleanupPeerConnection(false);
       mediaCapture.releaseLocalCaptureMedia();
       window.airdeskAPI.setSessionActive(false).catch(() => {});
+      updateControlButtonUi();
+    }
+    if (activeSignalingChannel !== 'lan') {
+      relayPairCode = '';
       pairCodeEl.textContent = '------';
       renderPairQr('').catch(() => {});
-      updateControlButtonUi();
-      signalingClient.scheduleReconnect(activeSignalingUrl, { enableHeartbeat: true });
+    }
+    relaySignalingClient.scheduleReconnect(activeSignalingUrl, { enableHeartbeat: true });
+  },
+  onMessage: async (msg, sock) => {
+    await handleSignalingMessage('relay', msg, sock);
+  },
+});
+
+const localSignalingClient = createSignalingClient({
+  reconnectDelaysMs: WS_RECONNECT_DELAYS_MS,
+  heartbeatIntervalMs: 25000,
+  pongTimeoutMs: 10000,
+  onOpen: (sock) => {
+    if (!isHosting || isManualStop) {
+      try {
+        sock.close();
+      } catch {}
+      return;
+    }
+    setChannelWs('lan', sock);
+    const createPayload = {
+      type: 'host:create',
+      protoVersion: 2,
+      hostLabel: cachedHostname || 'AirDesk Desktop',
+      audioEnabled: Boolean(enableAudioCheckbox && enableAudioCheckbox.checked),
+    };
+    if (hostIdentity && hostIdentity.hostId && hostIdentity.hostSecret) {
+      createPayload.hostId = hostIdentity.hostId;
+      createPayload.hostSecret = hostIdentity.hostSecret;
+    }
+    if (localSignalingInfo && localSignalingInfo.localHostToken) {
+      createPayload.localHostToken = localSignalingInfo.localHostToken;
+    }
+    sock.send(JSON.stringify(createPayload));
+  },
+  onError: (err, attempt, syncFailure) => {
+    if (syncFailure) {
+      if (signalingModeSelect.value === 'remote') {
+        if (isHosting && !isManualStop && enableLocalLanAlongsideRelay && activeLocalSignalingUrl) {
+          localSignalingClient.scheduleReconnect(activeLocalSignalingUrl, { enableHeartbeat: false });
+        }
+      } else {
+        stopHost('本地信令连接创建失败：' + (err && err.message ? err.message : err));
+      }
+      return;
+    }
+    if (attempt === 0 && signalingModeSelect.value === 'local') {
+      showNotice('本地信令连接出现异常，请检查防火墙或端口占用');
+    }
+  },
+  onClose: () => {
+    setChannelWs('lan', null);
+    localPairCode = '';
+    updateDualLanUi();
+    if (isManualStop || !isHosting) return;
+    if (pendingApprovalChannel === 'lan') {
+      hasPendingApproval = false;
+      pendingApprovalClient = null;
+      pendingApprovalChannel = null;
+      approvalCard.style.display = 'none';
+    }
+    if (signalingModeSelect.value === 'remote') {
+      if (activeSignalingChannel === 'lan') {
+        hasActivePeer = false;
+        currentControlEnabled = false;
+        activePeerIsOverlay = false;
+        activeSignalingChannel = null;
+        activeSignalingWs = null;
+        cleanupPeerConnection(true);
+        window.airdeskAPI.setSessionActive(false).catch(() => {});
+        updateControlButtonUi();
+        if (relayPairCode) {
+          setLivePill('waiting', '待连接');
+        }
+      }
+      if (enableLocalLanAlongsideRelay && activeLocalSignalingUrl) {
+        localSignalingClient.scheduleReconnect(activeLocalSignalingUrl, { enableHeartbeat: false });
+      }
       return;
     }
     stopHost('信令连接已断开，已自动释放采集并切回只读');
   },
   onMessage: async (msg, sock) => {
-    await handleSignalingMessage(msg, sock);
+    await handleSignalingMessage('lan', msg, sock);
   },
 });
 
@@ -1147,9 +1356,14 @@ async function stopHost(reason) {
   }
   hasPendingApproval = false;
   pendingApprovalClient = null;
+  pendingApprovalChannel = null;
   hasActivePeer = false;
   activePeerIsOverlay = false;
   activeRelaySessionToken = '';
+  activeSignalingChannel = null;
+  activeSignalingWs = null;
+  relayPairCode = '';
+  localPairCode = '';
   currentControlEnabled = false;
   remoteIceServers = [];
   mediaCapture.cancelIdleCaptureRelease();
@@ -1160,13 +1374,18 @@ async function stopHost(reason) {
   mediaCapture.clearRecoverTimer();
   await window.airdeskAPI.setSessionActive(false);
   cleanupPeerConnection(false);
-  ws = null;
-  signalingClient.stop({
+  relayWs = null;
+  localWs = null;
+  relaySignalingClient.stop({
+    closePayload: { type: 'session:close', reason: reason || '电脑端已停止共享' },
+  });
+  localSignalingClient.stop({
     closePayload: { type: 'session:close', reason: reason || '电脑端已停止共享' },
   });
   mediaCapture.releaseLocalCaptureMedia();
   approvalCard.style.display = 'none';
   pairCodeEl.textContent = '------';
+  updateDualLanUi();
   await renderPairQr('');
   setLivePill('', '未启动');
   btnStart.disabled = false;
@@ -1176,33 +1395,38 @@ async function stopHost(reason) {
 }
 
 function buildIceServers() {
-  if (signalingModeSelect.value === 'local' && lanNoStunCheckbox.checked) {
-    return [];
-  }
-  const merged = [];
-  if (Array.isArray(remoteIceServers) && remoteIceServers.length > 0) {
-    merged.push(...remoteIceServers);
-  }
-  const custom = parseIceServerInput(customStunInput ? customStunInput.value : '');
-  if (custom.length > 0) {
-    merged.push(...custom);
-  }
-  if (merged.length > 0) {
-    return merged;
-  }
-  if (lanNoStunCheckbox && lanNoStunCheckbox.checked) {
-    return [];
-  }
-  return [{ urls: 'stun:stun.miwifi.com:3478' }, { urls: 'stun:stun.l.google.com:19302' }];
+  return resolveChannelIceServers({
+    activeSignalingChannel,
+    signalingMode: signalingModeSelect ? signalingModeSelect.value : 'local',
+    lanNoStun: Boolean(lanNoStunCheckbox && lanNoStunCheckbox.checked),
+    activePeerIsOverlay,
+    remoteIceServers,
+    customIceServers: parseIceServerInput(customStunInput ? customStunInput.value : ''),
+  });
+}
+
+function connectLocalSignalingSocket() {
+  if (!isHosting || isManualStop) return;
+  const port = (localSignalingInfo && localSignalingInfo.port) || 47820;
+  activeLocalSignalingUrl = 'ws://127.0.0.1:' + port + '/ws/signaling';
+  localWs = null;
+  localSignalingClient.connect(activeLocalSignalingUrl, { enableHeartbeat: false });
 }
 
 async function startHost() {
   if (isHosting) return;
   isManualStop = false;
-  signalingClient.resetReconnectAttempts();
-  signalingClient.clearReconnectTimer();
+  relaySignalingClient.resetReconnectAttempts();
+  relaySignalingClient.clearReconnectTimer();
+  localSignalingClient.resetReconnectAttempts();
+  localSignalingClient.clearReconnectTimer();
   mediaCapture.bumpSessionGen();
   remoteIceServers = [];
+  activeSignalingChannel = null;
+  activeSignalingWs = null;
+  pendingApprovalChannel = null;
+  relayPairCode = '';
+  localPairCode = '';
   localStorage.setItem(STORAGE_MODE_KEY, signalingModeSelect.value);
   if (signalingModeSelect.value === 'local') {
     localSignalingInfo = await window.airdeskAPI.startLocalSignaling(47820);
@@ -1247,33 +1471,61 @@ async function startHost() {
   btnStart.disabled = true;
   btnStop.disabled = false;
   updateControlButtonUi();
-  connectSignalingSocket(wsUrl);
+  if (signalingModeSelect.value === 'local') {
+    connectLocalSignalingSocket();
+    statusEl.textContent = '正在连接内置本地信令...';
+  } else {
+    connectSignalingSocket(wsUrl);
+    if (enableLocalLanAlongsideRelay) {
+      try {
+        localSignalingInfo = await window.airdeskAPI.startLocalSignaling(47820);
+        if (isHosting && !isManualStop) {
+          connectLocalSignalingSocket();
+        }
+      } catch (err) {
+        console.warn('[AirDesk DualMode] Failed to start local LAN signaling alongside relay:', err);
+      }
+    }
+  }
 }
 
 function connectSignalingSocket(wsUrl) {
   if (!isHosting || isManualStop) return;
   activeSignalingUrl = wsUrl;
-  ws = null;
-  const attempt = signalingClient.getReconnectAttempt();
+  relayWs = null;
+  const attempt = relaySignalingClient.getReconnectAttempt();
   statusEl.textContent =
     attempt > 0
       ? '正在尝试重新连接公网信令服务器 (第 ' + attempt + ' 次)...'
       : '正在连接信令服务器...';
-  signalingClient.connect(wsUrl, {
+  relaySignalingClient.connect(wsUrl, {
     enableHeartbeat: signalingModeSelect.value === 'remote',
   });
 }
 
-async function handleSignalingMessage(msg, sock) {
+async function handleSignalingMessage(channel, msg, sock) {
   if (msg.type === 'ws:pong') {
     return;
   } else if (msg.type === 'error') {
+    if (channel === 'lan' && signalingModeSelect.value === 'remote') {
+      console.warn('[AirDesk DualMode LAN error]:', msg.message);
+      return;
+    }
     showNotice(msg.message || '信令服务器返回错误');
     statusEl.textContent = msg.message || '信令服务错误';
     return;
   } else if (msg.type === 'host:created' || msg.type === 'host:code_rotated') {
-    if (Array.isArray(msg.iceServers)) {
-      remoteIceServers = msg.iceServers;
+    if (channel === 'lan') {
+      localPairCode = msg.code || '';
+      if (signalingModeSelect.value === 'remote') {
+        updateDualLanUi();
+        return;
+      }
+    } else {
+      relayPairCode = msg.code || '';
+      if (Array.isArray(msg.iceServers)) {
+        remoteIceServers = msg.iceServers;
+      }
     }
     const streamingNow = Boolean(pc && pc.connectionState === 'connected');
     if (streamingNow) {
@@ -1298,14 +1550,14 @@ async function handleSignalingMessage(msg, sock) {
         signalingModeSelect.value === 'local'
           ? '内置本地信令已就绪：手机连接同一热点/Wi-Fi 扫码即可 0 流量直连'
           : (hasTurn
-              ? '公网信令已就绪（已配 TURN 中继兜底' + hostIdNote + '）：等待手机接入...'
-              : '公网信令已就绪（STUN P2P 穿透' + hostIdNote + '）：等待手机接入...');
+              ? '公网信令已就绪（已配 TURN 中继兜底' + hostIdNote + (enableLocalLanAlongsideRelay ? ' · 已同步开启局域网直连' : '') + '）：等待手机接入...'
+              : '公网信令已就绪（STUN P2P 穿透' + hostIdNote + (enableLocalLanAlongsideRelay ? ' · 已同步开启局域网直连' : '') + '）：等待手机接入...');
     }
   } else if (msg.type === 'host:password_challenge_request') {
     const chalRes = await window.airdeskAPI.createPasswordChallenge({
       challengeId: msg.challengeId,
     });
-    if (ws === sock && sock.readyState === WebSocket.OPEN) {
+    if (getChannelWs(channel) === sock && sock.readyState === WebSocket.OPEN) {
       sock.send(
         JSON.stringify({
           type: 'host:password_challenge_reply',
@@ -1333,12 +1585,15 @@ async function handleSignalingMessage(msg, sock) {
       ipMasked: clientMeta.ipMasked,
     });
     if (verifyRes && verifyRes.ok) {
+      evictExistingSessionIfNeeded(channel, '已授权设备通过公网访问密码接管会话');
       activeRelaySessionToken = verifyRes.sessionToken;
+      activeSignalingChannel = channel;
+      activeSignalingWs = sock;
     }
     if (window.airdeskAPI.getUnattendedPasswordStatus) {
       updateUnattendedPasswordUi(await window.airdeskAPI.getUnattendedPasswordStatus());
     }
-    if (ws === sock && sock.readyState === WebSocket.OPEN) {
+    if (getChannelWs(channel) === sock && sock.readyState === WebSocket.OPEN) {
       sock.send(
         JSON.stringify({
           type: 'host:password_verified',
@@ -1365,13 +1620,19 @@ async function handleSignalingMessage(msg, sock) {
         approved &&
         pc &&
         pc.signalingState !== 'closed' &&
+        activeSignalingChannel === channel &&
         activeRelaySessionToken &&
         activeRelaySessionToken === msg.sessionToken
     );
     if (approved) {
+      if (!canReattach) {
+        evictExistingSessionIfNeeded(channel, '已信任设备通过另一通道接管会话');
+      }
       activeRelaySessionToken = msg.sessionToken;
+      activeSignalingChannel = channel;
+      activeSignalingWs = sock;
     }
-    if (ws === sock && sock.readyState === WebSocket.OPEN) {
+    if (getChannelWs(channel) === sock && sock.readyState === WebSocket.OPEN) {
       sock.send(
         JSON.stringify({
           type: 'host:token_verified',
@@ -1384,11 +1645,29 @@ async function handleSignalingMessage(msg, sock) {
       );
     }
   } else if (msg.type === 'host:approval_request') {
+    if (
+      (hasActivePeer && activeSignalingChannel && activeSignalingChannel !== channel) ||
+      (hasPendingApproval && pendingApprovalChannel && pendingApprovalChannel !== channel)
+    ) {
+      if (sock && sock.readyState === WebSocket.OPEN) {
+        sock.send(
+          JSON.stringify({
+            type: 'host:approval_decision',
+            approved: false,
+            reason: '该电脑当前已有其他通道的活跃连接，请稍后再试',
+          })
+        );
+      }
+      return;
+    }
     hasPendingApproval = true;
+    pendingApprovalChannel = channel;
     pendingApprovalClient = msg.client || null;
     activePeerIsOverlay = Boolean(msg.client && msg.client.isOverlayPeer);
+    const channelBadge = channel === 'lan' ? '[局域网] ' : '[公网中继] ';
     const netBadge = activePeerIsOverlay ? ' [异地组网]' : '';
     approvalDesc.textContent =
+      channelBadge +
       msg.client.deviceLabel +
       ' (' +
       msg.client.platformHint +
@@ -1399,18 +1678,33 @@ async function handleSignalingMessage(msg, sock) {
       ' 请求连接';
     approvalCard.style.display = 'block';
   } else if (msg.type === 'rtc:offer') {
+    if (activeSignalingChannel && activeSignalingChannel !== channel) {
+      return;
+    }
+    if (!activeSignalingChannel) {
+      activeSignalingChannel = channel;
+      activeSignalingWs = sock;
+    }
     if (msg.iceRestart === true && pc && pc.signalingState !== 'closed') {
       await handleIceRestartOffer(msg.sdp);
     } else {
       await handleOffer(msg.sdp);
     }
   } else if (msg.type === 'rtc:ice') {
+    if (activeSignalingChannel && activeSignalingChannel !== channel) {
+      return;
+    }
     if (pc && pc.remoteDescription) {
       await pc.addIceCandidate(msg.candidate).catch(() => {});
     } else {
       pendingIceCandidates.push(msg.candidate);
     }
   } else if (msg.type === 'host:client_reattached') {
+    if (activeSignalingChannel && activeSignalingChannel !== channel) {
+      return;
+    }
+    activeSignalingChannel = channel;
+    activeSignalingWs = sock;
     hasActivePeer = true;
     activePeerIsOverlay = Boolean(msg.isOverlayPeer);
     currentControlEnabled = msg.mode === 'full_control';
@@ -1422,30 +1716,46 @@ async function handleSignalingMessage(msg, sock) {
     }
     statusEl.textContent = '手机端信令已静默重连，画面保持中';
   } else if (msg.type === 'host:client_reconnected') {
+    evictExistingSessionIfNeeded(channel, '已信任设备通过另一通道接管会话');
+    activeSignalingChannel = channel;
+    activeSignalingWs = sock;
     hasActivePeer = true;
     activePeerIsOverlay = Boolean(msg.isOverlayPeer);
     currentControlEnabled = msg.mode === 'full_control';
     await window.airdeskAPI.setSessionActive(true);
     await window.airdeskAPI.setControlPermission(currentControlEnabled);
     updateControlButtonUi();
-    statusEl.textContent = activePeerIsOverlay
-      ? '已信任设备通过异地组网切回前台，正在自动免审批重连...'
-      : '已信任设备切回前台，正在自动免审批重连...';
+    statusEl.textContent =
+      channel === 'lan'
+        ? (activePeerIsOverlay
+            ? '已信任设备通过异地组网切回前台，正在自动免审批重连...'
+            : '已信任设备通过局域网直连切回，正在建立 0 流量满血通道...')
+        : '已信任设备通过公网中继切回前台，正在自动免审批重连...';
     showNotice(
-      activePeerIsOverlay
-        ? '已信任手机端通过 Tailscale 异地自动重连（免二次审批）'
-        : '已信任手机端自动重连（免二次审批）'
+      channel === 'lan'
+        ? (activePeerIsOverlay
+            ? '已信任手机端通过 Tailscale 异地自动重连（免二次审批）'
+            : '已信任手机端通过局域网免审批直连（35Mbps 满血模式）')
+        : '已信任手机端通过公网中继自动重连（免二次审批）'
     );
   } else if (msg.type === 'host:pending_cancelled') {
-    hasPendingApproval = false;
-    pendingApprovalClient = null;
-    approvalCard.style.display = 'none';
-    showNotice(msg.reason || '连接请求已取消');
+    if (!pendingApprovalChannel || pendingApprovalChannel === channel) {
+      hasPendingApproval = false;
+      pendingApprovalClient = null;
+      pendingApprovalChannel = null;
+      approvalCard.style.display = 'none';
+      showNotice(msg.reason || '连接请求已取消');
+    }
   } else if (msg.type === 'host:client_disconnected') {
+    if (activeSignalingChannel && activeSignalingChannel !== channel) {
+      return;
+    }
     statusEl.textContent = '客户端已断开：' + msg.reason;
     currentControlEnabled = false;
     activePeerIsOverlay = false;
     activeRelaySessionToken = '';
+    activeSignalingChannel = null;
+    activeSignalingWs = null;
     if (isHosting) setLivePill('waiting', '待连接');
     cleanupPeerConnection();
     await window.airdeskAPI.setSessionActive(false);
@@ -1453,7 +1763,7 @@ async function handleSignalingMessage(msg, sock) {
 }
 
 async function handleIceRestartOffer(remoteSdp) {
-  if (!pc || pc.signalingState === 'closed' || !ws || ws.readyState !== WebSocket.OPEN) {
+  if (!pc || pc.signalingState === 'closed' || !activeSignalingWs || activeSignalingWs.readyState !== WebSocket.OPEN) {
     return handleOffer(remoteSdp);
   }
   const currentPc = pc;
@@ -1490,8 +1800,10 @@ async function handleIceRestartOffer(remoteSdp) {
     console.warn('[AirDesk] iceRestart answer SDP rejected, falling back:', err.message);
     await currentPc.setLocalDescription(answer);
   }
-  if (pc !== currentPc || !ws || ws.readyState !== WebSocket.OPEN) return;
-  ws.send(JSON.stringify({ type: 'rtc:answer', sdp: sentAnswer.sdp, iceRestart: true }));
+  if (pc !== currentPc) return;
+  if (!sendOnActiveSignaling({ type: 'rtc:answer', sdp: sentAnswer.sdp, iceRestart: true })) {
+    return;
+  }
   statusEl.textContent = '收到手机端切网 iceRestart 请求，正在原地刷新通道...';
 }
 
@@ -1551,15 +1863,17 @@ async function handleOffer(remoteSdp) {
   };
 
   currentPc.onicecandidate = (e) => {
-    if (pc !== currentPc || !e.candidate || !ws || ws.readyState !== WebSocket.OPEN) return;
+    if (pc !== currentPc || !e.candidate) return;
     if (isVirtualCandidate(e.candidate.candidate)) return;
-    ws.send(JSON.stringify({ type: 'rtc:ice', candidate: e.candidate }));
+    sendOnActiveSignaling({ type: 'rtc:ice', candidate: e.candidate });
   };
 
   const resetOnConnectionLost = async (stateLabel) => {
     if (pc !== currentPc) return;
     hasActivePeer = false;
     currentControlEnabled = false;
+    activeSignalingChannel = null;
+    activeSignalingWs = null;
     if (isHosting) setLivePill('waiting', '待连接');
     updateControlButtonUi();
     cleanupPeerConnection(true);
@@ -1591,7 +1905,8 @@ async function handleOffer(remoteSdp) {
       }
     } else if (state === 'failed') {
       const wsReadyOrReconnecting =
-        signalingModeSelect.value === 'remote' || (ws && ws.readyState === WebSocket.OPEN);
+        activeSignalingChannel === 'relay' ||
+        Boolean(activeSignalingWs && activeSignalingWs.readyState === WebSocket.OPEN);
       if (wsReadyOrReconnecting) {
         if (!disconnectGraceTimer) {
           statusEl.textContent = 'WebRTC 链路中断 (failed)，等待手机端信令重连 / iceRestart...';
@@ -1706,7 +2021,10 @@ async function handleOffer(remoteSdp) {
           mediaCapture.clearWarmDisplayTracks();
           await mediaCapture.switchActiveDisplay(displaySelect.value, true);
         }
-        const maxPolicyCap = signalingModeSelect && signalingModeSelect.value === 'remote' ? 8000 : 35000;
+        const maxPolicyCap = resolvePolicyBitrateCapKbps({
+          activeSignalingChannel,
+          signalingMode: signalingModeSelect ? signalingModeSelect.value : 'local',
+        });
         const targetBitrate = Math.min(maxPolicyCap, Math.max(1000, Number(data.maxBitrateKbps) || 15000));
         const targetFps = reqFps > 0 ? reqFps : data.preset === 'office_saver' ? 20 : captureMaxFps();
         resetAdaptiveBitrate(targetBitrate);
@@ -1824,11 +2142,10 @@ async function handleOffer(remoteSdp) {
       await pc.setLocalDescription(answer);
     }
     if (pc !== currentPc) return;
-    if (!ws || ws.readyState !== WebSocket.OPEN) {
+    if (!sendOnActiveSignaling({ type: 'rtc:answer', sdp: sentAnswer.sdp })) {
       clearFailedOfferSession(true);
       return;
     }
-    ws.send(JSON.stringify({ type: 'rtc:answer', sdp: sentAnswer.sdp }));
     hasActivePeer = true;
     if (Date.now() < audioRenegotiatePreserveCtrlUntil) {
       currentControlEnabled = preservedControlEnabled;
@@ -1843,7 +2160,9 @@ async function handleOffer(remoteSdp) {
     setLivePill('live', '串流中');
     statusEl.textContent = activePeerIsOverlay
       ? 'WebRTC 异地组网串流已建立（支持全局快捷键切屏/切权与系统级操控）'
-      : 'WebRTC 串流已建立（支持全局快捷键切屏/切权与系统级操控）';
+      : getEffectiveChannel() === 'lan'
+        ? 'WebRTC 局域网 0 流量直连已建立（最高 35Mbps · 支持全局快捷键切屏/切权）'
+        : 'WebRTC 公网串流已建立（支持全局快捷键切屏/切权与系统级操控）';
   } catch (err) {
     if (pc === currentPc) {
       clearFailedOfferSession(true);
@@ -1853,17 +2172,21 @@ async function handleOffer(remoteSdp) {
 }
 
 async function approveRequest(mode) {
+  const targetChannel = pendingApprovalChannel || getEffectiveChannel();
+  pendingApprovalChannel = null;
   hasPendingApproval = false;
   const clientMeta = pendingApprovalClient || {};
   pendingApprovalClient = null;
   approvalCard.style.display = 'none';
   hasActivePeer = true;
+  activeSignalingChannel = targetChannel;
+  activeSignalingWs = getChannelWs(targetChannel);
   currentControlEnabled = mode === 'full_control';
   await window.airdeskAPI.setSessionActive(true);
   await window.airdeskAPI.setControlPermission(currentControlEnabled);
   updateControlButtonUi();
   const decisionPayload = { type: 'host:approval_decision', approved: true, mode };
-  if (signalingModeSelect.value === 'remote' && window.airdeskAPI.issueRelayTrustedToken) {
+  if (targetChannel === 'relay' && window.airdeskAPI.issueRelayTrustedToken) {
     const issued = await window.airdeskAPI.issueRelayTrustedToken({
       mode,
       deviceLabel: clientMeta.deviceLabel || '远程移动设备',
@@ -1875,18 +2198,16 @@ async function approveRequest(mode) {
       activeRelaySessionToken = issued.sessionToken;
     }
   }
-  if (ws && ws.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify(decisionPayload));
-  }
+  sendOnChannel(targetChannel, decisionPayload);
 }
 
 function rejectRequest() {
+  const targetChannel = pendingApprovalChannel || getEffectiveChannel();
+  pendingApprovalChannel = null;
   hasPendingApproval = false;
   pendingApprovalClient = null;
   approvalCard.style.display = 'none';
-  if (ws && ws.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify({ type: 'host:approval_decision', approved: false }));
-  }
+  sendOnChannel(targetChannel, { type: 'host:approval_decision', approved: false });
 }
 
 async function init() {
@@ -1898,6 +2219,10 @@ async function init() {
   }
   updateUnattendedPasswordUi(info.unattendedPasswordStatus || null);
   const hostSettings = info.hostSettings || {};
+  enableLocalLanAlongsideRelay = hostSettings.enableLocalLanAlongsideRelay !== false;
+  if (enableLocalLanAlongsideRelayCheckbox) {
+    enableLocalLanAlongsideRelayCheckbox.checked = enableLocalLanAlongsideRelay;
+  }
   displaysMeta = info.displays || [];
   localSignalingInfo = info.localSignaling || null;
   currentControlEnabled = Boolean(info.controlEnabled);
@@ -2155,9 +2480,7 @@ async function init() {
         })
       );
     }
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ type: 'host:emergency_stop' }));
-    }
+    sendOnAllOpenSignaling({ type: 'host:emergency_stop' });
   });
 
   window.airdeskAPI.onHotkeyAction(async (evt) => {
@@ -2185,7 +2508,7 @@ async function init() {
       updateControlButtonUi();
       const label = currentControlEnabled ? '允许远程操控' : '仅观看（只读）';
       showNotice('快捷键切权 (Ctrl+Alt+L)：当前已切换为「' + label + '」');
-      if (signalingModeSelect.value === 'remote' && activeRelaySessionToken && window.airdeskAPI.updateRelayTokenMode) {
+      if (activeSignalingChannel === 'relay' && activeRelaySessionToken && window.airdeskAPI.updateRelayTokenMode) {
         window.airdeskAPI
           .updateRelayTokenMode({
             sessionToken: activeRelaySessionToken,
@@ -2193,14 +2516,10 @@ async function init() {
           })
           .catch(() => {});
       }
-      if (ws && ws.readyState === WebSocket.OPEN) {
-        ws.send(
-          JSON.stringify({
-            type: 'host:update_config',
-            activeMode: currentControlEnabled ? 'full_control' : 'view_only',
-          })
-        );
-      }
+      sendOnActiveSignaling({
+        type: 'host:update_config',
+        activeMode: currentControlEnabled ? 'full_control' : 'view_only',
+      });
       if (reliableDc && reliableDc.readyState === 'open') {
         reliableDc.send(
           JSON.stringify({
@@ -2354,9 +2673,7 @@ async function init() {
   if (btnRevokeAllTokens) {
     btnRevokeAllTokens.onclick = async () => {
       await window.airdeskAPI.revokeTrustedDevice('*');
-      if (ws && ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({ type: 'host:update_config', revokeAllTokens: true }));
-      }
+      sendOnAllOpenSignaling({ type: 'host:update_config', revokeAllTokens: true });
       await refreshTrustedDevicesUi();
       showNotice('已清空所有已信任设备的 7 天免密凭证');
     };
@@ -2374,19 +2691,62 @@ async function init() {
         (typeof data.tokenPrefix === 'string' && activeRelaySessionToken.startsWith(data.tokenPrefix));
       if (!matched) return;
       activeRelaySessionToken = '';
-      if (signalingModeSelect.value === 'remote' && hasActivePeer) {
-        if (ws && ws.readyState === WebSocket.OPEN) {
-          ws.send(JSON.stringify({ type: 'session:close', reason: '电脑端已移除当前设备信任凭证' }));
-        }
+      if (activeSignalingChannel === 'relay' && hasActivePeer) {
+        sendOnChannel('relay', { type: 'session:close', reason: '电脑端已移除当前设备信任凭证' });
         hasActivePeer = false;
         currentControlEnabled = false;
         activePeerIsOverlay = false;
+        activeSignalingChannel = null;
+        activeSignalingWs = null;
         if (isHosting) setLivePill('waiting', '待连接');
         updateControlButtonUi();
         cleanupPeerConnection(true);
         window.airdeskAPI.setSessionActive(false).catch(() => {});
       }
     });
+  }
+  if (enableLocalLanAlongsideRelayCheckbox) {
+    enableLocalLanAlongsideRelayCheckbox.onchange = async () => {
+      const want = Boolean(enableLocalLanAlongsideRelayCheckbox.checked);
+      enableLocalLanAlongsideRelay = want;
+      await window.airdeskAPI.updateHostSettings({ enableLocalLanAlongsideRelay: want });
+      if (isHosting && signalingModeSelect.value === 'remote') {
+        if (want) {
+          try {
+            localSignalingInfo = await window.airdeskAPI.startLocalSignaling(47820);
+            connectLocalSignalingSocket();
+            showNotice('已开启双模局域网直连通道');
+          } catch (err) {
+            showNotice('开启局域网直连失败：' + (err && err.message ? err.message : err));
+          }
+        } else {
+          localSignalingClient.stop({
+            closePayload: { type: 'session:close', reason: '电脑端已关闭双模局域网通道' },
+          });
+          localWs = null;
+          localPairCode = '';
+          updateDualLanUi();
+          if (activeSignalingChannel === 'lan') {
+            hasActivePeer = false;
+            currentControlEnabled = false;
+            activePeerIsOverlay = false;
+            activeSignalingChannel = null;
+            activeSignalingWs = null;
+            if (isHosting) setLivePill('waiting', '待连接');
+            updateControlButtonUi();
+            cleanupPeerConnection(true);
+            window.airdeskAPI.setSessionActive(false).catch(() => {});
+          }
+          showNotice('已关闭公网模式下的局域网直连通道');
+        }
+      } else {
+        showNotice(
+          want
+            ? '已开启：公网模式下同步启用局域网直连（双模常驻）'
+            : '已关闭公网模式下的局域网直连'
+        );
+      }
+    };
   }
   if (trustTtlSelect) {
     trustTtlSelect.value =
@@ -2505,7 +2865,7 @@ btnToggleCtrl.onclick = async () => {
   const res = await window.airdeskAPI.setControlPermission(next);
   currentControlEnabled = Boolean(res.controlEnabled);
   updateControlButtonUi();
-  if (signalingModeSelect.value === 'remote' && activeRelaySessionToken && window.airdeskAPI.updateRelayTokenMode) {
+  if (activeSignalingChannel === 'relay' && activeRelaySessionToken && window.airdeskAPI.updateRelayTokenMode) {
     window.airdeskAPI
       .updateRelayTokenMode({
         sessionToken: activeRelaySessionToken,
@@ -2513,14 +2873,10 @@ btnToggleCtrl.onclick = async () => {
       })
       .catch(() => {});
   }
-  if (ws && ws.readyState === WebSocket.OPEN) {
-    ws.send(
-      JSON.stringify({
-        type: 'host:update_config',
-        activeMode: currentControlEnabled ? 'full_control' : 'view_only',
-      })
-    );
-  }
+  sendOnActiveSignaling({
+    type: 'host:update_config',
+    activeMode: currentControlEnabled ? 'full_control' : 'view_only',
+  });
   if (reliableDc && reliableDc.readyState === 'open') {
     reliableDc.send(
       JSON.stringify({

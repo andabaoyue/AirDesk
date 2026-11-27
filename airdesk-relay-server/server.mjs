@@ -11,6 +11,9 @@ const PAIR_CODE_TTL_MS = 30 * 60 * 1000;
 const TRUSTED_TOKEN_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const RATE_LIMIT_WINDOW_MS = 60 * 1000;
 const RATE_LIMIT_MAX_ATTEMPTS = 8;
+const PROBE_RATE_LIMIT_WINDOW_MS = 60 * 1000;
+const PROBE_RATE_LIMIT_MAX = 20;
+const MAX_PROBE_HOST_IDS = 16;
 const MAX_IP_BUCKETS = 10000;
 const MAX_HOST_REGISTRY = 10000;
 const MAX_PENDING_VERIFIES_PER_ROOM = 4;
@@ -87,6 +90,11 @@ function sendWs(ws, obj) {
 
 export function createRelayServer(options = {}) {
   const gracePeriodMs = parseIntSafe(options.gracePeriodMs, 20000);
+  const probeRateLimitMax = parseIntSafe(options.probeRateLimitMax, PROBE_RATE_LIMIT_MAX);
+  const probeRateLimitWindowMs = parseIntSafe(
+    options.probeRateLimitWindowMs,
+    PROBE_RATE_LIMIT_WINDOW_MS
+  );
   const accessKey = String(
     options.accessKey !== undefined ? options.accessKey : (process.env.RELAY_ACCESS_KEY || '')
   ).trim();
@@ -110,6 +118,7 @@ export function createRelayServer(options = {}) {
   const socketRoom = new Map();
   const wsPendingChallenge = new WeakMap();
   const ipAttemptBuckets = new Map();
+  const probeIpBuckets = new Map();
 
   function getIceServers() {
     return buildIceServersFromConfig(iceConfig);
@@ -206,6 +215,21 @@ export function createRelayServer(options = {}) {
     const bucket = ipAttemptBuckets.get(ip);
     if (!bucket || now > bucket.resetAt) return false;
     return bucket.count >= RATE_LIMIT_MAX_ATTEMPTS;
+  }
+
+  function checkAndRecordProbeIp(ip) {
+    const now = Date.now();
+    let bucket = probeIpBuckets.get(ip);
+    if (!bucket || now > bucket.resetAt) {
+      if (!bucket && probeIpBuckets.size >= MAX_IP_BUCKETS) {
+        const oldestKey = probeIpBuckets.keys().next().value;
+        if (oldestKey !== undefined) probeIpBuckets.delete(oldestKey);
+      }
+      bucket = { count: 0, resetAt: now + probeRateLimitWindowMs };
+      probeIpBuckets.set(ip, bucket);
+    }
+    bucket.count += 1;
+    return bucket.count > probeRateLimitMax;
   }
 
   const server = http.createServer((req, res) => {
@@ -306,6 +330,9 @@ export function createRelayServer(options = {}) {
     for (const [ip, bucket] of ipAttemptBuckets.entries()) {
       if (now > bucket.resetAt) ipAttemptBuckets.delete(ip);
     }
+    for (const [ip, bucket] of probeIpBuckets.entries()) {
+      if (now > bucket.resetAt) probeIpBuckets.delete(ip);
+    }
   }, 5000);
 
   wss.on('connection', (ws, req) => {
@@ -336,6 +363,38 @@ export function createRelayServer(options = {}) {
       if (msg.type === 'ws:ping') {
         ws.isAlive = true;
         sendWs(ws, { type: 'ws:pong', ts: msg.ts });
+        return;
+      }
+
+      if (msg.type === 'client:probe_hosts') {
+        if (checkAndRecordProbeIp(maskedIp)) {
+          sendWs(ws, {
+            type: 'error',
+            code: 'PROBE_RATE_LIMITED',
+            retryable: true,
+            message: '探活请求过于频繁，请稍后再试',
+          });
+          return;
+        }
+        const rawIds = Array.isArray(msg.hostIds) ? msg.hostIds : [];
+        const uniqueIds = [];
+        const seen = new Set();
+        for (const item of rawIds) {
+          if (typeof item !== 'string') continue;
+          const id = item.trim();
+          if (!HOST_ID_RE.test(id) || seen.has(id)) continue;
+          seen.add(id);
+          uniqueIds.push(id);
+          if (uniqueIds.length >= MAX_PROBE_HOST_IDS) break;
+        }
+        const hosts = {};
+        for (const id of uniqueIds) {
+          const room = roomsByHostId.get(id);
+          const online = Boolean(room && room.hostWs && room.hostWs.readyState === 1);
+          const busy = online && Boolean(room.activeClientWs && room.activeClientWs.readyState === 1);
+          hosts[id] = { online, busy };
+        }
+        sendWs(ws, { type: 'client:hosts_status', hosts });
         return;
       }
 

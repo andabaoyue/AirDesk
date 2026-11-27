@@ -1,6 +1,7 @@
 import 'dart:convert';
 import 'dart:typed_data';
 import 'package:airdesk_app/main.dart';
+import 'package:airdesk_app/models/airdesk_models.dart';
 import 'package:airdesk_app/services/scrypt_helper.dart';
 import 'package:airdesk_app/services/sdp_helper.dart';
 import 'package:airdesk_app/services/storage_service.dart';
@@ -385,5 +386,122 @@ void main() {
       WebRtcSessionService.shouldSkipRtcRebuildOnApproved({'reattached': true}, hasLivePc: false),
       isFalse,
     );
+  });
+
+  test('PR 3 SavedHostProfile merge & Smart Route priority (USB > LAN > Relay > Offline)', () async {
+    SharedPreferences.setMockInitialValues({});
+    final storage = StorageService();
+
+    await storage.upsertHostProfile(
+      const SavedHostProfile(
+        hostId: 'hosthome0001',
+        hostLabel: 'Home Desktop',
+        lastLanIp: '192.168.1.25',
+        lastLanPort: 47820,
+        lastUsedMs: 1000,
+      ),
+    );
+    await storage.upsertHostProfile(
+      const SavedHostProfile(
+        hostId: 'hosthome0001',
+        hostLabel: 'Home Desktop Renamed',
+        relayUrl: 'https://relay.example.com',
+        customIceRaw: 'turn:u:p@1.2.3.4:3478',
+        lastUsedMs: 2000,
+      ),
+    );
+    await storage.upsertHostProfile(
+      const SavedHostProfile(
+        hostId: 'hostwork0002',
+        hostLabel: 'Work PC',
+        relayUrl: 'https://relay.example.com',
+        lastUsedMs: 3000,
+      ),
+    );
+
+    final profiles = await storage.getSavedHostProfiles();
+    expect(profiles.length, 2);
+    expect(profiles.first.hostId, 'hostwork0002');
+    final mergedHome = profiles.last;
+    expect(mergedHome.hostId, 'hosthome0001');
+    expect(mergedHome.hostLabel, 'Home Desktop Renamed');
+    expect(mergedHome.lastLanIp, '192.168.1.25');
+    expect(mergedHome.relayUrl, 'https://relay.example.com');
+    expect(mergedHome.customIceRaw, 'turn:u:p@1.2.3.4:3478');
+
+    const usbHost = AirDeskHostInfo(
+      hostId: 'hosthome0001',
+      hostname: 'Home (USB)',
+      ip: '192.168.42.1',
+      isUsb: true,
+    );
+    const lanHost = AirDeskHostInfo(
+      hostId: 'hosthome0001',
+      hostname: 'Home',
+      ip: '192.168.1.25',
+    );
+    const relayOnline = RelayHostProbeStatus(online: true, busy: false);
+    const relayBusy = RelayHostProbeStatus(online: true, busy: true);
+    const relayOffline = RelayHostProbeStatus(online: false, busy: false);
+
+    // USB > LAN > Relay when preferLanFirst is true
+    expect(
+      resolveSmartRoutePriority(
+        profile: mergedHome,
+        discoveredUsb: usbHost,
+        discoveredLan: lanHost,
+        relayStatus: relayOnline,
+      ).channel,
+      SmartRouteChannel.usb,
+    );
+    expect(
+      resolveSmartRoutePriority(
+        profile: mergedHome,
+        discoveredLan: lanHost,
+        relayStatus: relayOnline,
+      ).channel,
+      SmartRouteChannel.lan,
+    );
+    final relayRoute = resolveSmartRoutePriority(
+      profile: mergedHome,
+      relayStatus: relayOnline,
+    );
+    expect(relayRoute.channel, SmartRouteChannel.relay);
+    expect(relayRoute.isBusy, isFalse);
+
+    final busyRoute = resolveSmartRoutePriority(
+      profile: mergedHome,
+      relayStatus: relayBusy,
+    );
+    expect(busyRoute.channel, SmartRouteChannel.relay);
+    expect(busyRoute.isBusy, isTrue);
+
+    expect(
+      resolveSmartRoutePriority(
+        profile: mergedHome,
+        relayStatus: relayOffline,
+      ).channel,
+      SmartRouteChannel.offline,
+    );
+
+    final relayPreferred = SavedHostProfile(
+      hostId: mergedHome.hostId,
+      hostLabel: mergedHome.hostLabel,
+      relayUrl: mergedHome.relayUrl,
+      lastLanIp: mergedHome.lastLanIp,
+      lastUsedMs: mergedHome.lastUsedMs,
+      preferLanFirst: false,
+    );
+    expect(
+      resolveSmartRoutePriority(
+        profile: relayPreferred,
+        discoveredLan: lanHost,
+        relayStatus: relayOnline,
+      ).channel,
+      SmartRouteChannel.relay,
+    );
+
+    await storage.removeHostProfile('hostwork0002');
+    expect((await storage.getSavedHostProfiles()).length, 1);
   });
 }

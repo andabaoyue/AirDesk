@@ -27,25 +27,173 @@ class SavedRemoteHost {
 }
 
 class AirDeskHostInfo {
+  final String hostId;
   final String hostname;
   final String ip;
   final int port;
   final String version;
   final List<String> allAddresses;
   final bool hasTrustedToken;
+  final bool isUsb;
 
   const AirDeskHostInfo({
+    this.hostId = '',
     required this.hostname,
     required this.ip,
     this.port = 47820,
     this.version = '',
     this.allAddresses = const [],
     this.hasTrustedToken = false,
+    this.isUsb = false,
   });
 
   String get httpBaseUrl => 'http://$ip:$port';
   String get wsUrl => 'ws://$ip:$port/ws/signaling';
-  String get hostKey => '$hostname@$ip:$port';
+  String get hostKey => hostId.isNotEmpty ? hostId : '$hostname@$ip:$port';
+}
+
+class RelayHostProbeStatus {
+  final bool online;
+  final bool busy;
+
+  const RelayHostProbeStatus({
+    required this.online,
+    this.busy = false,
+  });
+
+  factory RelayHostProbeStatus.fromJson(Map<String, dynamic> j) => RelayHostProbeStatus(
+        online: j['online'] == true,
+        busy: j['busy'] == true,
+      );
+}
+
+enum SmartRouteChannel { usb, lan, relay, offline }
+
+class SavedHostProfile {
+  final String hostId;
+  final String hostLabel;
+  final String relayUrl;
+  final String lastLanIp;
+  final int lastLanPort;
+  final String customIceRaw;
+  final int lastUsedMs;
+  final bool preferLanFirst;
+
+  const SavedHostProfile({
+    required this.hostId,
+    required this.hostLabel,
+    this.relayUrl = '',
+    this.lastLanIp = '',
+    this.lastLanPort = 47820,
+    this.customIceRaw = '',
+    required this.lastUsedMs,
+    this.preferLanFirst = true,
+  });
+
+  SavedHostProfile mergeWith(SavedHostProfile incoming) {
+    final nextLabel = incoming.hostLabel.trim().isNotEmpty ? incoming.hostLabel.trim() : hostLabel;
+    final nextRelay = incoming.relayUrl.trim().isNotEmpty ? incoming.relayUrl.trim() : relayUrl;
+    final nextLanIp = incoming.lastLanIp.trim().isNotEmpty ? incoming.lastLanIp.trim() : lastLanIp;
+    final nextLanPort =
+        incoming.lastLanIp.trim().isNotEmpty && incoming.lastLanPort > 0
+            ? incoming.lastLanPort
+            : lastLanPort;
+    final nextCustomIce =
+        incoming.customIceRaw.trim().isNotEmpty ? incoming.customIceRaw.trim() : customIceRaw;
+    final nextLastUsedMs = incoming.lastUsedMs > lastUsedMs ? incoming.lastUsedMs : lastUsedMs;
+    return SavedHostProfile(
+      hostId: hostId.isNotEmpty ? hostId : incoming.hostId,
+      hostLabel: nextLabel,
+      relayUrl: nextRelay,
+      lastLanIp: nextLanIp,
+      lastLanPort: nextLanPort,
+      customIceRaw: nextCustomIce,
+      lastUsedMs: nextLastUsedMs,
+      preferLanFirst: incoming.preferLanFirst,
+    );
+  }
+
+  Map<String, dynamic> toJson() => {
+        'hostId': hostId,
+        'hostLabel': hostLabel,
+        'relayUrl': relayUrl,
+        'lastLanIp': lastLanIp,
+        'lastLanPort': lastLanPort,
+        'customIceRaw': customIceRaw,
+        'lastUsedMs': lastUsedMs,
+        'preferLanFirst': preferLanFirst,
+      };
+
+  factory SavedHostProfile.fromJson(Map<String, dynamic> j) => SavedHostProfile(
+        hostId: (j['hostId'] ?? '').toString().trim(),
+        hostLabel: (j['hostLabel'] ?? '').toString(),
+        relayUrl: (j['relayUrl'] ?? '').toString().trim(),
+        lastLanIp: (j['lastLanIp'] ?? '').toString().trim(),
+        lastLanPort: (j['lastLanPort'] as num?)?.toInt() ?? 47820,
+        customIceRaw: (j['customIceRaw'] ?? '').toString().trim(),
+        lastUsedMs: (j['lastUsedMs'] as num?)?.toInt() ?? 0,
+        preferLanFirst: j['preferLanFirst'] is bool ? j['preferLanFirst'] as bool : true,
+      );
+}
+
+class ResolvedHostRoute {
+  final SmartRouteChannel channel;
+  final String badgeText;
+  final bool isOnline;
+  final bool isBusy;
+
+  const ResolvedHostRoute({
+    required this.channel,
+    required this.badgeText,
+    required this.isOnline,
+    this.isBusy = false,
+  });
+}
+
+ResolvedHostRoute resolveSmartRoutePriority({
+  required SavedHostProfile profile,
+  AirDeskHostInfo? discoveredUsb,
+  AirDeskHostInfo? discoveredLan,
+  RelayHostProbeStatus? relayStatus,
+}) {
+  final relayOnline = relayStatus?.online == true;
+  final relayBusy = relayOnline && relayStatus?.busy == true;
+
+  if (!profile.preferLanFirst && relayOnline && profile.relayUrl.isNotEmpty) {
+    return ResolvedHostRoute(
+      channel: SmartRouteChannel.relay,
+      badgeText: relayBusy ? '公网中继 · 忙碌' : '公网中继 · 在线',
+      isOnline: true,
+      isBusy: relayBusy,
+    );
+  }
+  if (discoveredUsb != null) {
+    return const ResolvedHostRoute(
+      channel: SmartRouteChannel.usb,
+      badgeText: 'USB 有线',
+      isOnline: true,
+    );
+  }
+  if (discoveredLan != null) {
+    return const ResolvedHostRoute(
+      channel: SmartRouteChannel.lan,
+      badgeText: '局域网直连 · 0 流量',
+      isOnline: true,
+    );
+  }
+  if (relayOnline && profile.relayUrl.isNotEmpty) {
+    return ResolvedHostRoute(
+      channel: SmartRouteChannel.relay,
+      badgeText: relayBusy ? '公网中继 · 忙碌' : '公网中继 · 在线',
+      isOnline: true,
+      isBusy: relayBusy,
+    );
+  }
+  return const ResolvedHostRoute(
+    channel: SmartRouteChannel.offline,
+    badgeText: '离线',
+    isOnline: false,
+  );
 }
 
 enum ScenePreset {
