@@ -8,7 +8,10 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const require = createRequire(import.meta.url);
+const net = require('node:net');
+const { WebSocket } = require('ws');
 const { createTrustStore } = require('../electron/modules/trust-store.cjs');
+const { createLanServerManager } = require('../electron/modules/lan-server.cjs');
 
 import {
   isLanLikeConnection,
@@ -725,6 +728,184 @@ execFileSync(process.execPath, ['--input-type=module', '--check'], {
   assert.ok(mainCjsSrc.includes("'airdesk:set-hosting-active'"));
 }
 
+// 7. Unit tests: PR 1 LAN zombie WS cleanup, hot audio replaceTrack, & host.js stability checks
+{
+  // 7a. LAN server zombie WS heartbeat cleanup
+  const tmpLanDir = fs.mkdtempSync(path.join(os.tmpdir(), 'airdesk-lan-ws-test-'));
+  const trustStore = createTrustStore({ userDataDir: tmpLanDir });
+  const lanMgr = createLanServerManager({
+    appVersion: '0.9.0',
+    trustStore,
+    getMainWindow: () => null,
+    getHasActiveSession: () => false,
+    getAuthoritativeControl: () => false,
+    getAirDeskDownloadsDir: () => tmpLanDir,
+    sanitizeFileName: (n) => n,
+    allocateUniqueFilePath: (d, n) => ({ finalName: n, finalPath: path.join(d, n) }),
+    maxFileTransferBytes: 1024 * 1024,
+    buildEmbeddedMobileClientHtml: () => '<html></html>',
+    wsPingIntervalMs: 35,
+    wsStaleTimeoutMs: 80,
+  });
+
+  const freePort = await new Promise((resolve, reject) => {
+    const srv = net.createServer();
+    srv.once('error', reject);
+    srv.listen(0, '127.0.0.1', () => {
+      const addr = srv.address();
+      srv.close(() => resolve(addr.port));
+    });
+  });
+
+  try {
+    const info = await lanMgr.startLocalSignalingServer(freePort);
+    const wsUrl = `ws://127.0.0.1:${info.port}/ws/signaling`;
+
+    const hostWs = new WebSocket(wsUrl);
+    const pairCode = await new Promise((resolve, reject) => {
+      hostWs.once('error', reject);
+      hostWs.on('open', () => {
+        hostWs.send(
+          JSON.stringify({
+            type: 'host:create',
+            localHostToken: info.localHostToken,
+            hostLabel: 'Test-PC',
+          })
+        );
+      });
+      hostWs.on('message', (raw) => {
+        const msg = JSON.parse(raw.toString('utf8'));
+        if (msg.type === 'host:created') resolve(msg.code);
+      });
+    });
+    assert.match(pairCode, /^\d{6}$/);
+
+    // Connect a silent client that ignores protocol pings (autoPong: false) -> server must terminate it
+    const silentClient = new WebSocket(wsUrl, { autoPong: false });
+    let closedByServer = false;
+    let hostSawCancelled = false;
+    hostWs.on('message', (raw) => {
+      const msg = JSON.parse(raw.toString('utf8'));
+      if (msg.type === 'host:pending_cancelled') hostSawCancelled = true;
+    });
+    await new Promise((resolve, reject) => {
+      silentClient.once('error', reject);
+      silentClient.on('open', () => {
+        silentClient.send(JSON.stringify({ type: 'client:join', code: pairCode, deviceLabel: 'ZombiePhone' }));
+      });
+      silentClient.on('close', () => {
+        closedByServer = true;
+        resolve();
+      });
+      setTimeout(() => reject(new Error('Zombie client was not terminated by lan-server heartbeat')), 2000);
+    });
+    await new Promise((r) => setTimeout(r, 40));
+    assert.equal(closedByServer, true);
+    assert.equal(hostSawCancelled, true);
+    hostWs.close();
+  } finally {
+    lanMgr.stopLocalSignalingServer();
+    fs.rmSync(tmpLanDir, { recursive: true, force: true });
+  }
+
+  // 7b. Hot audio toggle: audioSender != null uses replaceTrack and skips renegotiation; audioSender == null falls back
+  const prevNavDesc = Object.getOwnPropertyDescriptor(globalThis, 'navigator');
+  let audioEnabledState = false;
+  let renegotiateCalls = 0;
+  let replacedTracks = [];
+  let currentAudioSender = {
+    async replaceTrack(track) {
+      replacedTracks.push(track);
+    },
+  };
+  const makeTrack = (kind) => ({ kind, readyState: 'live', enabled: true, muted: false, stop() { this.readyState = 'ended'; } });
+  const makeStream = (tracks) => ({
+    getTracks: () => tracks,
+    getVideoTracks: () => tracks.filter((t) => t.kind === 'video'),
+    getAudioTracks: () => tracks.filter((t) => t.kind === 'audio'),
+    removeTrack: () => {},
+  });
+  Object.defineProperty(globalThis, 'navigator', {
+    configurable: true,
+    value: {
+      mediaDevices: {
+        async getUserMedia(constraints) {
+          if (constraints && constraints.audio) return makeStream([makeTrack('video'), makeTrack('audio')]);
+          return makeStream([makeTrack('video')]);
+        },
+      },
+    },
+  });
+
+  try {
+    const mgr = createMediaCaptureManager({
+      getScreenSources: () => [{ id: 'screen:0:0', displayId: '1', name: 'Display 1' }],
+      getSelectedDisplayId: () => '1',
+      setSelectedDisplayId: () => {},
+      getSelectedResolution: () => '1080p',
+      getCaptureMaxFps: () => 30,
+      getContentHintPref: () => 'auto',
+      getAudioEnabled: () => audioEnabledState,
+      setAudioEnabledState: (v) => {
+        audioEnabledState = Boolean(v);
+      },
+      getVirtualAudioInfo: () => null,
+      getMuteHostVirtualAudio: () => false,
+      getIsHosting: () => true,
+      getHasActivePeer: () => true,
+      getHasPc: () => true,
+      getPcStats: async () => new Map(),
+      getHostInSecureDesktop: () => false,
+      getVideoSender: () => null,
+      getAudioSender: () => currentAudioSender,
+      getReliableDc: () => null,
+      getWs: () => null,
+      onAudioRenegotiatePreserveCtrl: () => {
+        renegotiateCalls += 1;
+      },
+      applyVideoParameters: async () => {},
+      getAbrTargetKbps: () => 6000,
+      getAbrFpsCap: () => 30,
+      getIsIdleThrottled: () => false,
+      pushDisplaysListToClient: () => {},
+      pushUiConfigToClient: () => {},
+      showNotice: () => {},
+      setStatusText: () => {},
+      airdeskAPI: {
+        setActiveDisplay: async () => ({ ok: true }),
+        setVirtualAudioRoute: async () => ({ ok: true }),
+      },
+    });
+    await mgr.ensureLocalCaptureReady();
+    await mgr.setDesktopAudioEnabled(true, false);
+    assert.equal(renegotiateCalls, 0);
+    assert.equal(replacedTracks.length, 1);
+    assert.equal(replacedTracks[0].kind, 'audio');
+
+    await mgr.setDesktopAudioEnabled(false, false);
+    assert.equal(renegotiateCalls, 0);
+    assert.equal(replacedTracks.length, 2);
+    assert.equal(replacedTracks[1], null);
+
+    // Fallback path when audioSender is null (e.g. legacy/Web PWA client)
+    currentAudioSender = null;
+    await mgr.setDesktopAudioEnabled(true, false);
+    assert.equal(renegotiateCalls, 1);
+    mgr.releaseLocalCaptureMedia();
+  } finally {
+    if (prevNavDesc) Object.defineProperty(globalThis, 'navigator', prevNavDesc);
+    else delete globalThis.navigator;
+  }
+
+  // 7c. Structural assertions for PR 1 in host.js
+  const hostSrc = fs.readFileSync(hostJsPath, 'utf8');
+  assert.ok(hostSrc.includes("audioTransceiver.direction = 'sendonly'"));
+  assert.ok(hostSrc.includes("RTCRtpSender.getCapabilities('video')"));
+  assert.ok(hostSrc.includes('iceCandidatePoolSize: resolvedIceServers.length > 0 ? 2 : 0'));
+  assert.ok(hostSrc.includes('wsPongTimeoutTimer'));
+  assert.ok(hostSrc.includes('cachedHostname'));
+}
+
 console.log(
-  `[AirDesk Tests] Passed syntax checks (${cjsFiles.length} CJS, ${mjsFiles.length} MJS, host.js) + sdp-codec, abr-controller, trust-store & PR 0 idle-guard unit tests.`
+  `[AirDesk Tests] Passed syntax checks (${cjsFiles.length} CJS, ${mjsFiles.length} MJS, host.js) + sdp-codec, abr-controller, trust-store, PR 0 idle-guard & PR 1 stability/hot-audio tests.`
 );

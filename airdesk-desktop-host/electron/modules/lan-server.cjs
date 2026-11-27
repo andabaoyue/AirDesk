@@ -25,6 +25,8 @@ function createLanServerManager({
   allocateUniqueFilePath,
   maxFileTransferBytes,
   buildEmbeddedMobileClientHtml,
+  wsPingIntervalMs = 30000,
+  wsStaleTimeoutMs = 75000,
 }) {
   let localHttpServer = null;
   let localWss = null;
@@ -673,11 +675,35 @@ function createLanServerManager({
         }
       }, 5000);
 
+      const pingTimer = setInterval(() => {
+        const now = Date.now();
+        for (const client of wss.clients) {
+          if (client.isAlive === false || now - (client.lastActivityAt || 0) > wsStaleTimeoutMs) {
+            try {
+              client.terminate();
+            } catch {}
+            continue;
+          }
+          client.isAlive = false;
+          try {
+            client.ping();
+          } catch {}
+        }
+      }, wsPingIntervalMs);
+
       wss.on('connection', (ws, req) => {
         const rawIp = (req.socket && req.socket.remoteAddress) || 'LAN';
         const maskedIp = rawIp.replace(/^::ffff:/, '');
+        ws.isAlive = true;
+        ws.lastActivityAt = Date.now();
+        ws.on('pong', () => {
+          ws.isAlive = true;
+          ws.lastActivityAt = Date.now();
+        });
 
         ws.on('message', (raw) => {
+          ws.isAlive = true;
+          ws.lastActivityAt = Date.now();
           let msg;
           try {
             msg = JSON.parse(raw.toString('utf8'));
@@ -930,6 +956,7 @@ function createLanServerManager({
 
       server.on('close', () => {
         clearInterval(ttlTimer);
+        clearInterval(pingTimer);
         localSignalingRunning = false;
         revokeAllTrustedTokensCallback = null;
         revokeOneTrustedTokenCallback = null;
@@ -938,6 +965,7 @@ function createLanServerManager({
 
       server.once('error', (err) => {
         clearInterval(ttlTimer);
+        clearInterval(pingTimer);
         localSignalingRunning = false;
         revokeAllTrustedTokensCallback = null;
         revokeOneTrustedTokenCallback = null;
@@ -1000,6 +1028,11 @@ function createLanServerManager({
       localUdpDiscoverySocket = null;
     }
     if (localWss) {
+      for (const client of localWss.clients) {
+        try {
+          client.terminate();
+        } catch {}
+      }
       try {
         localWss.close();
       } catch {}

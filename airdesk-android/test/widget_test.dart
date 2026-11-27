@@ -251,4 +251,82 @@ void main() {
       );
     }
   });
+
+  test('PR 1 tokenKeyForEndpoint isolates multiple hosts on same relay and preserves legacy fallback', () async {
+    SharedPreferences.setMockInitialValues({});
+    final storage = StorageService();
+
+    const relayUrl = 'https://relay.example.com';
+    final baseKey = WebRtcSessionService.tokenKeyForEndpoint(signalingUrl: relayUrl);
+    final hostAKey = WebRtcSessionService.tokenKeyForEndpoint(
+      signalingUrl: relayUrl,
+      hostId: 'hostA1234567',
+    );
+    final hostBKey = WebRtcSessionService.tokenKeyForEndpoint(
+      signalingUrl: relayUrl,
+      hostId: 'hostB7654321',
+    );
+    expect(baseKey, 'relay:relay.example.com:443');
+    expect(hostAKey, 'relay:relay.example.com:443:hostA1234567');
+    expect(hostBKey, 'relay:relay.example.com:443:hostB7654321');
+    expect(
+      WebRtcSessionService.tokenKeyForEndpoint(hostIp: '192.168.1.10', port: 47820, hostId: 'ignored'),
+      '192.168.1.10:47820',
+    );
+
+    // Legacy token under baseKey works for matching/unset hostId, but does NOT leak to another hostId
+    await storage.saveTokenForKey(baseKey, 'legacy-tok-A');
+    await storage.saveHostIdForKey(baseKey, 'hostA1234567');
+    expect(await storage.getTokenForRelay(baseKey, hostId: 'hostA1234567'), 'legacy-tok-A');
+    expect(await storage.getTokenForRelay(baseKey, hostId: 'hostB7654321'), isNull);
+
+    // Scoped tokens for hostA and hostB stay isolated
+    await storage.saveTokenForKey(hostAKey, 'scoped-tok-A');
+    await storage.saveTokenForKey(hostBKey, 'scoped-tok-B');
+    expect(await storage.getTokenForRelay(baseKey, hostId: 'hostA1234567'), 'scoped-tok-A');
+    expect(await storage.getTokenForRelay(baseKey, hostId: 'hostB7654321'), 'scoped-tok-B');
+
+    await storage.removeTokenForRelay(baseKey, hostId: 'hostB7654321');
+    expect(await storage.getTokenForRelay(baseKey, hostId: 'hostB7654321'), isNull);
+    expect(await storage.getTokenForRelay(baseKey, hostId: 'hostA1234567'), 'scoped-tok-A');
+  });
+
+  test('PR 1 StorageService forceTurnRelay & WebRtcSessionService.buildRtcConfig', () async {
+    SharedPreferences.setMockInitialValues({});
+    final storage = StorageService();
+    expect(await storage.getForceTurnRelay(), isFalse);
+    await storage.setForceTurnRelay(true);
+    expect(await storage.getForceTurnRelay(), isTrue);
+
+    final noIceCfg = WebRtcSessionService.buildRtcConfig(const [], forceTurnRelay: true);
+    expect(noIceCfg['iceCandidatePoolSize'], 0);
+    expect(noIceCfg.containsKey('iceTransportPolicy'), isFalse);
+
+    final stunOnlyCfg = WebRtcSessionService.buildRtcConfig(
+      const [
+        {'urls': 'stun:stun.example.com:3478'},
+      ],
+      forceTurnRelay: true,
+    );
+    expect(stunOnlyCfg['iceCandidatePoolSize'], 2);
+    expect(stunOnlyCfg.containsKey('iceTransportPolicy'), isFalse);
+
+    final turnCfgOff = WebRtcSessionService.buildRtcConfig(
+      const [
+        {'urls': 'turn:turn.example.com:3478', 'username': 'u', 'credential': 'p'},
+      ],
+      forceTurnRelay: false,
+    );
+    expect(turnCfgOff['iceCandidatePoolSize'], 2);
+    expect(turnCfgOff.containsKey('iceTransportPolicy'), isFalse);
+
+    final turnCfgOn = WebRtcSessionService.buildRtcConfig(
+      const [
+        {'urls': 'turns:turn.example.com:5349', 'username': 'u', 'credential': 'p'},
+      ],
+      forceTurnRelay: true,
+    );
+    expect(turnCfgOn['iceCandidatePoolSize'], 2);
+    expect(turnCfgOn['iceTransportPolicy'], 'relay');
+  });
 }
