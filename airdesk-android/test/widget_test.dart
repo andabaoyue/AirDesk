@@ -343,7 +343,7 @@ void main() {
     expect(SdpHelper.isVirtualCandidate('candidate:1 1 UDP 2122 172.19.0.1 5000 typ host'), isTrue);
     expect(SdpHelper.isVirtualCandidate('candidate:1 1 UDP 2122 192.168.1.5 5000 typ host'), isFalse);
 
-    const rawOffer = [
+    final rawOffer = [
       'v=0',
       'm=video 9 UDP/TLS/RTP/SAVPF 96 97 98 99 100',
       'a=rtpmap:96 VP8/90000',
