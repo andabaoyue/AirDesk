@@ -1517,17 +1517,29 @@ async function handleOffer(remoteSdp) {
   });
   pc = currentPc;
 
+  const clearFailedOfferSession = (scheduleIdleRelease) => {
+    cleanupPeerConnection(scheduleIdleRelease);
+    currentControlEnabled = false;
+    activePeerIsOverlay = false;
+    if (isHosting) setLivePill('waiting', '待连接');
+    updateControlButtonUi();
+    window.airdeskAPI.setSessionActive(false).catch(() => {});
+  };
+
   try {
     await mediaCapture.ensureLocalCaptureReady();
   } catch (err) {
     if (pc === currentPc) {
-      cleanupPeerConnection(false);
+      clearFailedOfferSession(false);
     }
     showNotice('启动屏幕采集失败：' + (err && err.message ? err.message : err));
     return;
   }
   const localStream = mediaCapture.getLocalStream();
   if (pc !== currentPc || !isHosting || !localStream) {
+    if (pc === currentPc) {
+      clearFailedOfferSession(false);
+    }
     if (!isHosting) {
       mediaCapture.releaseLocalCaptureMedia();
     }
@@ -1795,7 +1807,11 @@ async function handleOffer(remoteSdp) {
       console.warn('[AirDesk] Playout-delay answer SDP rejected, falling back:', err.message);
       await pc.setLocalDescription(answer);
     }
-    if (pc !== currentPc || !ws || ws.readyState !== WebSocket.OPEN) return;
+    if (pc !== currentPc) return;
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      clearFailedOfferSession(true);
+      return;
+    }
     ws.send(JSON.stringify({ type: 'rtc:answer', sdp: sentAnswer.sdp }));
     hasActivePeer = true;
     if (Date.now() < audioRenegotiatePreserveCtrlUntil) {
@@ -1814,7 +1830,7 @@ async function handleOffer(remoteSdp) {
       : 'WebRTC 串流已建立（支持全局快捷键切屏/切权与系统级操控）';
   } catch (err) {
     if (pc === currentPc) {
-      cleanupPeerConnection(true);
+      clearFailedOfferSession(true);
     }
     showNotice('建立 WebRTC 通道失败：' + (err && err.message ? err.message : err));
   }
